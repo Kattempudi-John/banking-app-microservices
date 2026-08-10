@@ -2,7 +2,6 @@ import { Component, OnInit, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 
 import { ProfileService } from '../../core/services/profile.service';
-import { AuthService } from '../../core/auth.service';
 import { ButtonComponent } from '../../shared/button/button.component';
 import { AlertBannerComponent } from '../../shared/alert-banner/alert-banner.component';
 import { NavComponent } from '../../shared/nav/nav.component';
@@ -27,22 +26,17 @@ export class AlertPreferencesComponent implements OnInit {
   readonly dailySummaryMessage = signal<string | null>(null);
   readonly dailySummaryMessageType = signal<'success' | 'error'>('success');
 
-  private userId: number | null = null;
-
   constructor(
     private readonly profileService: ProfileService,
-    private readonly authService: AuthService,
   ) {}
 
   ngOnInit(): void {
-    this.userId = this.authService.userId();
-    if (this.userId !== null) {
-      this.profileService.getPreferences(this.userId).subscribe((pref) => {
-        this.threshold.set(String(pref.alertThresholdAmount));
-        this.dailySummaryEnabled.set(pref.dailySummaryEnabled);
-        this.timezone.set(pref.timezone);
-      });
-    }
+    // No userId needed - the backend derives it from the JWT on the request.
+    this.profileService.getPreferences().subscribe((pref) => {
+      this.threshold.set(String(pref.alertThresholdAmount));
+      this.dailySummaryEnabled.set(pref.dailySummaryEnabled);
+      this.timezone.set(pref.timezone);
+    });
   }
 
   saveThreshold(): void {

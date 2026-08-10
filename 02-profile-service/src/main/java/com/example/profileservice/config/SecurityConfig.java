@@ -1,5 +1,6 @@
 package com.example.profileservice.config;
 
+import jakarta.servlet.DispatcherType;
 import com.example.profileservice.security.KycWebhookFilter;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
@@ -54,9 +55,17 @@ public class SecurityConfig {
             // they are protected by other means instead, the webhook by its own hmac signature
             // filter below, and kyc-status because it is meant for internal service to service calls
             .authorizeHttpRequests(auth -> auth
+                // Spring re-dispatches internally to /error to render an error body. Without this,
+                // that dispatch is authorized as if it were a fresh request, so every 400/404 comes
+                // back as a bodyless 401 and the real reason never reaches the caller. Matching on
+                // the ERROR dispatch type keeps /error itself from being publicly reachable.
+                .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
                 .requestMatchers("/api/v1/webhooks/**").permitAll()
-                .requestMatchers("/api/v1/profiles/*/kyc-status").permitAll()
-                .requestMatchers(HttpMethod.GET, "/api/v1/profile/alerts/*", "/api/v1/profile/alerts/daily-summary-users").permitAll()
+                // Service-to-service only, and the ONE prefix the k8s ingress does not route.
+                // Anything unauthenticated has to live here: the ingress matches by path prefix, so a
+                // permitAll endpoint under /api/v1/profiles (which is routed) is published to the
+                // internet - exactly what the old /api/v1/profiles/*/kyc-status rule did.
+                .requestMatchers("/api/v1/internal/**").permitAll()
                 // Swagger/OpenAPI UI - documentation, not application data
                 .requestMatchers("/swagger-ui/**", "/swagger-ui.html", "/v3/api-docs/**").permitAll()
                 .anyRequest().authenticated()

@@ -1,5 +1,6 @@
 package com.example.notificationservice.config;
 
+import jakarta.servlet.DispatcherType;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -40,6 +41,11 @@ public class SecurityConfig {
             .csrf(AbstractHttpConfigurer::disable)
             .cors(cors -> cors.configurationSource(corsConfigurationSource()))
             .authorizeHttpRequests(auth -> auth
+                // Spring re-dispatches internally to /error to render an error body. Without this,
+                // that dispatch is authorized as if it were a fresh request, so every 400/404 comes
+                // back as a bodyless 401 and the real reason never reaches the caller. Matching on
+                // the ERROR dispatch type keeps /error itself from being publicly reachable.
+                .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
                 .anyRequest().authenticated()
             )
             .sessionManagement(session -> session

@@ -105,7 +105,7 @@ class NotificationPersistenceTestSuite {
     @DisplayName("Transaction alert above threshold persists a SENT notification record - [MEANT TO PASS]")
     void testTransactionAlert_AboveThreshold_PersistsRecord() {
         given(profileServiceClient.getUserPreferences(42L))
-                .willReturn(new ProfileServiceClient.UserPreferenceResponse(42L, new BigDecimal("100.00"), true, "UTC"));
+                .willReturn(new ProfileServiceClient.UserPreferenceResponse(42L, new BigDecimal("100.00"), true, "UTC", "alerts@example.com"));
         given(notificationProviderService.dispatchEmail(any(), any(), any())).willReturn(true);
         FundsTransferredEvent event = new FundsTransferredEvent(42L, 1L, 2L, new BigDecimal("500.00"), UUID.randomUUID());
 
@@ -123,7 +123,7 @@ class NotificationPersistenceTestSuite {
     @DisplayName("Transaction alert below threshold does not persist a notification record - [MEANT TO FAIL]")
     void testTransactionAlert_BelowThreshold_DoesNotPersist() {
         given(profileServiceClient.getUserPreferences(42L))
-                .willReturn(new ProfileServiceClient.UserPreferenceResponse(42L, new BigDecimal("1000.00"), true, "UTC"));
+                .willReturn(new ProfileServiceClient.UserPreferenceResponse(42L, new BigDecimal("1000.00"), true, "UTC", "alerts@example.com"));
         FundsTransferredEvent event = new FundsTransferredEvent(42L, 1L, 2L, new BigDecimal("50.00"), UUID.randomUUID());
 
         transactionAlertListener.consumeTransferEvent(event);
@@ -131,17 +131,39 @@ class NotificationPersistenceTestSuite {
         verify(notificationRecordRepository, never()).save(any());
     }
 
+    // Users who registered before the email field existed have no address on file. Dispatching to the
+    // old fabricated "user_<id>@bank.com" would have looked like a success while going nowhere, so the
+    // listener now records the miss as FAILED and sends nothing.
+    @Test
+    @DisplayName("Transaction alert for a user with no email records FAILED and dispatches nothing - [MEANT TO PASS]")
+    void testTransactionAlert_NoEmailOnFile_RecordsFailedWithoutDispatching() {
+        given(profileServiceClient.getUserPreferences(42L))
+                .willReturn(new ProfileServiceClient.UserPreferenceResponse(42L, new BigDecimal("100.00"), true, "UTC", null));
+
+        transactionAlertListener.consumeTransferEvent(new FundsTransferredEvent(
+                42L, 1L, 2L, new BigDecimal("500.00"), UUID.randomUUID()));
+
+        verify(notificationProviderService, never()).dispatchEmail(any(), any(), any());
+        verify(notificationRecordRepository).save(argThat(record ->
+                record.getUserId().equals(42L) && record.getStatus() == NotificationStatus.FAILED
+        ));
+    }
+
     @Test
     @DisplayName("Profile security update dispatches an email and persists a SENT record - [MEANT TO PASS]")
     void testProfileSecurity_PersistsRecord() {
         // Closes a pre-existing gap: this listener used to only log a line, never actually calling
         // NotificationProviderService despite its own comment claiming to.
+        // Unlike the transaction alert above, this listener has no preferences object handed to it, so
+        // it fetches one purely to resolve where the notice should be delivered.
+        given(profileServiceClient.getUserPreferences(42L))
+                .willReturn(new ProfileServiceClient.UserPreferenceResponse(42L, new BigDecimal("100.00"), true, "UTC", "alerts@example.com"));
         given(notificationProviderService.dispatchEmail(any(), any(), any())).willReturn(true);
         Map<String, Object> event = Map.of("userId", "42", "eventType", "CONTACT_INFO_UPDATED");
 
         profileNotificationListener.consumeProfileUpdate(event);
 
-        verify(notificationProviderService).dispatchEmail(eq("user_42@bank.com"), any(), any());
+        verify(notificationProviderService).dispatchEmail(eq("alerts@example.com"), any(), any());
         verify(notificationRecordRepository).save(argThat(record ->
                 record.getUserId().equals(42L)
                         && record.getType() == NotificationType.PROFILE_SECURITY

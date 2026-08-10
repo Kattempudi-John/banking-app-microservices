@@ -12,6 +12,8 @@ import org.springframework.web.cors.CorsConfiguration;
 import org.springframework.web.cors.CorsConfigurationSource;
 import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 
+import jakarta.servlet.DispatcherType;
+
 import java.util.List;
 
 import com.example.authservice.security.JwtAuthenticationFilter;
@@ -46,6 +48,11 @@ public class SecurityConfig {
 
             // 2. Configure endpoint routing rules
             .authorizeHttpRequests(auth -> auth
+                // Spring re-dispatches internally to /error to render an error body. Without this,
+                // that dispatch is authorized as if it were a fresh request, so every 400/404 comes
+                // back as a bodyless 401 and the real reason never reaches the caller. Matching on
+                // the ERROR dispatch type keeps /error itself from being publicly reachable.
+                .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
                 // Public endpoints that do not require an Access Token
                 .requestMatchers("/api/v1/auth/login").permitAll()
                 .requestMatchers("/api/v1/auth/register").permitAll()

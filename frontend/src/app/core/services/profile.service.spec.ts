@@ -42,9 +42,9 @@ describe('ProfileService', () => {
   it('fetches the KYC status for a given user id', () => {
     let result: KycStatus | undefined;
 
-    service.getKycStatus(42).subscribe((status) => (result = status));
+    service.getKycStatus().subscribe((status) => (result = status));
 
-    const req = httpMock.expectOne(`${environment.profileApiUrl}/profiles/42/kyc-status`);
+    const req = httpMock.expectOne(`${environment.profileApiUrl}/profiles/me/kyc-status`);
     expect(req.request.method).toBe('GET');
     req.flush({ status: 'APPROVED' });
 
@@ -60,9 +60,9 @@ describe('ProfileService', () => {
     };
     let result: UserPreference | undefined;
 
-    service.getPreferences(42).subscribe((pref) => (result = pref));
+    service.getPreferences().subscribe((pref) => (result = pref));
 
-    const req = httpMock.expectOne(`${environment.profileApiUrl}/profile/alerts/42`);
+    const req = httpMock.expectOne(`${environment.profileApiUrl}/profile/alerts/me`);
     expect(req.request.method).toBe('GET');
     req.flush(mockPreference);
 

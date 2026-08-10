@@ -6,11 +6,15 @@ import jakarta.validation.constraints.Size;
 
 public class UpdateContactInfoRequestDto {
 
-    // Regex strictly validates E.164 international phone number format (e.g., +14155552671)
+    // Accepts the separators a person actually types - "(571) 285-6947", "571-285-6947",
+    // "+1 571 285 6947" - because PhoneNumberNormalizer converts whatever arrives into E.164 before
+    // it's stored. This pattern only rejects input that clearly isn't a phone number at all; the
+    // normalizer makes the real call and ProfileManagementService returns a clear error if it can't
+    // resolve one unambiguous number.
     // learned all these jakarta validation annotations only actually run when the controller
     // method parameter is also marked @Valid, the annotation alone on the dto does nothing by itself
     @NotBlank(message = "Phone number is required")
-    @Pattern(regexp = "^\\+?[1-9]\\d{1,14}$", message = "Phone number must be a valid international format")
+    @Pattern(regexp = "^[+()\\-.\\s0-9]{7,20}$", message = "Phone number must be a valid phone number")
     private String phoneNumber;
 
     @NotBlank(message = "Address line 1 is required")

@@ -62,3 +62,22 @@ spec:
                 name: profile-service
                 port:
                   number: 8080
+
+          # 6. Alert preference traffic - PreferenceController is mapped at the SINGULAR
+          # /api/v1/profile/alerts, which the plural rule above does not match: pathType Prefix
+          # compares whole path segments, so "/api/v1/profiles" never matches "/api/v1/profile/...".
+          # Without this rule the Alert Preferences page 404s behind the ingress even though it works
+          # fine against docker-compose.
+          #
+          # Note this is only safe because every endpoint under this prefix requires authentication.
+          # The two that can't (notification-service reads a user's threshold and the daily-summary
+          # opt-ins with no end-user token) were moved to /api/v1/internal/, which is deliberately
+          # absent from this file - adding an unauthenticated endpoint under a routed prefix would
+          # publish it, and these responses carry email addresses.
+          - path: /api/v1/profile
+            pathType: Prefix
+            backend:
+              service:
+                name: profile-service
+                port:
+                  number: 8080

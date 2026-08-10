@@ -119,7 +119,7 @@ describe('AuthService', () => {
   it('registers a new user without storing an access token', () => {
     let result: unknown;
     service
-      .register({ username: 'jdoe', password: 'secret123', phoneNumber: '+15551234567' })
+      .register({ username: 'jdoe', password: 'secret123', phoneNumber: '+15551234567', email: 'jdoe@example.com' })
       .subscribe((res) => (result = res));
 
     const req = httpMock.expectOne(`${environment.authApiUrl}/register`);
@@ -128,6 +128,7 @@ describe('AuthService', () => {
       username: 'jdoe',
       password: 'secret123',
       phoneNumber: '+15551234567',
+      email: 'jdoe@example.com',
     });
     req.flush({ status: 'SUCCESS', message: 'Account created successfully' });
 

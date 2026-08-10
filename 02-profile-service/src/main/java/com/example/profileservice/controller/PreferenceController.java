@@ -3,9 +3,8 @@ package com.example.profileservice.controller;
 import com.example.profileservice.dto.UpdateAlertThresholdRequestDto;
 import com.example.profileservice.dto.UpdateDailySummaryRequestDto;
 import com.example.profileservice.model.UserPreferenceEntity;
-import com.example.profileservice.model.UserProfile;
-import com.example.profileservice.repository.UserProfileRepository;
 import com.example.profileservice.service.PreferenceService;
+import com.example.profileservice.service.UserPreferenceResponseMapper;
 import jakarta.validation.Valid;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
@@ -25,11 +24,11 @@ import java.util.List;
 public class PreferenceController {
 
     private final PreferenceService preferenceService;
-    private final UserProfileRepository userProfileRepository;
+    private final UserPreferenceResponseMapper responseMapper;
 
-    public PreferenceController(PreferenceService preferenceService, UserProfileRepository userProfileRepository) {
+    public PreferenceController(PreferenceService preferenceService, UserPreferenceResponseMapper responseMapper) {
         this.preferenceService = preferenceService;
-        this.userProfileRepository = userProfileRepository;
+        this.responseMapper = responseMapper;
     }
 
     // @Valid tells spring to run bean validation on the incoming dto before this method body
@@ -65,33 +64,17 @@ public class PreferenceController {
             String email
     ) {}
 
-    @GetMapping("/{userId}")
-    @PreAuthorize("permitAll()")
-    public ResponseEntity<UserPreferenceResponse> getPreferences(@PathVariable Long userId) {
-        UserPreferenceEntity entity = preferenceService.getPreferences(userId);
-        return ResponseEntity.ok(toResponse(entity));
+    // What the frontend's Alert Preferences page calls. Takes no userId - it comes off the JWT, so
+    // the class-level SCOPE_FULL_AUTH check applies and one user can't read another's preferences
+    // (or, since this response carries an email address, another user's email) by changing an id.
+    @GetMapping("/me")
+    public ResponseEntity<UserPreferenceResponse> getMyPreferences() {
+        Long userId = extractUserIdFromAuth();
+        return ResponseEntity.ok(toResponse(preferenceService.getPreferences(userId)));
     }
 
-    @GetMapping("/daily-summary-users")
-    @PreAuthorize("permitAll()")
-    public ResponseEntity<List<UserPreferenceResponse>> getUsersForDailySummary(@RequestParam String timezone) {
-        List<UserPreferenceResponse> users = preferenceService.getUsersForDailySummary(timezone).stream()
-                .map(this::toResponse)
-                .toList();
-        return ResponseEntity.ok(users);
-    }
-
-    // Preferences and profile are separate tables keyed by the same user id, so the address is looked
-    // up alongside. A user with no profile row (or one registered before the email field existed)
-    // simply reports a null address, which the notification listeners treat as "can't email this user".
     private UserPreferenceResponse toResponse(UserPreferenceEntity entity) {
-        String email = userProfileRepository.findById(entity.getUserId())
-                .map(UserProfile::getEmail)
-                .orElse(null);
-
-        return new UserPreferenceResponse(
-                entity.getUserId(), entity.getAlertThresholdAmount(), entity.getDailySummaryEnabled(),
-                entity.getTimezone(), email);
+        return responseMapper.toResponse(entity);
     }
 
     private Long extractUserIdFromAuth() {

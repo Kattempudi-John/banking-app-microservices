@@ -1,5 +1,6 @@
 package com.example.transactionservice.config;
 
+import jakarta.servlet.DispatcherType;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -40,6 +41,12 @@ public class SecurityConfig {
             // cross-origin, including sending the Authorization header on credentialed requests.
             .cors(cors -> cors.configurationSource(corsConfigurationSource()))
             .authorizeHttpRequests(auth -> auth
+                // Spring re-dispatches internally to /error to render an error body. Without this,
+                // that dispatch is authorized as if it were a fresh request, so anything not caught
+                // by GlobalExceptionHandler (bean-validation failures, 404s) came back as a bodyless
+                // 401 and the real reason never reached the user. Matching on the ERROR dispatch type
+                // keeps /error itself from being publicly reachable.
+                .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
                 // Method-level @PreAuthorize on TransferController enforces SCOPE_FULL_AUTH;
                 // require authentication here so anonymous callers are rejected outright.
                 // notice InternalFraudController has no matching exemption here, meaning it

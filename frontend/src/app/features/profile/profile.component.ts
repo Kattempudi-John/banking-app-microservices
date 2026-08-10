@@ -4,7 +4,6 @@ import { FormsModule } from '@angular/forms';
 import { extractApiError } from '../../core/api-error';
 import { ProfileService } from '../../core/services/profile.service';
 import { AccountService } from '../../core/services/account.service';
-import { AuthService } from '../../core/auth.service';
 import { KycStatus } from '../../core/models/profile.models';
 import { AccountOverview } from '../../core/models/account.models';
 import { ButtonComponent } from '../../shared/button/button.component';
@@ -12,7 +11,10 @@ import { AlertBannerComponent } from '../../shared/alert-banner/alert-banner.com
 import { NavComponent } from '../../shared/nav/nav.component';
 import { InputComponent } from '../../shared/input/input.component';
 
-const PHONE_PATTERN = /^\+?[1-9]\d{1,14}$/;
+// Permissive on purpose: the backend normalizes whatever is typed into E.164 before storing it, so
+// "(571) 285-6947" and "+1 571 285 6947" are both fine here. This only catches input that plainly
+// isn't a phone number; profile-service returns a specific message if it can't resolve one.
+const PHONE_PATTERN = /^[+()\-.\s0-9]{7,20}$/;
 
 @Component({
   selector: 'app-profile',
@@ -49,26 +51,20 @@ export class ProfileComponent implements OnInit {
   constructor(
     private readonly profileService: ProfileService,
     private readonly accountService: AccountService,
-    private readonly authService: AuthService,
   ) {}
 
   ngOnInit(): void {
-    const userId = this.authService.userId();
-    if (userId === null) {
-      this.kycLoading.set(false);
-      this.kycError.set(true);
-    } else {
-      this.profileService.getKycStatus(userId).subscribe({
-        next: (status) => {
-          this.kycStatus.set(status);
-          this.kycLoading.set(false);
-        },
-        error: () => {
-          this.kycLoading.set(false);
-          this.kycError.set(true);
-        },
-      });
-    }
+    // No userId needed - the backend derives it from the JWT on the request.
+    this.profileService.getKycStatus().subscribe({
+      next: (status) => {
+        this.kycStatus.set(status);
+        this.kycLoading.set(false);
+      },
+      error: () => {
+        this.kycLoading.set(false);
+        this.kycError.set(true);
+      },
+    });
     this.accountService.getAccounts().subscribe((accounts) => this.accounts.set(accounts));
   }
 
@@ -89,7 +85,7 @@ export class ProfileComponent implements OnInit {
     this.saveMessage.set(null);
 
     if (!PHONE_PATTERN.test(this.phoneNumber())) {
-      this.validationError.set('Please enter a valid phone number (e.g. +15551234567).');
+      this.validationError.set('Please enter a valid phone number (e.g. 571-285-6947 or +15712856947).');
       return;
     }
     if (!this.addressLine1() || !this.city() || !this.state() || !this.zipCode()) {

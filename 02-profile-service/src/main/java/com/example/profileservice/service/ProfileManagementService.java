@@ -6,9 +6,12 @@ import com.example.profileservice.model.KycStatus;
 import com.example.profileservice.model.UserProfile;
 import com.example.profileservice.repository.KycOverrideAuditLogRepository;
 import com.example.profileservice.repository.UserProfileRepository;
+import com.example.profileservice.util.PhoneNumberNormalizer;
+import org.springframework.http.HttpStatus;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.time.LocalDateTime;
 import java.util.HashMap;
@@ -20,6 +23,7 @@ public class ProfileManagementService {
     private final UserProfileRepository userProfileRepository;
     private final KycOverrideAuditLogRepository auditLogRepository;
     private final KafkaTemplate<String, Object> kafkaTemplate;
+    private final PhoneNumberNormalizer phoneNumberNormalizer;
 
     // Kafka Topic Constants
     private static final String PROFILE_EVENTS_TOPIC = "profile-events";
@@ -27,10 +31,12 @@ public class ProfileManagementService {
 
     public ProfileManagementService(UserProfileRepository userProfileRepository,
                                     KycOverrideAuditLogRepository auditLogRepository,
-                                    KafkaTemplate<String, Object> kafkaTemplate) {
+                                    KafkaTemplate<String, Object> kafkaTemplate,
+                                    PhoneNumberNormalizer phoneNumberNormalizer) {
         this.userProfileRepository = userProfileRepository;
         this.auditLogRepository = auditLogRepository;
         this.kafkaTemplate = kafkaTemplate;
+        this.phoneNumberNormalizer = phoneNumberNormalizer;
     }
 
     // @Transactional here matters more than it looks, if publishing to kafka down in step 4
@@ -43,8 +49,12 @@ public class ProfileManagementService {
         // 1. Capture the before state for the audit trail
         Map<String, String> oldState = captureOldContactState(user);
 
-        // 2. Apply new state
-        user.setPhoneNumber(dto.getPhoneNumber());
+        // 2. Apply new state. The phone number is stored in E.164 regardless of how it was typed, so
+        // this copy stays in the same shape as the one auth-service sends 2FA codes to.
+        String normalizedPhone = phoneNumberNormalizer.normalize(dto.getPhoneNumber())
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                        "Please enter a valid phone number, e.g. 571-285-6947 or +15712856947"));
+        user.setPhoneNumber(normalizedPhone);
         user.setAddressLine1(dto.getAddressLine1());
         user.setAddressLine2(dto.getAddressLine2());
         user.setCity(dto.getCity());

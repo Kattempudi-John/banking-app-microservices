@@ -31,6 +31,53 @@ spec:
               value: "redis-master.banking-app.svc.cluster.local"
             - name: REDIS_PORT
               value: "6379"
+            # Twilio (SMS 2FA) and SendGrid (summaries/alerts) credentials.
+            #
+            # These deliberately reference a secret that is NOT in this repo. Unlike
+            # banking-db-secret in 02-secrets.yaml, which holds obviously-fake placeholder values,
+            # these are real credentials that can be used to send messages billed to your account -
+            # so the manifest holding them must never be committed. Create it directly instead:
+            #
+            #   kubectl create secret generic banking-notification-secret \
+            #     --namespace banking-app \
+            #     --from-literal=TWILIO_ACCOUNT_SID=... \
+            #     --from-literal=TWILIO_AUTH_TOKEN=... \
+            #     --from-literal=TWILIO_FROM_NUMBER=+15551234567 \
+            #     --from-literal=SENDGRID_API_KEY=... \
+            #     --from-literal=SENDGRID_FROM_EMAIL=alerts@yourdomain.com
+            #
+            # optional: true on every key means the pod still starts without this secret present -
+            # it just falls back to the logging providers rather than crash-looping.
+            - name: TWILIO_ACCOUNT_SID
+              valueFrom:
+                secretKeyRef:
+                  name: banking-notification-secret
+                  key: TWILIO_ACCOUNT_SID
+                  optional: true
+            - name: TWILIO_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: banking-notification-secret
+                  key: TWILIO_AUTH_TOKEN
+                  optional: true
+            - name: TWILIO_FROM_NUMBER
+              valueFrom:
+                secretKeyRef:
+                  name: banking-notification-secret
+                  key: TWILIO_FROM_NUMBER
+                  optional: true
+            - name: SENDGRID_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: banking-notification-secret
+                  key: SENDGRID_API_KEY
+                  optional: true
+            - name: SENDGRID_FROM_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: banking-notification-secret
+                  key: SENDGRID_FROM_EMAIL
+                  optional: true
 ---
 # clusterip even though nothing external hits this service directly, keeping it consistent with the others
 apiVersion: v1

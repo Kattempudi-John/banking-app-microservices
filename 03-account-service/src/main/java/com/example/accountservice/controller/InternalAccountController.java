@@ -123,7 +123,11 @@ public class InternalAccountController {
         return ResponseEntity.ok().build();
     }
 
-    @PostMapping("/api/v1/accounts/balances/batch")
+    // Under /api/v1/internal/ like everything else in this controller, and NOT under /api/v1/accounts.
+    // It used to sit on the latter, which the k8s ingress routes publicly - combined with the
+    // permitAll needed for notification-service to call it, that made "post a list of user ids, get
+    // back their total balances" reachable from the internet with no authentication at all.
+    @PostMapping("/api/v1/internal/accounts/balances/batch")
     public ResponseEntity<List<UserAggregateBalanceResponse>> balancesBatch(@RequestBody List<Long> userIds) {
         return ResponseEntity.ok(internalAccountService.aggregateBalances(userIds));
     }

@@ -84,15 +84,15 @@ This system was implemented against 10 functional-requirement documents (FR1–F
 | `02-profile-service` | 8082 | KYC status/webhook/admin override, contact info, alert & daily-summary preferences; provisions a profile on registration |
 | `03-account-service` | 8083 | Account dashboard, paginated transaction history — sole owner of the accounts ledger; provisions a starter account on registration |
 | `03-transaction-service` | 8084 | Internal transfers, external wires, fraud-threshold review |
-| `04-notification-service` | 8085 | Kafka-driven real-time alerts + scheduled daily balance summary (no REST API) |
+| `04-notification-service` | 8085 | Kafka-driven real-time alerts + scheduled daily balance summary; real SMS/email delivery via Twilio/SendGrid; exposes `/api/v1/notifications` |
 | `05-audit-service` | 8086 | Immutable, insert-only audit log of profile/KYC changes (no REST API) |
-| `frontend` | 4200 | Angular web client — login/2FA, dashboard, transactions, transfers, profile, alert preferences |
+| `frontend` | 4200 | Angular web client — login/2FA, dashboard, transactions, transfers, history, notifications, profile, alert preferences |
 
 ## Frontend
 
-`frontend/` is an Angular 22 single-page app that talks to `auth-service`, `profile-service`, `account-service`, and `transaction-service` directly over REST (`notification-service` and `audit-service` have no REST API, so the frontend never calls them). Each of those four services has a `CorsConfigurationSource` bean scoped to `http://localhost:4200` with credentials enabled, since the frontend and backend run on different ports locally.
+`frontend/` is an Angular 22 single-page app that talks to `auth-service`, `profile-service`, `account-service`, `transaction-service`, and `notification-service` directly over REST (`audit-service` has no REST API, so the frontend never calls it). Each of those services has a `CorsConfigurationSource` bean scoped to `http://localhost:4200` with credentials enabled, since the frontend and backend run on different ports locally.
 
-**Pages:** `/signup` (self-service registration) → `/login` (credentials + SMS 2FA) → `/dashboard` (account list) → `/accounts/:id/transactions` (paginated history) → `/transfer` (internal + external wire, KYC-gated) → `/profile` (contact info + KYC status) → `/profile/alerts` (threshold + daily summary).
+**Pages:** `/signup` (self-service registration) → `/login` (credentials + SMS 2FA) → `/dashboard` (account list) → `/accounts/:id/transactions` (paginated history) → `/transfer` (own-account transfers, paying another user by account number, and external wire — all KYC-gated) → `/history` (ledger entries and wires merged, filterable) → `/notifications` (delivered alert log) → `/profile` (contact info, KYC status, IBAN/SWIFT to receive money) → `/profile/alerts` (threshold + daily summary).
 
 **Registration provisioning:** `POST /api/v1/auth/register` (or the `/signup` page) creates the auth-service credentials, then publishes a `user-events` Kafka event that `profile-service` and `account-service` each consume independently to provision their own initial row — a `PENDING_VERIFICATION` profile and a `$0` `CHECKING` account — so a freshly-registered user has a usable (if empty) dashboard and KYC status immediately, no manual seeding required. See [Running this project](#running-this-project) below if you want to seed additional accounts or approve KYC for testing transfers.
 
@@ -129,7 +129,7 @@ docker-compose up -d
 ./mvnw test                    # run from inside any one service's directory
 ```
 
-**5. Create a test user** — register via `POST /api/v1/auth/register` (or the frontend's `/signup` page) with `{"username", "password", "phoneNumber"}`. This is the preferred path: it also publishes the `user-events` Kafka event that provisions a `PENDING_VERIFICATION` profile and a `$0` checking account automatically (see [Frontend](#frontend) above) — `auth-service`, `profile-service`, and `account-service` all need to be running for that to happen.
+**5. Create a test user** — register via `POST /api/v1/auth/register` (or the frontend's `/signup` page) with `{"username", "password", "phoneNumber", "email"}`. This is the preferred path: it also publishes the `user-events` Kafka event that provisions a `PENDING_VERIFICATION` profile and a `$0` checking account (with its own IBAN) automatically (see [Frontend](#frontend) above) — `auth-service`, `profile-service`, and `account-service` all need to be running for that to happen.
 
 If you'd rather skip the API and insert a user directly into Postgres (bcrypt hash below is for password `Password123!`), note that this bypasses the `user-events` publish entirely — you'll need to seed `user_profiles`/`accounts` rows yourself too:
 
@@ -166,6 +166,60 @@ docker-compose down
 - http://localhost:8083/swagger-ui.html
 - http://localhost:8084/swagger-ui.html
 
+### Notification providers
+
+2FA codes and transaction alerts go out through swappable provider clients in
+`04-notification-service`, selected by a single property each. Both default to `logging`, which
+writes the message to the service log and needs no account or key — so everything above runs with
+zero setup. Exactly one client bean matches the chosen value, so there is never any ambiguity.
+
+| Property | Values | Delivers |
+|---|---|---|
+| `sms.provider` | `logging` (default), `textbelt`, `twilio` | 2FA codes |
+| `email.provider` | `logging` (default), `sendgrid` | Balance summaries, transaction alerts, profile security notices |
+
+To send for real, copy the template and fill in your credentials:
+
+```bash
+cp .env.example .env      # .env is gitignored; .env.example holds variable names only
+```
+
+Then load it before starting `notification-service`:
+
+```bash
+# Git Bash / macOS / Linux
+set -a && source .env && set +a
+```
+
+```powershell
+# PowerShell
+Get-Content .env | Where-Object { $_ -match '^\s*[^#].*=' } | ForEach-Object {
+  $name, $value = $_ -split '=', 2
+  [Environment]::SetEnvironmentVariable($name.Trim(), $value.Trim(), 'Process')
+}
+```
+
+Every credential is read from an environment variable with a blank fallback, so they are never
+written into a tracked file. **Do not replace the `${VAR:}` placeholders in `application.yml` with
+literal values** — that file is committed, and anything that reaches git stays in the history even
+after it's deleted. A leaked Twilio auth token can be used to send messages billed to your account;
+rotate it in the Twilio console immediately if that happens.
+
+Credentials have no defaults on purpose: a real provider selected with a blank credential fails at
+startup naming the missing property, rather than silently dropping notifications.
+
+For Kubernetes, the notification-service deployment reads the same variable names from a
+`banking-notification-secret` that is deliberately **not** in this repo — create it with
+`kubectl create secret generic` (the exact command is in `k8s/07-notification-service.yaml`). Every
+key is marked `optional: true`, so the pod still starts without it and falls back to logging.
+
+`textbelt` is a middle option for SMS: its free tier needs no signup at all (1 text/day/IP), enough
+to prove the 2FA path end-to-end without opening a Twilio account.
+
+Email is delivered to the address captured at registration and stored on the user's profile. A user
+registered before that field existed has none, and is skipped with a logged warning rather than
+being mailed at a fabricated address.
+
 ## Infrastructure
 
 Terraform (`terraform/`) defines the target AWS footprint (VPC, RDS Postgres, EKS with a managed node group); Helm values (`helm/`) configure Kafka/Redis/ingress-nginx on the cluster; `k8s/` holds the namespace, config/secrets, and per-service Deployment/Service manifests. `.github/workflows/build-and-test.yml` runs every service's test suite on every push/PR to `main`. `.github/workflows/deploy-to-eks.yml` (GHCR image build/push + `kubectl apply` to EKS) exists but is entirely commented out until the four AWS secrets it needs are actually configured — see the comment at the top of that file to re-enable it.
@@ -176,11 +230,17 @@ Terraform (`terraform/`) defines the target AWS footprint (VPC, RDS Postgres, EK
 
 Being upfront about what's intentionally not production-complete:
 
-- **Email/SMS providers are placeholders.** `LoggingEmailProviderClient` logs instead of calling a real vendor (SendGrid/Twilio slots exist and are documented in the FR docs, just not wired to real accounts).
+- **Notification providers default to logging.** Real delivery is wired and ready — Twilio for SMS, SendGrid for email — but `sms.provider`/`email.provider` default to `logging` so the project runs with zero credentials. Set them to `twilio`/`sendgrid` and supply the keys (see [Notification providers](#notification-providers) below) to send for real.
 - **No role-based authorization system yet.** Profile-service's admin KYC-override endpoint requires `ADMIN`/`COMPLIANCE_OFFICER` roles, but nothing in the system currently grants roles to a user — that endpoint is reachable in code but not yet in a real deployment.
 - **Kafka-provisioned profiles/accounts are minimal.** The `user-events` consumer in `profile-service`/`account-service` (see [Frontend](#frontend) above) only sets the bare minimum — a `PENDING_VERIFICATION` profile with no address, and a single `$0` checking account. If Kafka is down when a user registers, they end up with credentials but no profile/account until manually backfilled (no dead-letter/retry queue yet, just a logged error).
-- **`/api/v1/profile/alerts/**` isn't in the k8s ingress routes** (`k8s/08-ingress-routes.yaml` only routes `/api/v1/profiles`, plural) — the Alert Preferences page works fine against `docker-compose`/local ports, but would 404 if deployed behind the ingress unchanged.
 - **IaC is validated, not deployed** (see [Infrastructure](#infrastructure) above).
+
+**On endpoint exposure:** every unauthenticated endpoint lives under `/api/v1/internal/`, which is
+deliberately absent from `k8s/08-ingress-routes.yaml` and so is unreachable from outside the
+cluster. Everything the ingress does route requires a valid JWT and resolves the user from that
+token rather than from a client-supplied id, so one user cannot read another's data by changing a
+number in a URL. Adding a new unauthenticated endpoint anywhere outside that prefix would publish
+it to the internet — that is the rule to keep in mind when extending any of the services.
 
 ## License
 

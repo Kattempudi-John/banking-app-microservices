@@ -17,6 +17,8 @@ import org.springframework.web.cors.CorsConfiguration;
 import org.springframework.web.cors.CorsConfigurationSource;
 import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 
+import jakarta.servlet.DispatcherType;
+
 import javax.crypto.spec.SecretKeySpec;
 import java.util.Base64;
 import java.util.List;
@@ -40,10 +42,20 @@ public class SecurityConfig {
             // cross-origin, including sending the Authorization header on credentialed requests.
             .cors(cors -> cors.configurationSource(corsConfigurationSource()))
             .authorizeHttpRequests(auth -> auth
+                // When a handler throws, Spring re-dispatches the request internally to /error to
+                // render the response body. That dispatch was being authorized like a fresh request,
+                // so with nothing permitting it every 400/403/404 came back as a bodyless 401 instead
+                // - including INSUFFICIENT_FUNDS and ownership failures, which transaction-service
+                // relays to the user. Permitting the ERROR dispatch specifically (rather than the
+                // "/error" path) keeps /error from being reachable as a public endpoint on its own.
+                .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
                 // Internal, service-to-service only endpoints (transaction-service's transfer/
                 // debit/credit calls, notification-service's balances-batch lookup) - not reachable
                 // via the k8s ingress, so no end-user JWT is ever available to satisfy SCOPE_FULL_AUTH here.
-                .requestMatchers("/api/v1/internal/**", "/api/v1/accounts/balances/batch").permitAll()
+                // Everything permitted here MUST live under this one prefix: the ingress routes by
+                // path prefix, so an unauthenticated endpoint anywhere else (balances/batch used to be
+                // under /api/v1/accounts) is an endpoint published straight to the internet.
+                .requestMatchers("/api/v1/internal/**").permitAll()
                 // Swagger/OpenAPI UI - documentation, not application data
                 .requestMatchers("/swagger-ui/**", "/swagger-ui.html", "/v3/api-docs/**").permitAll()
                 // simplest possible rule set here, just one line, since @PreAuthorize on the

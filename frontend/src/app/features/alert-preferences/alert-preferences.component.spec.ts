@@ -62,7 +62,7 @@ describe('AlertPreferencesComponent', () => {
 
   it('loads and pre-fills existing preferences on init', async () => {
     await setup();
-    expect(profileServiceSpy.getPreferences).toHaveBeenCalledWith(42);
+    expect(profileServiceSpy.getPreferences).toHaveBeenCalled();
     expect(thresholdInput().value).toBe('500');
     expect(dailySummaryToggle().checked).toBeTrue();
     expect(timezoneSelect().value).toBe('America/New_York');

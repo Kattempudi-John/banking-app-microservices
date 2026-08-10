@@ -10,9 +10,15 @@ spring:
   jpa:
     hibernate:
       ddl-auto: update
-      properties:
-        hibernate:
-          default_schema: notification
+    # NOTE the nesting: this has to be spring.jpa.properties.hibernate.default_schema. It was
+    # previously one level deeper, under spring.jpa.hibernate.properties, which Spring ignores
+    # entirely - so Hibernate fell back to the "public" schema, quietly created a SECOND
+    # notification_records table there via ddl-auto, and wrote every record into it while the
+    # Flyway-managed notification.notification_records sat empty. Email alerts then failed outright,
+    # because that accidental table typed message as varchar(255) and the HTML bodies are longer.
+    properties:
+      hibernate:
+        default_schema: notification
     show-sql: true
   # account-service and transaction-service already occupy version numbers 1-7 in this shared
   # local database's public schema/flyway history - this service's own V1 would collide there
@@ -36,13 +42,19 @@ spring:
 #
 #   logging  - no credentials, logs instead of sending (default)
 #   textbelt - free tier needs no signup at all, 1 text/day/IP, good for a one-off end-to-end check
-#   twilio   - real delivery; paste your three values below or export the env vars
+#   twilio   - real delivery
+#
+# IMPORTANT: this file is tracked by git. Every credential below is read from an environment
+# variable with a blank fallback - set them in the gitignored .env (see .env.example) or export them
+# in your shell. Never replace a ${VAR:} placeholder with a literal value here: anything committed
+# to git stays in the history even after it is deleted, and a leaked Twilio auth token can be used
+# to send messages billed to your account.
 sms:
   provider: ${SMS_PROVIDER:logging}
   textbelt-key: ${TEXTBELT_KEY:textbelt}
   twilio:
-    # From the Twilio console. Leaving these blank with provider=twilio fails startup on purpose,
-    # rather than letting a login hang on a 2FA code that was never really sent.
+    # Leaving these blank with provider=twilio fails startup on purpose, rather than letting a login
+    # hang on a 2FA code that was never really sent.
     account-sid: ${TWILIO_ACCOUNT_SID:}
     auth-token: ${TWILIO_AUTH_TOKEN:}
     # Must be a number Twilio has actually issued to your account, in E.164 format (+15551234567).

@@ -41,6 +41,10 @@ describe('SignupComponent', () => {
     return fixture.nativeElement.querySelector('app-input[id="phoneNumber"] input');
   }
 
+  function emailInput(): HTMLInputElement {
+    return fixture.nativeElement.querySelector('app-input[id="email"] input');
+  }
+
   function submitForm(): void {
     fixture.nativeElement.querySelector('form').dispatchEvent(new Event('submit'));
   }
@@ -56,6 +60,7 @@ describe('SignupComponent', () => {
     typeInto(passwordInput(), 'SecurePass123!');
     typeInto(confirmPasswordInput(), 'SecurePass123!');
     typeInto(phoneInput(), '+15551234567');
+    typeInto(emailInput(), 'newuser@example.com');
   }
 
   it('renders the sign-up form', () => {
@@ -63,6 +68,7 @@ describe('SignupComponent', () => {
     expect(passwordInput()).not.toBeNull();
     expect(confirmPasswordInput()).not.toBeNull();
     expect(phoneInput()).not.toBeNull();
+    expect(emailInput()).not.toBeNull();
   });
 
   it('calls AuthService.register with the entered details on submit', async () => {
@@ -75,7 +81,19 @@ describe('SignupComponent', () => {
       username: 'newuser',
       password: 'SecurePass123!',
       phoneNumber: '+15551234567',
+      email: 'newuser@example.com',
     });
+  });
+
+  // an address is what notification-service delivers balance summaries and alerts to, so a typo here
+  // has to be caught before the account is created rather than discovered when nothing ever arrives
+  it('rejects a malformed email without calling AuthService', async () => {
+    await fillValidFormAndWait();
+    typeInto(emailInput(), 'not-an-address');
+
+    submitForm();
+
+    expect(authServiceSpy.register).not.toHaveBeenCalled();
   });
 
   it('navigates to /login with a success message after registering', async () => {

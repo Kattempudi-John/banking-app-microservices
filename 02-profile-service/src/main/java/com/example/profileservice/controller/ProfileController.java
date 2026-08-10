@@ -50,14 +50,35 @@ public class ProfileController {
         return ResponseEntity.ok(Map.of("message", "Profile updated successfully"));
     }
 
+    // What the frontend's Profile page calls. Takes no userId at all - it reads the caller's own id
+    // out of the JWT, which is both why it can be safely authenticated-only and why one user can no
+    // longer look up another's KYC status by guessing an id.
+    @GetMapping("/profiles/me/kyc-status")
+    @PreAuthorize("hasAuthority('SCOPE_FULL_AUTH')")
+    public ResponseEntity<?> getMyKycStatus() {
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+        Long currentUserId = extractUserIdFromAuth(authentication);
+
+        return ResponseEntity.ok(Map.of("status", resolveKycStatus(currentUserId)));
+    }
+
+    // The service-to-service twin of the above, called by transaction-service's KycEnforcementAspect
+    // before it lets any money move. It has to stay unauthenticated - there is no end-user token on
+    // an internal call - so it lives under /api/v1/internal/, the one prefix the k8s ingress does not
+    // route. It previously sat at /api/v1/profiles/{userId}/kyc-status, which the ingress DOES route,
+    // publishing "any user's KYC status by id, no credentials required" to the internet.
     // @PathVariable pulls the {userId} segment straight out of the url and hands it to me
     // already converted to a long, spring matches it up by parameter name automatically
-    @GetMapping("/profiles/{userId}/kyc-status")
+    @GetMapping("/internal/profiles/{userId}/kyc-status")
     public ResponseEntity<?> getKycStatus(@PathVariable Long userId) {
+        return ResponseEntity.ok(Map.of("status", resolveKycStatus(userId)));
+    }
+
+    private String resolveKycStatus(Long userId) {
         UserProfile user = userProfileRepository.findById(userId)
                 .orElseGet(() -> provisionMissingProfile(userId));
 
-        return ResponseEntity.ok(Map.of("status", user.getKycStatus().name()));
+        return user.getKycStatus().name();
     }
 
     // A user can hold valid credentials in auth-service and still have no profile row here, if the

@@ -119,7 +119,7 @@ class ProfileServiceTestSuite {
         given(userProfileRepository.findById(999L)).willReturn(Optional.empty());
         given(userProfileRepository.save(any(UserProfile.class))).willAnswer(invocation -> invocation.getArgument(0));
 
-        mockMvc.perform(get("/api/v1/profiles/999/kyc-status"))
+        mockMvc.perform(get("/api/v1/internal/profiles/999/kyc-status"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("PENDING_VERIFICATION"));
 
@@ -140,9 +140,32 @@ class ProfileServiceTestSuite {
     void testFinalAC_GetKycStatus_ReturnsCurrentPendingState() throws Exception {
         given(userProfileRepository.findById(100L)).willReturn(Optional.of(mockUser));
 
-        mockMvc.perform(get("/api/v1/profiles/100/kyc-status"))
+        mockMvc.perform(get("/api/v1/internal/profiles/100/kyc-status"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("PENDING_VERIFICATION"));
+    }
+
+    // the endpoint the frontend calls: it takes no userId at all, so there is no id for a caller to
+    // tamper with - the status returned is always the one belonging to the token's own user
+    @Test
+    @DisplayName("Block 1b: /profiles/me/kyc-status Reads The Caller's Own Id From The JWT - [MEANT TO PASS]")
+    void testGetMyKycStatus_UsesTokenUserId() throws Exception {
+        given(userProfileRepository.findById(100L)).willReturn(Optional.of(mockUser));
+
+        mockMvc.perform(get("/api/v1/profiles/me/kyc-status")
+                .with(jwt().jwt(builder -> builder.claim("userId", 100L))
+                        .authorities(new SimpleGrantedAuthority("SCOPE_FULL_AUTH"))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("PENDING_VERIFICATION"));
+    }
+
+    // this is the whole reason the endpoint moved: it used to be permitAll AND sat under a path the
+    // k8s ingress publishes, so anyone on the internet could read any user's KYC status by id
+    @Test
+    @DisplayName("Block 1c: /profiles/me/kyc-status Rejects An Unauthenticated Caller - [MEANT TO FAIL]")
+    void testGetMyKycStatus_RequiresAuthentication() throws Exception {
+        mockMvc.perform(get("/api/v1/profiles/me/kyc-status"))
+                .andExpect(status().isUnauthorized());
     }
 
     // making sure the kyc webhook refuses a request with no signature header at all
@@ -522,10 +545,40 @@ class ProfileServiceTestSuite {
                 .andExpect(status().is4xxClientError());
     }
 
+    // the endpoint the Alert Preferences page calls - authenticated, and scoped to the token's own
+    // user, so nobody can read another person's threshold or email by changing an id
+    @Test
+    @DisplayName("Block: GET alerts/me returns the caller's own preferences - [MEANT TO PASS]")
+    void testBlock_GetMyPreferences_UsesTokenUserId() throws Exception {
+        UserPreferenceEntity existing = new UserPreferenceEntity();
+        existing.setUserId(100L);
+        existing.setAlertThresholdAmount(new BigDecimal("250.00"));
+        existing.setDailySummaryEnabled(true);
+        existing.setTimezone("Europe/London");
+        given(preferenceRepository.findByUserId(100L)).willReturn(Optional.of(existing));
+
+        mockMvc.perform(get("/api/v1/profile/alerts/me")
+                .with(jwt().jwt(builder -> builder.claim("userId", 100L))
+                        .authorities(new SimpleGrantedAuthority("SCOPE_FULL_AUTH"))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.userId").value(100))
+                .andExpect(jsonPath("$.alertThresholdAmount").value(250.00));
+    }
+
+    // the whole reason the service-to-service reads moved to /api/v1/internal/: now that the ingress
+    // routes /api/v1/profile, anything left unauthenticated under it would be public - and this
+    // response carries the user's email address
+    @Test
+    @DisplayName("Block: GET alerts/me Rejects An Unauthenticated Caller - [MEANT TO FAIL]")
+    void testBlock_GetMyPreferences_RequiresAuthentication() throws Exception {
+        mockMvc.perform(get("/api/v1/profile/alerts/me"))
+                .andExpect(status().isUnauthorized());
+    }
+
     // happy path: notification-service asks for a user's preferences and gets back exactly
     // what's stored, no authentication required since this is an internal service-to-service call
     @Test
-    @DisplayName("Block: GET alerts/{userId} returns the stored preferences unauthenticated - [MEANT TO PASS]")
+    @DisplayName("Block: GET internal preferences returns the stored values unauthenticated - [MEANT TO PASS]")
     void testBlock_GetPreferences_ExistingRow_ReturnsStoredValues() throws Exception {
         UserPreferenceEntity existing = new UserPreferenceEntity();
         existing.setUserId(100L);
@@ -534,7 +587,7 @@ class ProfileServiceTestSuite {
         existing.setTimezone("Europe/London");
         given(preferenceRepository.findByUserId(100L)).willReturn(Optional.of(existing));
 
-        mockMvc.perform(get("/api/v1/profile/alerts/100"))
+        mockMvc.perform(get("/api/v1/internal/profiles/100/preferences"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.userId").value(100))
                 .andExpect(jsonPath("$.alertThresholdAmount").value(250.00))
@@ -545,11 +598,11 @@ class ProfileServiceTestSuite {
     // a user with no preference row yet should still get a coherent response (the documented
     // defaults), not a 404 - and this lookup must never persist anything on its own
     @Test
-    @DisplayName("Block: GET alerts/{userId} returns documented defaults for a user with no row yet - [MEANT TO PASS]")
+    @DisplayName("Block: GET internal preferences returns documented defaults for a user with no row yet - [MEANT TO PASS]")
     void testBlock_GetPreferences_NoRow_ReturnsDefaultsWithoutPersisting() throws Exception {
         given(preferenceRepository.findByUserId(999L)).willReturn(Optional.empty());
 
-        mockMvc.perform(get("/api/v1/profile/alerts/999"))
+        mockMvc.perform(get("/api/v1/internal/profiles/999/preferences"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.alertThresholdAmount").value(100.00))
                 .andExpect(jsonPath("$.dailySummaryEnabled").value(false))
@@ -571,7 +624,7 @@ class ProfileServiceTestSuite {
         given(preferenceRepository.findByDailySummaryEnabledTrueAndTimezone("America/New_York"))
                 .willReturn(List.of(optedIn));
 
-        mockMvc.perform(get("/api/v1/profile/alerts/daily-summary-users").param("timezone", "America/New_York"))
+        mockMvc.perform(get("/api/v1/internal/profiles/daily-summary-users").param("timezone", "America/New_York"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.length()").value(1))
                 .andExpect(jsonPath("$[0].userId").value(200));

@@ -79,11 +79,11 @@ class NotificationAlertsTestSuite {
         // test cannot pass by accident if the listener regresses to using an account ID again.
         FundsTransferredEvent event = new FundsTransferredEvent(42L, 501L, 502L, new BigDecimal("150.00"), UUID.randomUUID());
         given(profileServiceClient.getUserPreferences(42L))
-                .willReturn(new UserPreferenceResponse(42L, new BigDecimal("100.00"), true, "America/New_York"));
+                .willReturn(new UserPreferenceResponse(42L, new BigDecimal("100.00"), true, "America/New_York", "alerts@example.com"));
 
         transactionAlertListener.consumeTransferEvent(event);
 
-        verify(notificationProviderService).dispatchEmail(eq("user_42@bank.com"), anyString(), anyString());
+        verify(notificationProviderService).dispatchEmail(eq("alerts@example.com"), anyString(), anyString());
         verify(profileServiceClient, never()).getUserPreferences(501L);
     }
 
@@ -96,7 +96,7 @@ class NotificationAlertsTestSuite {
     void testBlock2_transferBelowThreshold_noAlert() {
         FundsTransferredEvent event = new FundsTransferredEvent(42L, 501L, 502L, new BigDecimal("50.00"), UUID.randomUUID());
         given(profileServiceClient.getUserPreferences(42L))
-                .willReturn(new UserPreferenceResponse(42L, new BigDecimal("100.00"), true, "America/New_York"));
+                .willReturn(new UserPreferenceResponse(42L, new BigDecimal("100.00"), true, "America/New_York", "alerts@example.com"));
 
         transactionAlertListener.consumeTransferEvent(event);
 
@@ -145,14 +145,14 @@ class NotificationAlertsTestSuite {
     void testBlock5_listenerUsesUserIdNotAccountId() {
         FundsTransferredEvent event = new FundsTransferredEvent(777L, 111L, 222L, new BigDecimal("200.00"), UUID.randomUUID());
         given(profileServiceClient.getUserPreferences(777L))
-                .willReturn(new UserPreferenceResponse(777L, new BigDecimal("100.00"), true, "UTC"));
+                .willReturn(new UserPreferenceResponse(777L, new BigDecimal("100.00"), true, "UTC", "alerts@example.com"));
 
         transactionAlertListener.consumeTransferEvent(event);
 
         verify(profileServiceClient).getUserPreferences(777L);
         verify(profileServiceClient, never()).getUserPreferences(111L);
         verify(profileServiceClient, never()).getUserPreferences(222L);
-        verify(notificationProviderService).dispatchEmail(eq("user_777@bank.com"), anyString(), anyString());
+        verify(notificationProviderService).dispatchEmail(eq("alerts@example.com"), anyString(), anyString());
     }
 
     // USER STORY 9.3 (NotificationProviderService's own dispatch/retry/recover behavior) is
@@ -175,7 +175,7 @@ class NotificationAlertsTestSuite {
         // timezone string the job queries is deterministic - this stubs and verifies that one
         // zone specifically, rather than answering (and counting calls) for every zone at once.
         given(profileServiceClient.getUsersForDailySummary(eq(NEW_YORK_ZONE)))
-                .willReturn(List.of(new UserPreferenceResponse(100L, new BigDecimal("100.00"), true, NEW_YORK_ZONE)));
+                .willReturn(List.of(new UserPreferenceResponse(100L, new BigDecimal("100.00"), true, NEW_YORK_ZONE, "summary@example.com")));
         given(accountServiceClient.getAggregateBalancesBatch(eq(List.of(100L))))
                 .willReturn(List.of(new UserAggregateBalanceResponse(100L, new BigDecimal("5432.10"))));
 
@@ -183,7 +183,7 @@ class NotificationAlertsTestSuite {
 
         verify(profileServiceClient, times(1)).getUsersForDailySummary(eq(NEW_YORK_ZONE));
         verify(notificationProviderService, times(1))
-                .dispatchEmail(eq("user_100@bank.com"), anyString(), anyString());
+                .dispatchEmail(eq("summary@example.com"), anyString(), anyString());
     }
 
     // making sure an empty opted in list short circuits instead of doing pointless downstream work
@@ -211,7 +211,7 @@ class NotificationAlertsTestSuite {
     @DisplayName("Block 9: A user with no matching balance entry is skipped, not errored - [MEANT TO PASS]")
     void testBlock9_userWithoutMatchingBalance_isSkipped() {
         given(profileServiceClient.getUsersForDailySummary(anyString()))
-                .willReturn(List.of(new UserPreferenceResponse(200L, new BigDecimal("100.00"), true, "any")));
+                .willReturn(List.of(new UserPreferenceResponse(200L, new BigDecimal("100.00"), true, "any", "summary@example.com")));
         given(accountServiceClient.getAggregateBalancesBatch(eq(List.of(200L))))
                 .willReturn(List.of()); // Account Service returned nothing for this user
 

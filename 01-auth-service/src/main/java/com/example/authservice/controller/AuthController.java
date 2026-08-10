@@ -32,6 +32,7 @@ import com.example.authservice.repository.UserRepository;
 import com.example.authservice.security.TokenType;
 import com.example.authservice.service.AuthSecurityService;
 import com.example.authservice.service.JwtService;
+import com.example.authservice.util.PhoneNumberNormalizer;
 
 import jakarta.servlet.http.HttpServletRequest;
 
@@ -48,6 +49,7 @@ public class AuthController {
     private final RefreshTokenRepository refreshTokenRepository;
     private final UserRepository userRepository;
     private final PasswordEncoder passwordEncoder;
+    private final PhoneNumberNormalizer phoneNumberNormalizer;
 
     // Portfolio-demo affordance: surfaces the just-generated 2FA code in the login response so a
     // recruiter can click through the real 2FA screen without digging through service logs. This
@@ -62,13 +64,15 @@ public class AuthController {
                           AuthSecurityService authSecurityService,
                           RefreshTokenRepository refreshTokenRepository,
                           UserRepository userRepository,
-                          PasswordEncoder passwordEncoder) {
+                          PasswordEncoder passwordEncoder,
+                          PhoneNumberNormalizer phoneNumberNormalizer) {
         this.authenticationManager = authenticationManager;
         this.jwtService = jwtService;
         this.authSecurityService = authSecurityService;
         this.refreshTokenRepository = refreshTokenRepository;
         this.userRepository = userRepository;
         this.passwordEncoder = passwordEncoder;
+        this.phoneNumberNormalizer = phoneNumberNormalizer;
     }
 
     // ==========================================
@@ -110,10 +114,23 @@ public class AuthController {
             return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of("error", "That email is already registered"));
         }
 
+        // Store the number in E.164 or not at all. This is the number 2FA codes are sent to (see
+        // handleUnrecognizedDeviceLogin below), and the SMS provider rejects any other format - so a
+        // number accepted here in the wrong shape becomes a login that can never complete.
+        String normalizedPhone = null;
+        if (phoneNumber != null && !phoneNumber.isBlank()) {
+            normalizedPhone = phoneNumberNormalizer.normalize(phoneNumber)
+                    .orElse(null);
+            if (normalizedPhone == null) {
+                return ResponseEntity.badRequest()
+                        .body(Map.of("error", "Please enter a valid phone number, e.g. 571-285-6947 or +15712856947"));
+            }
+        }
+
         User newUser = new User();
         newUser.setUsername(username);
         newUser.setPassword(passwordEncoder.encode(password));
-        newUser.setPhoneNumber(phoneNumber);
+        newUser.setPhoneNumber(normalizedPhone);
         newUser.setEmail(email);
         newUser.setTotpEnabled(false);
         userRepository.save(newUser);

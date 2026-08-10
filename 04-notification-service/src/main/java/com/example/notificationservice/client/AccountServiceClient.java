@@ -17,6 +17,9 @@ public interface AccountServiceClient {
             BigDecimal totalBalance
     ) {}
 
-    @PostMapping("/api/v1/accounts/balances/batch")
+    // Moved under /api/v1/internal/ so the k8s ingress stops routing it publicly - it answers with
+    // users' total balances and is unauthenticated by necessity, since there's no end-user token on a
+    // service-to-service call.
+    @PostMapping("/api/v1/internal/accounts/balances/batch")
     List<UserAggregateBalanceResponse> getAggregateBalancesBatch(@RequestBody List<Long> userIds);
 }

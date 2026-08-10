@@ -370,7 +370,8 @@ class AuthManagementTestSuite {
 
         mockMvc.perform(post("/api/v1/auth/register")
                 .contentType(MediaType.APPLICATION_JSON)
-                .content("{\"username\":\"newuser\",\"password\":\"SecurePass123!\",\"phoneNumber\":\"+15551234567\"}"))
+                .content("{\"username\":\"newuser\",\"password\":\"SecurePass123!\",\"phoneNumber\":\"+15551234567\","
+                        + "\"email\":\"newuser@example.com\"}"))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.status").value("SUCCESS"));
 
@@ -379,6 +380,9 @@ class AuthManagementTestSuite {
         assertThat(savedUser.getValue().getUsername()).isEqualTo("newuser");
         assertThat(savedUser.getValue().getPassword()).isNotEqualTo("SecurePass123!");
         assertThat(passwordEncoder.matches("SecurePass123!", savedUser.getValue().getPassword())).isTrue();
+        // notification-service delivers balance summaries and alerts here - a user saved without one
+        // can't be emailed at all
+        assertThat(savedUser.getValue().getEmail()).isEqualTo("newuser@example.com");
     }
 
     // confirms registration publishes a UserRegistered event so profile-service/account-service
@@ -396,7 +400,8 @@ class AuthManagementTestSuite {
 
         mockMvc.perform(post("/api/v1/auth/register")
                 .contentType(MediaType.APPLICATION_JSON)
-                .content("{\"username\":\"newuser\",\"password\":\"SecurePass123!\",\"phoneNumber\":\"+15551234567\"}"))
+                .content("{\"username\":\"newuser\",\"password\":\"SecurePass123!\",\"phoneNumber\":\"+15551234567\","
+                        + "\"email\":\"newuser@example.com\"}"))
                 .andExpect(status().isCreated());
 
         ArgumentCaptor<String> payload = ArgumentCaptor.forClass(String.class);
@@ -404,6 +409,9 @@ class AuthManagementTestSuite {
         assertThat(payload.getValue()).contains("\"userId\":\"99\"");
         assertThat(payload.getValue()).contains("\"username\":\"newuser\"");
         assertThat(payload.getValue()).contains("\"phoneNumber\":\"+15551234567\"");
+        // the address has to travel on the event itself - profile-service stores it from here, and
+        // notification-service reads it back from profile-service when it needs to send anything
+        assertThat(payload.getValue()).contains("\"email\":\"newuser@example.com\"");
     }
 
     @Test
@@ -413,7 +421,7 @@ class AuthManagementTestSuite {
 
         mockMvc.perform(post("/api/v1/auth/register")
                 .contentType(MediaType.APPLICATION_JSON)
-                .content("{\"username\":\"johndoe\",\"password\":\"SecurePass123!\"}"))
+                .content("{\"username\":\"johndoe\",\"password\":\"SecurePass123!\",\"email\":\"johndoe@example.com\"}"))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.error").value("Username is already taken"));
 
@@ -442,6 +450,85 @@ class AuthManagementTestSuite {
                 .content("{\"username\":\"newuser\",\"password\":\"short\"}"))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error").exists());
+    }
+
+    // an account with no address on file can never receive a balance summary or a transaction alert,
+    // so registration insists on one even though the column itself is nullable for older rows
+    @Test
+    @DisplayName("Register: Missing Email Rejected - [MEANT TO FAIL]")
+    void testRegister_MissingEmail_Rejected() throws Exception {
+        mockMvc.perform(post("/api/v1/auth/register")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"username\":\"newuser\",\"password\":\"SecurePass123!\",\"phoneNumber\":\"+15551234567\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("Email is required"));
+
+        verify(kafkaTemplate, never()).send(eq("user-events"), any(String.class));
+    }
+
+    // catches the obvious typo before it becomes an undeliverable address sitting in the database
+    @Test
+    @DisplayName("Register: Malformed Email Rejected - [MEANT TO FAIL]")
+    void testRegister_MalformedEmail_Rejected() throws Exception {
+        mockMvc.perform(post("/api/v1/auth/register")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"username\":\"newuser\",\"password\":\"SecurePass123!\",\"email\":\"not-an-address\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("Please enter a valid email address"));
+
+        verify(kafkaTemplate, never()).send(eq("user-events"), any(String.class));
+    }
+
+    // a number stored the way a person types it is silently undeliverable - the SMS provider only
+    // accepts E.164 - so registration converts it rather than storing what was typed
+    @Test
+    @DisplayName("Register: Phone Number Stored In E.164 Regardless Of Typed Format - [MEANT TO PASS]")
+    void testRegister_NormalizesPhoneNumber() throws Exception {
+        given(userRepository.existsByUsername("newuser")).willReturn(false);
+
+        mockMvc.perform(post("/api/v1/auth/register")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"username\":\"newuser\",\"password\":\"SecurePass123!\",\"phoneNumber\":\"(571) 285-6947\","
+                        + "\"email\":\"newuser@example.com\"}"))
+                .andExpect(status().isCreated());
+
+        ArgumentCaptor<User> savedUser = ArgumentCaptor.forClass(User.class);
+        verify(userRepository).save(savedUser.capture());
+        assertThat(savedUser.getValue().getPhoneNumber()).isEqualTo("+15712856947");
+    }
+
+    // refused rather than stored as-is: a number that can't be resolved would produce an account
+    // that can never complete a 2FA login, with nothing to indicate why
+    @Test
+    @DisplayName("Register: Unresolvable Phone Number Rejected - [MEANT TO FAIL]")
+    void testRegister_InvalidPhoneNumber_Rejected() throws Exception {
+        given(userRepository.existsByUsername("newuser")).willReturn(false);
+
+        mockMvc.perform(post("/api/v1/auth/register")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"username\":\"newuser\",\"password\":\"SecurePass123!\",\"phoneNumber\":\"285-6947\","
+                        + "\"email\":\"newuser@example.com\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").exists());
+
+        verify(kafkaTemplate, never()).send(eq("user-events"), any(String.class));
+    }
+
+    // the email column is unique, so this has to be caught up front rather than surfacing as a
+    // constraint violation from the insert
+    @Test
+    @DisplayName("Register: Duplicate Email Rejected With Conflict - [MEANT TO FAIL]")
+    void testRegister_DuplicateEmail_Rejected() throws Exception {
+        given(userRepository.existsByUsername("newuser")).willReturn(false);
+        given(userRepository.existsByEmail("taken@example.com")).willReturn(true);
+
+        mockMvc.perform(post("/api/v1/auth/register")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"username\":\"newuser\",\"password\":\"SecurePass123!\",\"email\":\"taken@example.com\"}"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.error").value("That email is already registered"));
+
+        verify(kafkaTemplate, never()).send(eq("user-events"), any(String.class));
     }
 
     private String hashString(String input) {

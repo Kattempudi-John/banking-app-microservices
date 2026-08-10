@@ -25,10 +25,30 @@ override.tf.json
 .DS_Store
 Thumbs.db
 
-# no .env file exists in this repo today, but this is a banking-flavored project - keep it out
-# defensively in case one ever gets created for local secrets
+# local secrets live in .env (Twilio account sid/auth token, SendGrid api key, and anything else
+# added later). Never committed - the tracked .env.example carries the variable NAMES only, so a
+# fresh clone knows what to set without any real value ever reaching git.
 .env
 *.env
+.env.*
+!.env.example
+
+# Spring's convention for a local-only profile. Anything in a file named like this is assumed to
+# hold real credentials, so it stays out of git across every service.
+**/application-local.yml
+**/application-local.yaml
+**/application-local.properties
+**/application-secrets.yml
+
+# a k8s Secret manifest with real values filled in - the tracked k8s/02-secrets.yaml holds
+# placeholders only, so any *.local.yaml copy of it is the one carrying the real thing
+k8s/*.local.yaml
+
+# private keys and certificates, whatever tool drops them
+*.pem
+*.key
+*.p12
+*.jks
 
 # personal local planning doc for a future AWS deploy session - not meant to be tracked/shared
 aws-deployment-plan/

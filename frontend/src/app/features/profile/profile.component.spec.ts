@@ -63,7 +63,7 @@ describe('ProfileComponent', () => {
 
   it('fetches and displays the KYC status for the logged-in user', async () => {
     await setup('APPROVED');
-    expect(profileServiceSpy.getKycStatus).toHaveBeenCalledWith(42);
+    expect(profileServiceSpy.getKycStatus).toHaveBeenCalled();
     expect(fixture.nativeElement.textContent).toContain('APPROVED');
   });
 
