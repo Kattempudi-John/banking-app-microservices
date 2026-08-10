@@ -39,6 +39,9 @@ public class AccountEntity {
     @Column(name = "account_number", nullable = false, unique = true, length = 20)
     private String accountNumber;
 
+    @Column(name = "iban", unique = true, length = 34)
+    private String iban;
+
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)
     private AccountStatus status;
@@ -78,6 +81,8 @@ public class AccountEntity {
     public void setRoutingNumber(String routingNumber) { this.routingNumber = routingNumber; }
     public String getAccountNumber() { return accountNumber; }
     public void setAccountNumber(String accountNumber) { this.accountNumber = accountNumber; }
+    public String getIban() { return iban; }
+    public void setIban(String iban) { this.iban = iban; }
     public AccountStatus getStatus() { return status; }
     public void setStatus(AccountStatus status) { this.status = status; }
     public LocalDateTime getCreatedAt() { return createdAt; }

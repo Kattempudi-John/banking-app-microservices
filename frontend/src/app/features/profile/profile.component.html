@@ -12,6 +12,34 @@
       <app-alert-banner [type]="kycMessageType()" [message]="kycMessage()" />
     </div>
 
+    @if (accounts().length > 0) {
+      <div class="stack receive-money">
+        <h2>Receive Money</h2>
+        <p class="text-muted">
+          Share an account's IBAN with another user on this platform to receive an instant transfer via the Transfer page's External Wire tab.
+        </p>
+        @for (account of accounts(); track account.accountId) {
+          <div class="stack receive-money-account">
+            <p class="text-muted">{{ account.accountType }} {{ account.maskedAccountNumber }}</p>
+            <div class="receive-money-row">
+              <span class="receive-money-label">IBAN</span>
+              <span class="receive-money-value">{{ account.iban }}</span>
+              <app-button variant="secondary" (clicked)="copyToClipboard(account.accountId + '-iban', account.iban)">
+                {{ copiedField() === account.accountId + '-iban' ? 'Copied!' : 'Copy' }}
+              </app-button>
+            </div>
+            <div class="receive-money-row">
+              <span class="receive-money-label">SWIFT/BIC</span>
+              <span class="receive-money-value">{{ account.swiftCode }}</span>
+              <app-button variant="secondary" (clicked)="copyToClipboard(account.accountId + '-swift', account.swiftCode)">
+                {{ copiedField() === account.accountId + '-swift' ? 'Copied!' : 'Copy' }}
+              </app-button>
+            </div>
+          </div>
+        }
+      </div>
+    }
+
     <form class="stack" (submit)="submit(); $event.preventDefault()">
       <app-input
         id="phoneNumber"

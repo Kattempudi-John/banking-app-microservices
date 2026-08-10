@@ -7,6 +7,8 @@ import { AccountTransactionsComponent } from './features/account-transactions/ac
 import { TransferComponent } from './features/transfer/transfer.component';
 import { ProfileComponent } from './features/profile/profile.component';
 import { AlertPreferencesComponent } from './features/alert-preferences/alert-preferences.component';
+import { NotificationsComponent } from './features/notifications/notifications.component';
+import { HistoryComponent } from './features/history/history.component';
 import { authGuard } from './core/auth.guard';
 
 export const routes: Routes = [
@@ -17,5 +19,7 @@ export const routes: Routes = [
   { path: 'transfer', component: TransferComponent, canActivate: [authGuard] },
   { path: 'profile', component: ProfileComponent, canActivate: [authGuard] },
   { path: 'profile/alerts', component: AlertPreferencesComponent, canActivate: [authGuard] },
+  { path: 'notifications', component: NotificationsComponent, canActivate: [authGuard] },
+  { path: 'history', component: HistoryComponent, canActivate: [authGuard] },
   { path: '', redirectTo: 'login', pathMatch: 'full' },
 ];

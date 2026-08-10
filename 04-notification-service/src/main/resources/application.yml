@@ -10,7 +10,18 @@ spring:
   jpa:
     hibernate:
       ddl-auto: update
+      properties:
+        hibernate:
+          default_schema: notification
     show-sql: true
+  # account-service and transaction-service already occupy version numbers 1-7 in this shared
+  # local database's public schema/flyway history - this service's own V1 would collide there
+  # (different content, same version number), so it gets its own schema instead, same as
+  # 05-audit-service does.
+  flyway:
+    schemas: notification
+    default-schema: notification
+    create-schemas: true
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
   # the only service with a redis block, backs whatever caching ProfileServiceClient does with @cacheable

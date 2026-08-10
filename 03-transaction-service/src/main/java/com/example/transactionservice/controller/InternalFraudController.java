@@ -80,7 +80,17 @@ class FraudResolutionService {
     }
 
     private void finalizeTransaction(TransactionEntity transaction, String reviewerNotes) {
-        // Funds were already deducted during initiation, so we simply finalize the status.
+        // Funds were already deducted during initiation. For a genuinely external wire that's all
+        // that's needed - the money conceptually left the platform. For an on-us wire that was
+        // held for review, the destination account never got its half of the transfer yet - credit
+        // it now, completing the second leg (same account-service call the immediate-complete path
+        // in ExternalWireService already makes for on-us wires that don't need review).
+        if (transaction.getDestinationAccountId() != null) {
+            accountServiceClient.credit(transaction.getDestinationAccountId(), new AccountServiceClient.CreditRequest(
+                    transaction.getAmount(), "Incoming transfer from account " + transaction.getAccountId()
+                            + " (wire " + transaction.getTransactionId() + ")"));
+        }
+
         transaction.setStatus(TransactionStatus.COMPLETED);
         transaction.setDescription(transaction.getDescription() + " [Fraud Review: APPROVED. Notes: " + reviewerNotes + "]");
         transactionRepository.save(transaction);

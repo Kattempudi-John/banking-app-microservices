@@ -16,4 +16,5 @@ export type TransferStatus = 'COMPLETED' | 'PENDING_APPROVAL' | 'REJECTED' | 'FA
 export interface TransferResponse {
   transactionId: string;
   status: TransferStatus;
+  onUsTransfer: boolean;
 }

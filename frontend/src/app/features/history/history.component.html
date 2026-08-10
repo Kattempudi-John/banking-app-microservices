@@ -1,0 +1,62 @@
+<app-nav />
+
+<div class="page">
+  <div class="page-header">
+    <h1>History</h1>
+  </div>
+
+  <div class="filters">
+    <div class="select-group">
+      <label for="accountFilter">Account</label>
+      <select id="accountFilter" (change)="onAccountFilterChange($any($event.target).value)">
+        <option value="">All accounts</option>
+        @for (acc of accounts(); track acc.accountId) {
+          <option [value]="acc.accountId">{{ acc.accountType }} {{ acc.maskedAccountNumber }}</option>
+        }
+      </select>
+    </div>
+    <div class="select-group">
+      <label for="kindFilter">Type</label>
+      <select id="kindFilter" (change)="onKindFilterChange($any($event.target).value)">
+        <option value="ALL">All</option>
+        <option value="CREDIT">Credit</option>
+        <option value="DEBIT">Debit</option>
+        <option value="ON_US_WIRE">On-Us Wire</option>
+        <option value="EXTERNAL_WIRE">External Wire</option>
+      </select>
+    </div>
+    <div class="select-group">
+      <label for="statusFilter">Status</label>
+      <select id="statusFilter" (change)="onStatusFilterChange($any($event.target).value)">
+        <option value="ALL">All</option>
+        <option value="COMPLETED">Completed</option>
+        <option value="PENDING_APPROVAL">Pending Approval</option>
+        <option value="REJECTED">Rejected</option>
+        <option value="FAILED">Failed</option>
+      </select>
+    </div>
+    <div class="select-group">
+      <label for="fromFilter">From</label>
+      <input id="fromFilter" type="date" (change)="onFromChange($any($event.target).value)" />
+    </div>
+    <div class="select-group">
+      <label for="toFilter">To</label>
+      <input id="toFilter" type="date" (change)="onToChange($any($event.target).value)" />
+    </div>
+  </div>
+
+  @if (error()) {
+    <div class="card stack">
+      <p class="text-muted">Unable to load your history.</p>
+      <app-button (clicked)="retry()">Retry</app-button>
+    </div>
+  } @else if (filteredEntries().length === 0) {
+    <div class="card">
+      <p class="text-muted">No history found.</p>
+    </div>
+  } @else {
+    <div class="card table-card">
+      <app-table [columns]="columns" [rows]="filteredEntries()" />
+    </div>
+  }
+</div>

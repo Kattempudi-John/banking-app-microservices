@@ -2,3 +2,25 @@
   max-width: 480px;
   margin-inline: auto;
 }
+
+.receive-money-account {
+  border-top: var(--border-width) solid var(--border);
+  padding-top: 0.75rem;
+}
+
+.receive-money-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.receive-money-label {
+  min-width: 5.5rem;
+  font-weight: 600;
+}
+
+.receive-money-value {
+  flex: 1;
+  font-family: monospace;
+  overflow-wrap: anywhere;
+}

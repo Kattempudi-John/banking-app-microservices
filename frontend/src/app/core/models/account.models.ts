@@ -8,6 +8,8 @@ export interface AccountOverview {
   availableBalance: number;
   routingNumber: string;
   maskedAccountNumber: string;
+  iban: string;
+  swiftCode: string;
   status: AccountStatus;
 }
 

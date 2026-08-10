@@ -1,0 +1,28 @@
+<app-nav />
+
+<div class="page">
+  <div class="page-header">
+    <h1>Notifications</h1>
+  </div>
+
+  @if (error()) {
+    <div class="card stack">
+      <p class="text-muted">Unable to load your notifications.</p>
+      <app-button (clicked)="retry()">Retry</app-button>
+    </div>
+  } @else if (notifications().length === 0) {
+    <div class="card">
+      <p class="text-muted">No notifications yet.</p>
+    </div>
+  } @else {
+    <div class="card table-card">
+      <app-table [columns]="columns" [rows]="notifications()" />
+    </div>
+
+    <div class="pagination">
+      <app-button variant="secondary" [disabled]="currentPage() === 0" (clicked)="goToPage(currentPage() - 1)">Prev</app-button>
+      <span class="text-muted">Page {{ currentPage() + 1 }} of {{ totalPages() }}</span>
+      <app-button variant="secondary" [disabled]="currentPage() + 1 >= totalPages()" (clicked)="goToPage(currentPage() + 1)">Next</app-button>
+    </div>
+  }
+</div>

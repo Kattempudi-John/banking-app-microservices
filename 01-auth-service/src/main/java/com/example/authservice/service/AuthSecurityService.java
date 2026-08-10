@@ -80,7 +80,7 @@ public class AuthSecurityService {
     @Transactional
     public String triggerSms2fa(Long userId, String phoneNumber) {
         String code = generateAndStoreCode(userId);
-        publishSmsEvent(phoneNumber, code);
+        publishSmsEvent(userId, phoneNumber, code);
         return code; // Returned so the controller can surface it in demo mode; real delivery is still via Kafka/SMS above
     }
 
@@ -97,11 +97,12 @@ public class AuthSecurityService {
         return code;
     }
 
-    private void publishSmsEvent(String phoneNumber, String code) {
+    private void publishSmsEvent(Long userId, String phoneNumber, String code) {
         // 4. Fire the Kafka Event
         try {
             Map<String, String> event = new HashMap<>();
             event.put("action", "SMS_2FA_REQUESTED");
+            event.put("userId", userId.toString()); // notification-service needs this to record who the SMS was sent to
             event.put("phoneNumber", phoneNumber);
             event.put("code", code); // The notification service needs the raw code to send it via Twilio
 

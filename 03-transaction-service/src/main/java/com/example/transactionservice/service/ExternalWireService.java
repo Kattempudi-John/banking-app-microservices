@@ -49,7 +49,16 @@ public class ExternalWireService {
         // 1. Validate format
         validateFormat(request);
 
-        // 2-3. Pre-reserve the funds: account-service locks the row, verifies ownership/funds,
+        // 2. Check whether this IBAN actually belongs to an account on this platform - if so,
+        // this is really a peer-to-peer transfer between two real accounts, not money leaving to
+        // a correspondent bank. A genuinely unresolved IBAN keeps today's simulated-external
+        // behavior below untouched.
+        Long destinationAccountId = resolveOnUsDestination(request.iban());
+        boolean onUsTransfer = destinationAccountId != null;
+
+        UUID transactionId = UUID.randomUUID();
+
+        // 3-4. Pre-reserve the funds: account-service locks the row, verifies ownership/funds,
         // debits it, and records the DEBIT transaction-history row, all atomically.
         accountServiceClient.debit(fromAccountId, new AccountServiceClient.DebitRequest(
                 userId, request.amount(), "External Wire to " + request.beneficiaryName()));
@@ -57,15 +66,35 @@ public class ExternalWireService {
         // 5. Threshold Check Logic
         TransactionStatus finalStatus = determineTransactionStatus(request.amount());
 
-        // 6. Record the transaction state
-        UUID transactionId = UUID.randomUUID();
-        recordTransaction(transactionId, fromAccountId, request, finalStatus);
+        // 6. An on-us wire that clears immediately completes its second leg right now; one that's
+        // held for fraud review only gets credited to the destination later, once
+        // FraudResolutionService approves it - mirroring how a held wire's reversal already works.
+        if (onUsTransfer && finalStatus == TransactionStatus.COMPLETED) {
+            accountServiceClient.credit(destinationAccountId, new AccountServiceClient.CreditRequest(
+                    request.amount(), "Incoming transfer from account " + fromAccountId + " (wire " + transactionId + ")"));
+        }
 
-        // 7. Publish to Kafka if flagged for Fraud Review
+        // 7. Record the transaction state
+        recordTransaction(transactionId, fromAccountId, request, finalStatus, destinationAccountId);
+
+        // 8. Publish to Kafka if flagged for Fraud Review
         publishFraudReviewIfNeeded(transactionId, fromAccountId, request, finalStatus);
 
-        // 8. Return the UUID and the resulting status (either COMPLETED or PENDING_APPROVAL)
-        return new TransferResponseDto(transactionId, finalStatus.name());
+        // 9. Return the UUID, the resulting status (either COMPLETED or PENDING_APPROVAL), and
+        // whether this actually stayed on-platform
+        return new TransferResponseDto(transactionId, finalStatus.name(), onUsTransfer);
+    }
+
+    private Long resolveOnUsDestination(String iban) {
+        try {
+            AccountServiceClient.AccountLookupResponse account = accountServiceClient.lookupByIban(iban);
+            return account != null ? account.accountId() : null;
+        } catch (ResponseStatusException e) {
+            if (e.getStatusCode() == HttpStatus.NOT_FOUND) {
+                return null; // No account on this platform has this IBAN - a genuinely external wire
+            }
+            throw e;
+        }
     }
 
     private void validateFormat(ExternalWireRequestDto request) {
@@ -87,13 +116,18 @@ public class ExternalWireService {
         return TransactionStatus.COMPLETED;
     }
 
-    private void recordTransaction(UUID transactionId, Long fromAccountId, ExternalWireRequestDto request, TransactionStatus status) {
+    private void recordTransaction(UUID transactionId, Long fromAccountId, ExternalWireRequestDto request,
+                                    TransactionStatus status, Long destinationAccountId) {
         TransactionEntity transaction = new TransactionEntity();
         transaction.setTransactionId(transactionId);
         transaction.setAccountId(fromAccountId);
         transaction.setAmount(request.amount());
         transaction.setStatus(status);
         transaction.setDescription("External Wire to " + request.beneficiaryName());
+        transaction.setIban(request.iban());
+        transaction.setSwiftCode(request.swiftCode());
+        transaction.setBeneficiaryName(request.beneficiaryName());
+        transaction.setDestinationAccountId(destinationAccountId);
         transactionRepository.save(transaction);
     }
 

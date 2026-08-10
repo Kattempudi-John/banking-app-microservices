@@ -6,6 +6,8 @@ import com.example.transactionservice.client.ProfileServiceClient;
 import com.example.transactionservice.controller.TransferController.InternalTransferRequestDto;
 import com.example.transactionservice.event.FundsTransferredEvent;
 import com.example.transactionservice.event.LargeTransferRequestedEvent;
+import com.example.transactionservice.model.TransactionEntity;
+import com.example.transactionservice.model.TransactionStatus;
 import com.example.transactionservice.repository.TransactionRepository;
 import com.example.transactionservice.service.ExternalWireService;
 import com.example.transactionservice.service.TransferService;
@@ -18,6 +20,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.data.domain.PageImpl;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.kafka.core.KafkaTemplate;
@@ -35,16 +38,23 @@ import static org.springframework.security.test.web.servlet.request.SecurityMock
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.willThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
@@ -387,5 +397,161 @@ class TransferServiceTestSuite {
                 .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isForbidden())
                 .andExpect(jsonPath("$.error").value(org.hamcrest.Matchers.containsString("PENDING_VERIFICATION")));
+    }
+
+    // ==========================================
+    // On-network transfers via IBAN: an external wire whose IBAN resolves to an account on this
+    // platform executes as a real transfer (debit + credit) instead of the debit-only simulation
+    // used for a genuinely external destination.
+    // ==========================================
+
+    // an on-us wire that clears the fraud threshold immediately should complete both legs right
+    // away - debit the sender via account-service as usual, but also credit the resolved
+    // destination account, and report onUsTransfer=true so the frontend can say so
+    @Test
+    @DisplayName("On-us wire under threshold resolves via IBAN and credits the destination immediately - [MEANT TO PASS]")
+    void testOnUsWire_UnderThreshold_CreditsDestinationImmediately() {
+        authenticateAsFullAuthUser(42);
+        given(accountServiceClient.lookupByIban(VALID_IBAN))
+                .willReturn(new AccountServiceClient.AccountLookupResponse(99L, 55L, "CHECKING", "ACTIVE"));
+
+        var request = new com.example.transactionservice.dto.ExternalWireRequestDto(
+                VALID_IBAN, VALID_SWIFT, "Jane Doe", new BigDecimal("100.00"));
+
+        var response = externalWireService.initiateWire(42L, 1L, request);
+
+        assertThat(response.status()).isEqualTo("COMPLETED");
+        assertThat(response.onUsTransfer()).isTrue();
+        verify(accountServiceClient).debit(eq(1L), any());
+        verify(accountServiceClient).credit(eq(99L), any());
+        verify(largeTransferKafkaTemplate, never()).send(any(), any(), any());
+    }
+
+    // the flip side: an on-us wire over the threshold should still only hold funds (debit-only) at
+    // initiation, exactly like a genuinely external wire does - the destination doesn't get its
+    // half of the transfer until fraud review approves it (see the next test)
+    @Test
+    @DisplayName("On-us wire over threshold holds funds without crediting the destination yet - [MEANT TO PASS]")
+    void testOnUsWire_OverThreshold_HoldsWithoutCreditingYet() {
+        authenticateAsFullAuthUser(42);
+        given(accountServiceClient.lookupByIban(VALID_IBAN))
+                .willReturn(new AccountServiceClient.AccountLookupResponse(99L, 55L, "CHECKING", "ACTIVE"));
+
+        var request = new com.example.transactionservice.dto.ExternalWireRequestDto(
+                VALID_IBAN, VALID_SWIFT, "Jane Doe", new BigDecimal("7500.00"));
+
+        var response = externalWireService.initiateWire(42L, 1L, request);
+
+        assertThat(response.status()).isEqualTo("PENDING_APPROVAL");
+        assertThat(response.onUsTransfer()).isTrue();
+        verify(accountServiceClient).debit(eq(1L), any());
+        verify(accountServiceClient, never()).credit(any(), any());
+        verify(largeTransferKafkaTemplate).send(eq("large-transfers-review"), any(), any(LargeTransferRequestedEvent.class));
+    }
+
+    // an IBAN that doesn't belong to any account here (account-service returns 404, translated by
+    // FeignErrorConfig into a 404 ResponseStatusException) must fall back to today's simulated
+    // external behavior exactly - the regression guard that this feature doesn't change existing wires
+    @Test
+    @DisplayName("Wire with an unresolved IBAN stays a genuinely external, non-on-us wire - [MEANT TO PASS]")
+    void testExternalWire_UnresolvedIban_IsNotOnUs() {
+        authenticateAsFullAuthUser(42);
+        willThrow(new ResponseStatusException(HttpStatus.NOT_FOUND, "Account not found"))
+                .given(accountServiceClient).lookupByIban(VALID_IBAN);
+
+        var request = new com.example.transactionservice.dto.ExternalWireRequestDto(
+                VALID_IBAN, VALID_SWIFT, "Jane Doe", new BigDecimal("100.00"));
+
+        var response = externalWireService.initiateWire(42L, 1L, request);
+
+        assertThat(response.status()).isEqualTo("COMPLETED");
+        assertThat(response.onUsTransfer()).isFalse();
+        verify(accountServiceClient, never()).credit(any(), any());
+    }
+
+    // completing the held-wire story from testOnUsWire_OverThreshold above: once fraud review
+    // approves a held wire that has a destinationAccountId, the destination should finally get
+    // credited as part of finalizing it - this is the second leg that was deferred at initiation
+    @Test
+    @DisplayName("Approving a held on-us wire credits the destination account before completing - [MEANT TO PASS]")
+    void testFraudApproval_HeldOnUsWire_CreditsDestinationOnApproval() throws Exception {
+        UUID transactionId = UUID.randomUUID();
+        TransactionEntity heldWire = new TransactionEntity();
+        heldWire.setTransactionId(transactionId);
+        heldWire.setAccountId(1L);
+        heldWire.setAmount(new BigDecimal("7500.00"));
+        heldWire.setStatus(TransactionStatus.PENDING_APPROVAL);
+        heldWire.setDescription("External Wire to Jane Doe");
+        heldWire.setDestinationAccountId(99L);
+        given(transactionRepository.findById(transactionId)).willReturn(Optional.of(heldWire));
+
+        mockMvc.perform(patch("/api/v1/internal/transfers/{id}/fraud-status", transactionId)
+                .with(jwt().jwt(j -> j.claim("scope", "FULL_AUTH").claim("userId", 42L)))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"status\":\"APPROVED\",\"reviewerNotes\":\"looks fine\"}"))
+                .andExpect(status().isOk());
+
+        verify(accountServiceClient).credit(eq(99L), any());
+        verify(transactionRepository).save(argThat(tx -> tx.getStatus() == TransactionStatus.COMPLETED));
+    }
+
+    // and the control case: approving a genuinely external held wire (no destinationAccountId) must
+    // NOT call credit at all - there's no real destination account here to credit, exactly today's behavior
+    @Test
+    @DisplayName("Approving a held genuinely-external wire does not attempt to credit anything - [MEANT TO PASS]")
+    void testFraudApproval_HeldExternalWire_DoesNotCreditAnything() throws Exception {
+        UUID transactionId = UUID.randomUUID();
+        TransactionEntity heldWire = new TransactionEntity();
+        heldWire.setTransactionId(transactionId);
+        heldWire.setAccountId(1L);
+        heldWire.setAmount(new BigDecimal("7500.00"));
+        heldWire.setStatus(TransactionStatus.PENDING_APPROVAL);
+        heldWire.setDescription("External Wire to Jane Doe");
+        given(transactionRepository.findById(transactionId)).willReturn(Optional.of(heldWire));
+
+        mockMvc.perform(patch("/api/v1/internal/transfers/{id}/fraud-status", transactionId)
+                .with(jwt().jwt(j -> j.claim("scope", "FULL_AUTH").claim("userId", 42L)))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"status\":\"APPROVED\",\"reviewerNotes\":\"looks fine\"}"))
+                .andExpect(status().isOk());
+
+        verify(accountServiceClient, never()).credit(any(), any());
+        verify(transactionRepository).save(argThat(tx -> tx.getStatus() == TransactionStatus.COMPLETED));
+    }
+
+    // ==========================================
+    // Transfer History (GET /api/v1/transfers) - powers the frontend's History page
+    // ==========================================
+
+    @Test
+    @DisplayName("Transfer history resolves the caller's account IDs via account-service and queries by them - [MEANT TO PASS]")
+    void testTransferHistory_ResolvesOwnedAccountIdsAndReturnsRecords() throws Exception {
+        given(accountServiceClient.getAccountIdsByUser(42L)).willReturn(List.of(1L, 2L));
+        given(transactionRepository.findByAccountIdInWithFilters(eq(List.of(1L, 2L)), isNull(), isNull(), isNull(), any()))
+                .willReturn(new PageImpl<>(List.of()));
+
+        mockMvc.perform(get("/api/v1/transfers")
+                .with(jwt().jwt(j -> j.claim("scope", "FULL_AUTH").claim("userId", 42L))))
+                .andExpect(status().isOk());
+
+        verify(accountServiceClient).getAccountIdsByUser(42L);
+    }
+
+    @Test
+    @DisplayName("Transfer history narrowed to an accountId not owned by the caller is forbidden - [MEANT TO FAIL]")
+    void testTransferHistory_AccountIdFilterNotOwned_Returns403() throws Exception {
+        given(accountServiceClient.getAccountIdsByUser(42L)).willReturn(List.of(1L));
+
+        mockMvc.perform(get("/api/v1/transfers")
+                .param("accountId", "999")
+                .with(jwt().jwt(j -> j.claim("scope", "FULL_AUTH").claim("userId", 42L))))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    @DisplayName("Transfer history is rejected for an unauthenticated caller - [MEANT TO FAIL]")
+    void testTransferHistory_UnauthenticatedDenied() throws Exception {
+        mockMvc.perform(get("/api/v1/transfers"))
+                .andExpect(status().is4xxClientError());
     }
 }

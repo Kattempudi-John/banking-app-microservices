@@ -13,6 +13,7 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.data.web.PageableDefault;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
@@ -21,6 +22,7 @@ import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.*;
 
 import java.math.BigDecimal;
+import java.time.LocalDateTime;
 import java.util.List;
 
 @RestController
@@ -75,6 +77,23 @@ public class AccountController {
         // Returns the standard Spring Page JSON containing content and metadata (totalPages, totalElements)
         // learned page<t> serializes to json with a content array plus all that pagination
         // metadata bundled in automatically, did not have to build a custom response wrapper for it
+        return ResponseEntity.ok(transactions);
+    }
+
+    // Powers the frontend's History page - spans every account the caller owns (or just one, via
+    // accountId) instead of the single-account scope getTransactionHistory below is limited to.
+    @GetMapping("/transactions")
+    public ResponseEntity<Page<TransactionEntity>> getAllTransactionsAcrossAccounts(
+            @RequestParam(required = false) Long accountId,
+            @RequestParam(required = false) TransactionType type,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) LocalDateTime from,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) LocalDateTime to,
+            @PageableDefault(size = 50, sort = "createdAt", direction = Sort.Direction.DESC) Pageable pageable) {
+
+        Long userId = extractUserIdFromAuth();
+
+        Page<TransactionEntity> transactions = accountService.getAllTransactions(userId, accountId, type, from, to, pageable);
+
         return ResponseEntity.ok(transactions);
     }
 

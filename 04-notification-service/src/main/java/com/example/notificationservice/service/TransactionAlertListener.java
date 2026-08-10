@@ -9,6 +9,11 @@ import org.springframework.stereotype.Service;
 
 import com.example.notificationservice.client.ProfileServiceClient;
 import com.example.notificationservice.event.FundsTransferredEvent;
+import com.example.notificationservice.model.NotificationChannel;
+import com.example.notificationservice.model.NotificationRecord;
+import com.example.notificationservice.model.NotificationStatus;
+import com.example.notificationservice.model.NotificationType;
+import com.example.notificationservice.repository.NotificationRecordRepository;
 
 @Service
 public class TransactionAlertListener {
@@ -17,11 +22,14 @@ public class TransactionAlertListener {
 
     private final ProfileServiceClient profileServiceClient;
     private final NotificationProviderService notificationProviderService;
+    private final NotificationRecordRepository notificationRecordRepository;
 
-    public TransactionAlertListener(ProfileServiceClient profileServiceClient, 
-                                    NotificationProviderService notificationProviderService) {
+    public TransactionAlertListener(ProfileServiceClient profileServiceClient,
+                                    NotificationProviderService notificationProviderService,
+                                    NotificationRecordRepository notificationRecordRepository) {
         this.profileServiceClient = profileServiceClient;
         this.notificationProviderService = notificationProviderService;
+        this.notificationRecordRepository = notificationRecordRepository;
     }
 
     @KafkaListener(topics = "successful-transfers", groupId = "notification-service-group")
@@ -63,7 +71,9 @@ public class TransactionAlertListener {
             String userEmail = "user_" + event.userId() + "@bank.com";
 
             // Delegate to the provider service (which handles its own external retries)
-            notificationProviderService.dispatchEmail(userEmail, subject, htmlMessage);
+            boolean dispatched = notificationProviderService.dispatchEmail(userEmail, subject, htmlMessage);
+
+            persistRecord(event.userId(), subject, htmlMessage, dispatched ? NotificationStatus.SENT : NotificationStatus.FAILED);
 
         } else {
             log.debug("Transaction {} (Amount: ${}) is below threshold (${}). No alert needed.",
@@ -88,5 +98,16 @@ public class TransactionAlertListener {
                    </body>
                </html>
                """.formatted(event.amount(), event.transactionId(), Instant.now().toString());
+    }
+
+    private void persistRecord(Long userId, String subject, String message, NotificationStatus status) {
+        NotificationRecord record = new NotificationRecord();
+        record.setUserId(userId);
+        record.setType(NotificationType.TRANSACTION_ALERT);
+        record.setChannel(NotificationChannel.EMAIL);
+        record.setSubject(subject);
+        record.setMessage(message);
+        record.setStatus(status);
+        notificationRecordRepository.save(record);
     }
 }

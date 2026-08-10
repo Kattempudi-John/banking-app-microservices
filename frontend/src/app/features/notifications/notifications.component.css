@@ -1,0 +1,22 @@
+h1 {
+  font-size: var(--text-2xl);
+}
+
+.page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--space-6);
+}
+
+.table-card {
+  padding: 0;
+  overflow: hidden;
+  margin-bottom: var(--space-4);
+}
+
+.pagination {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}

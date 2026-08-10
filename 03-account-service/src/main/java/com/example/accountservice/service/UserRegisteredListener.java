@@ -4,6 +4,7 @@ import com.example.accountservice.model.AccountEntity;
 import com.example.accountservice.model.AccountStatus;
 import com.example.accountservice.model.AccountType;
 import com.example.accountservice.repository.AccountRepository;
+import com.example.accountservice.util.IbanGenerator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.kafka.annotation.KafkaListener;
@@ -25,10 +26,12 @@ public class UserRegisteredListener {
     private static final String DEFAULT_ROUTING_NUMBER = "021000021";
 
     private final AccountRepository accountRepository;
+    private final IbanGenerator ibanGenerator;
     private final SecureRandom random = new SecureRandom();
 
-    public UserRegisteredListener(AccountRepository accountRepository) {
+    public UserRegisteredListener(AccountRepository accountRepository, IbanGenerator ibanGenerator) {
         this.accountRepository = accountRepository;
+        this.ibanGenerator = ibanGenerator;
     }
 
     @KafkaListener(topics = "user-events", groupId = "account-service-group")
@@ -49,7 +52,9 @@ public class UserRegisteredListener {
             account.setAccountType(AccountType.CHECKING);
             account.setAvailableBalance(BigDecimal.ZERO);
             account.setRoutingNumber(DEFAULT_ROUTING_NUMBER);
-            account.setAccountNumber(generateAccountNumber());
+            String accountNumber = generateAccountNumber();
+            account.setAccountNumber(accountNumber);
+            account.setIban(ibanGenerator.generate(DEFAULT_ROUTING_NUMBER, accountNumber));
             account.setStatus(AccountStatus.ACTIVE);
             accountRepository.save(account);
 

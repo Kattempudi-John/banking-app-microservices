@@ -15,8 +15,8 @@ describe('TransferComponent', () => {
   let accountServiceSpy: jasmine.SpyObj<AccountService>;
 
   const mockAccounts: AccountOverview[] = [
-    { accountId: 1, accountType: 'CHECKING', availableBalance: 1000, routingNumber: '021000021', maskedAccountNumber: '****1234', status: 'ACTIVE' },
-    { accountId: 2, accountType: 'SAVINGS', availableBalance: 5000, routingNumber: '021000021', maskedAccountNumber: '****5678', status: 'ACTIVE' },
+    { accountId: 1, accountType: 'CHECKING', availableBalance: 1000, routingNumber: '021000021', maskedAccountNumber: '****1234', iban: 'XB00021000021123456789012', swiftCode: 'XBUSUS31', status: 'ACTIVE' },
+    { accountId: 2, accountType: 'SAVINGS', availableBalance: 5000, routingNumber: '021000021', maskedAccountNumber: '****5678', iban: 'XB00021000021987654321098', swiftCode: 'XBUSUS31', status: 'ACTIVE' },
   ];
 
   beforeEach(async () => {
@@ -66,7 +66,7 @@ describe('TransferComponent', () => {
 
   describe('internal transfer (default tab)', () => {
     it('submits with the selected accounts and amount', async () => {
-      transferServiceSpy.transferInternal.and.returnValue(of({ transactionId: 'txn-1', status: 'COMPLETED' }));
+      transferServiceSpy.transferInternal.and.returnValue(of({ transactionId: 'txn-1', status: 'COMPLETED', onUsTransfer: true }));
 
       const [fromSelect, toSelect] = selects();
       fromSelect.value = '1';
@@ -102,7 +102,7 @@ describe('TransferComponent', () => {
     });
 
     it('shows a success message with the transaction id when the transfer completes', async () => {
-      transferServiceSpy.transferInternal.and.returnValue(of({ transactionId: 'txn-1', status: 'COMPLETED' }));
+      transferServiceSpy.transferInternal.and.returnValue(of({ transactionId: 'txn-1', status: 'COMPLETED', onUsTransfer: true }));
       const [fromSelect, toSelect] = selects();
       fromSelect.value = '1';
       fromSelect.dispatchEvent(new Event('change'));
@@ -119,7 +119,7 @@ describe('TransferComponent', () => {
     });
 
     it('shows an "under review" message when the transfer is PENDING_APPROVAL', async () => {
-      transferServiceSpy.transferInternal.and.returnValue(of({ transactionId: 'txn-2', status: 'PENDING_APPROVAL' }));
+      transferServiceSpy.transferInternal.and.returnValue(of({ transactionId: 'txn-2', status: 'PENDING_APPROVAL', onUsTransfer: true }));
       const [fromSelect, toSelect] = selects();
       fromSelect.value = '1';
       fromSelect.dispatchEvent(new Event('change'));
@@ -167,7 +167,7 @@ describe('TransferComponent', () => {
     });
 
     it('submits with the entered wire details', async () => {
-      transferServiceSpy.transferExternal.and.returnValue(of({ transactionId: 'txn-3', status: 'COMPLETED' }));
+      transferServiceSpy.transferExternal.and.returnValue(of({ transactionId: 'txn-3', status: 'COMPLETED', onUsTransfer: false }));
 
       selects()[0].value = '1';
       selects()[0].dispatchEvent(new Event('change'));

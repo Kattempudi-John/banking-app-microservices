@@ -4,6 +4,15 @@ import { Observable } from 'rxjs';
 
 import { environment } from '../../../environments/environment';
 import { ExternalWireRequest, InternalTransferRequest, TransferResponse } from '../models/transfer.models';
+import { HistoryStatus, WireTransferPage } from '../models/history.models';
+
+export interface TransferHistoryQuery {
+  accountId?: number;
+  status?: HistoryStatus;
+  from?: string;
+  to?: string;
+  page?: number;
+}
 
 @Injectable({ providedIn: 'root' })
 export class TransferService {
@@ -18,5 +27,28 @@ export class TransferService {
   transferExternal(fromAccountId: number, request: ExternalWireRequest): Observable<TransferResponse> {
     const params = new HttpParams().set('fromAccountId', fromAccountId);
     return this.http.post<TransferResponse>(`${this.baseUrl}/external`, request, { params });
+  }
+
+  // Powers the History page's wire half (external/on-us wires, which carry approval status the
+  // ledger-sourced entries from AccountService don't have).
+  getTransferHistory(query: TransferHistoryQuery): Observable<WireTransferPage> {
+    let params = new HttpParams();
+    if (query.accountId !== undefined) {
+      params = params.set('accountId', query.accountId);
+    }
+    if (query.status) {
+      params = params.set('status', query.status);
+    }
+    if (query.from) {
+      params = params.set('from', query.from);
+    }
+    if (query.to) {
+      params = params.set('to', query.to);
+    }
+    if (query.page !== undefined) {
+      params = params.set('page', query.page);
+    }
+
+    return this.http.get<WireTransferPage>(this.baseUrl, { params });
   }
 }

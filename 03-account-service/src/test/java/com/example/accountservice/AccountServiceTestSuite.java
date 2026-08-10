@@ -11,6 +11,7 @@ import com.example.accountservice.repository.AccountRepository;
 import com.example.accountservice.repository.TransactionRepository;
 import com.example.accountservice.service.AccountService;
 import com.example.accountservice.service.UserRegisteredListener;
+import com.example.accountservice.util.IbanGenerator;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -25,13 +26,16 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.request.RequestPostProcessor;
 
 import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -54,6 +58,9 @@ class AccountServiceTestSuite {
 
     @Autowired
     private UserRegisteredListener userRegisteredListener;
+
+    @Autowired
+    private IbanGenerator ibanGenerator;
 
     @MockBean
     private AccountRepository accountRepository;
@@ -342,6 +349,126 @@ class AccountServiceTestSuite {
         userRegisteredListener.consumeUserRegistered(event);
 
         verify(accountRepository, never()).save(any(AccountEntity.class));
+    }
+
+    // ==========================================
+    // IbanGenerator / on-network transfer support (see transaction-service's ExternalWireService,
+    // which resolves an incoming wire's IBAN against this same accounts table)
+    // ==========================================
+
+    @Test
+    @DisplayName("UserRegistered event sets a checksum-valid IBAN built from the routing + account number - [MEANT TO PASS]")
+    void testUserRegisteredListener_NewUser_GeneratesValidIban() {
+        given(accountRepository.existsByUserId(777L)).willReturn(false);
+        Map<String, Object> event = Map.of("userId", "777", "username", "newuser", "phoneNumber", "+15550001111");
+
+        userRegisteredListener.consumeUserRegistered(event);
+
+        verify(accountRepository).save(argThat(account ->
+                account.getIban() != null
+                        && account.getIban().endsWith(account.getRoutingNumber() + account.getAccountNumber())
+                        && hasValidIbanChecksum(account.getIban())
+        ));
+    }
+
+    @Test
+    @DisplayName("IbanGenerator produces a different IBAN for a different account number - [MEANT TO PASS]")
+    void testIbanGenerator_differentAccountNumbersProduceDifferentIbans() {
+        String ibanOne = ibanGenerator.generate("021000021", "100000000001");
+        String ibanTwo = ibanGenerator.generate("021000021", "100000000002");
+
+        assertThat(ibanOne).isNotEqualTo(ibanTwo);
+        assertThat(hasValidIbanChecksum(ibanOne)).isTrue();
+        assertThat(hasValidIbanChecksum(ibanTwo)).isTrue();
+    }
+
+    @Test
+    @DisplayName("Internal IBAN lookup returns the matching account when one exists - [MEANT TO PASS]")
+    void testInternalLookupByIban_MatchFound() throws Exception {
+        activeChecking.setIban("XB00021000021123456789012");
+        given(accountRepository.findByIban("XB00021000021123456789012")).willReturn(Optional.of(activeChecking));
+
+        mockMvc.perform(get("/api/v1/internal/accounts/lookup").param("iban", "XB00021000021123456789012"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.accountId").value(1))
+                .andExpect(jsonPath("$.userId").value(42));
+    }
+
+    @Test
+    @DisplayName("Internal IBAN lookup returns 404 when no account on this platform matches - [MEANT TO FAIL]")
+    void testInternalLookupByIban_NoMatch() throws Exception {
+        given(accountRepository.findByIban("XB00000000000000000000000")).willReturn(Optional.empty());
+
+        mockMvc.perform(get("/api/v1/internal/accounts/lookup").param("iban", "XB00000000000000000000000"))
+                .andExpect(status().isNotFound());
+    }
+
+    // ==========================================
+    // Cross-account History (GET /api/v1/accounts/transactions, GET /api/v1/internal/accounts/by-user/{userId})
+    // ==========================================
+
+    @Test
+    @DisplayName("Cross-account history aggregates transactions across every account the caller owns - [MEANT TO PASS]")
+    void testGetAllTransactions_AggregatesAcrossOwnedAccounts() throws Exception {
+        AccountEntity secondAccount = new AccountEntity();
+        secondAccount.setId(2L);
+        secondAccount.setUserId(42L);
+        secondAccount.setAccountType(AccountType.SAVINGS);
+        secondAccount.setStatus(AccountStatus.ACTIVE);
+
+        given(accountRepository.findByUserIdAndStatusNot(42L, AccountStatus.CLOSED))
+                .willReturn(List.of(activeChecking, secondAccount));
+        given(transactionRepository.findByAccountIdInWithFilters(eq(List.of(1L, 2L)), isNull(), isNull(), isNull(), any()))
+                .willReturn(new PageImpl<>(List.of(buildTransaction(1L, TransactionType.CREDIT, new BigDecimal("50.0000")))));
+
+        mockMvc.perform(get("/api/v1/accounts/transactions").with(fullAuthUser(42)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.content.length()").value(1));
+    }
+
+    @Test
+    @DisplayName("Cross-account history narrowed to an accountId not owned by the caller is forbidden - [MEANT TO FAIL]")
+    void testGetAllTransactions_AccountIdFilterNotOwned_Returns403() throws Exception {
+        given(accountRepository.findByUserIdAndStatusNot(42L, AccountStatus.CLOSED))
+                .willReturn(List.of(activeChecking));
+
+        mockMvc.perform(get("/api/v1/accounts/transactions").param("accountId", "999").with(fullAuthUser(42)))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    @DisplayName("Internal by-user endpoint returns the caller's account IDs - [MEANT TO PASS]")
+    void testInternalAccountsByUser_ReturnsAccountIds() throws Exception {
+        AccountEntity secondAccount = new AccountEntity();
+        secondAccount.setId(2L);
+        secondAccount.setUserId(42L);
+        secondAccount.setAccountType(AccountType.SAVINGS);
+        secondAccount.setStatus(AccountStatus.ACTIVE);
+
+        given(accountRepository.findByUserIdAndStatusNot(42L, AccountStatus.CLOSED))
+                .willReturn(List.of(activeChecking, secondAccount));
+
+        mockMvc.perform(get("/api/v1/internal/accounts/by-user/42"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(2))
+                .andExpect(jsonPath("$[0]").value(1))
+                .andExpect(jsonPath("$[1]").value(2));
+    }
+
+    // Reimplements the ISO 7064 mod-97 verification side (mirrors IbanSwiftValidator over in
+    // transaction-service) so this suite can confirm IbanGenerator's output is actually valid,
+    // not just present.
+    private boolean hasValidIbanChecksum(String iban) {
+        String rearranged = iban.substring(4) + iban.substring(0, 4);
+        StringBuilder numeric = new StringBuilder();
+        for (char ch : rearranged.toCharArray()) {
+            if (Character.isLetter(ch)) {
+                numeric.append(Character.getNumericValue(ch));
+            } else {
+                numeric.append(ch);
+            }
+        }
+        return new BigInteger(numeric.toString()).mod(BigInteger.valueOf(97)).intValue() == 1;
     }
 
     private TransactionEntity buildTransaction(Long accountId, TransactionType type, BigDecimal amount) {

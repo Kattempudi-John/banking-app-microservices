@@ -4,4 +4,5 @@ export const environment = {
   profileApiUrl: '/api/v1',
   accountApiUrl: '/api/v1/accounts',
   transactionApiUrl: '/api/v1/transfers',
+  notificationApiUrl: '/api/v1/notifications',
 };

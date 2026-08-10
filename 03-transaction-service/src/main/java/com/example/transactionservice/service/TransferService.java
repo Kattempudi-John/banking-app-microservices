@@ -41,8 +41,8 @@ public class TransferService {
         // Publish the domain event
         publishTransferEvent(userId, fromAccountId, toAccountId, amount, transactionId);
 
-        // Return confirmation payload
-        return new TransferResponseDto(transactionId, "COMPLETED");
+        // Return confirmation payload - always on-us, both accounts are on this platform by definition
+        return new TransferResponseDto(transactionId, "COMPLETED", true);
     }
 
     private void publishTransferEvent(Long userId, Long fromAccountId, Long toAccountId, BigDecimal amount, UUID transactionId) {

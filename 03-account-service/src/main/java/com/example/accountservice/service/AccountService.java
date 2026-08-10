@@ -9,6 +9,7 @@ import com.example.accountservice.model.TransactionEntity;
 import com.example.accountservice.model.TransactionType;
 import com.example.accountservice.repository.AccountRepository;
 import com.example.accountservice.repository.TransactionRepository;
+import com.example.accountservice.util.IbanGenerator;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
@@ -34,14 +35,17 @@ public class AccountService {
     private final AccountRepository accountRepository;
     private final TransactionRepository transactionRepository;
     private final AccountMapper accountMapper;
+    private final IbanGenerator ibanGenerator;
     private final SecureRandom random = new SecureRandom();
 
     public AccountService(AccountRepository accountRepository,
                           TransactionRepository transactionRepository,
-                          AccountMapper accountMapper) {
+                          AccountMapper accountMapper,
+                          IbanGenerator ibanGenerator) {
         this.accountRepository = accountRepository;
         this.transactionRepository = transactionRepository;
         this.accountMapper = accountMapper;
+        this.ibanGenerator = ibanGenerator;
     }
 
     public List<AccountOverviewResponseDto> getDashboardAccounts(Long userId) {
@@ -65,6 +69,33 @@ public class AccountService {
             // If no filter is specified, return all transactions for the account
             return transactionRepository.findByAccountId(accountId, pageable);
         }
+    }
+
+    // Powers the frontend's cross-account History page - unlike getAccountTransactions above,
+    // this isn't scoped to one accountId path segment; it spans every account the caller owns
+    // (or just one, if they narrowed it with accountIdFilter) so History can show everything in
+    // one place instead of per-account.
+    public Page<TransactionEntity> getAllTransactions(Long userId, Long accountIdFilter, TransactionType type,
+                                                        LocalDateTime from, LocalDateTime to, Pageable pageable) {
+        List<Long> ownedAccountIds = accountRepository.findByUserIdAndStatusNot(userId, AccountStatus.CLOSED).stream()
+                .map(AccountEntity::getId)
+                .collect(Collectors.toList());
+
+        List<Long> accountIds;
+        if (accountIdFilter != null) {
+            if (!ownedAccountIds.contains(accountIdFilter)) {
+                throw new AccessDeniedException("Action forbidden: You do not have permission to view this account's history.");
+            }
+            accountIds = List.of(accountIdFilter);
+        } else {
+            accountIds = ownedAccountIds;
+        }
+
+        if (accountIds.isEmpty()) {
+            return Page.empty(pageable);
+        }
+
+        return transactionRepository.findByAccountIdInWithFilters(accountIds, type, from, to, pageable);
     }
 
     // Self-service "Add Funds" for the portfolio demo — a real product would fund this through a
@@ -119,7 +150,9 @@ public class AccountService {
         account.setAccountType(accountType);
         account.setAvailableBalance(BigDecimal.ZERO);
         account.setRoutingNumber(DEFAULT_ROUTING_NUMBER);
-        account.setAccountNumber(generateAccountNumber());
+        String accountNumber = generateAccountNumber();
+        account.setAccountNumber(accountNumber);
+        account.setIban(ibanGenerator.generate(DEFAULT_ROUTING_NUMBER, accountNumber));
         account.setStatus(AccountStatus.ACTIVE);
         accountRepository.save(account);
 

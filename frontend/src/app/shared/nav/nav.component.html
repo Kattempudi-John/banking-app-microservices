@@ -2,8 +2,10 @@
   <div>
     <a routerLink="/dashboard" routerLinkActive="active">Dashboard</a>
     <a routerLink="/transfer" routerLinkActive="active">Transfer</a>
+    <a routerLink="/history" routerLinkActive="active">History</a>
     <a routerLink="/profile" routerLinkActive="active" [routerLinkActiveOptions]="{ exact: true }">Profile</a>
     <a routerLink="/profile/alerts" routerLinkActive="active">Alerts</a>
+    <a routerLink="/notifications" routerLinkActive="active">Notifications</a>
   </div>
   <button type="button" (click)="logout()">Logout</button>
 </nav>

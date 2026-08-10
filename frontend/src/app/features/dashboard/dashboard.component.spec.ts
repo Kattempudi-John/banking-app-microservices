@@ -19,6 +19,8 @@ describe('DashboardComponent', () => {
       availableBalance: 1204.55,
       routingNumber: '021000021',
       maskedAccountNumber: '****1234',
+      iban: 'XB00021000021123456789012',
+      swiftCode: 'XBUSUS31',
       status: 'ACTIVE',
     },
     {
@@ -27,6 +29,8 @@ describe('DashboardComponent', () => {
       availableBalance: 9003.1,
       routingNumber: '021000021',
       maskedAccountNumber: '****5678',
+      iban: 'XB00021000021987654321098',
+      swiftCode: 'XBUSUS31',
       status: 'FROZEN',
     },
   ];

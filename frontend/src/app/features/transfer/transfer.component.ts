@@ -130,12 +130,25 @@ export class TransferComponent implements OnInit {
   }
 
   private handleResult(response: TransferResponse): void {
+    // onUsTransfer is always true for internal transfers (same platform by definition) - the
+    // distinct messaging only matters on the External Wire tab, where it tells the user whether
+    // their IBAN actually matched another account here or is genuinely leaving the network.
+    const isExternalTab = this.activeTab() === 'external';
+
     if (response.status === 'PENDING_APPROVAL') {
       this.resultType.set('info');
-      this.resultMessage.set(`Your transfer is under review. Transaction ID: ${response.transactionId}`);
+      const detail =
+        isExternalTab && response.onUsTransfer
+          ? 'This transfer matched an account on this platform and will be credited once fraud review approves it.'
+          : 'Your transfer is under review.';
+      this.resultMessage.set(`${detail} Transaction ID: ${response.transactionId}`);
     } else if (response.status === 'COMPLETED') {
       this.resultType.set('success');
-      this.resultMessage.set(`Transfer successful! Transaction ID: ${response.transactionId}`);
+      const detail =
+        isExternalTab && response.onUsTransfer
+          ? 'Sent instantly within the network!'
+          : 'Transfer successful!';
+      this.resultMessage.set(`${detail} Transaction ID: ${response.transactionId}`);
     } else {
       this.resultType.set('error');
       this.resultMessage.set(`Transfer ${response.status.toLowerCase()}. Transaction ID: ${response.transactionId}`);

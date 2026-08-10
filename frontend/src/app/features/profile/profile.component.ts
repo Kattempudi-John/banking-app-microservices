@@ -2,8 +2,10 @@ import { Component, OnInit, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 
 import { ProfileService } from '../../core/services/profile.service';
+import { AccountService } from '../../core/services/account.service';
 import { AuthService } from '../../core/auth.service';
 import { KycStatus } from '../../core/models/profile.models';
+import { AccountOverview } from '../../core/models/account.models';
 import { ButtonComponent } from '../../shared/button/button.component';
 import { AlertBannerComponent } from '../../shared/alert-banner/alert-banner.component';
 import { NavComponent } from '../../shared/nav/nav.component';
@@ -35,8 +37,12 @@ export class ProfileComponent implements OnInit {
   readonly kycMessage = signal<string | null>(null);
   readonly kycMessageType = signal<'success' | 'error'>('success');
 
+  readonly accounts = signal<AccountOverview[]>([]);
+  readonly copiedField = signal<string | null>(null);
+
   constructor(
     private readonly profileService: ProfileService,
+    private readonly accountService: AccountService,
     private readonly authService: AuthService,
   ) {}
 
@@ -45,6 +51,14 @@ export class ProfileComponent implements OnInit {
     if (userId !== null) {
       this.profileService.getKycStatus(userId).subscribe((status) => this.kycStatus.set(status));
     }
+    this.accountService.getAccounts().subscribe((accounts) => this.accounts.set(accounts));
+  }
+
+  copyToClipboard(field: string, value: string): void {
+    navigator.clipboard.writeText(value).then(() => {
+      this.copiedField.set(field);
+      setTimeout(() => this.copiedField.set(null), 2000);
+    });
   }
 
   submit(): void {

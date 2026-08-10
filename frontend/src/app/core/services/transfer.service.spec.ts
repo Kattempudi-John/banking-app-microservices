@@ -23,7 +23,7 @@ describe('TransferService', () => {
   });
 
   it('posts an internal transfer request', () => {
-    const mockResponse: TransferResponse = { transactionId: 'txn-1', status: 'COMPLETED' };
+    const mockResponse: TransferResponse = { transactionId: 'txn-1', status: 'COMPLETED', onUsTransfer: true };
     let result: TransferResponse | undefined;
 
     service
@@ -39,7 +39,7 @@ describe('TransferService', () => {
   });
 
   it('posts an external wire request with fromAccountId as a query param', () => {
-    const mockResponse: TransferResponse = { transactionId: 'txn-2', status: 'PENDING_APPROVAL' };
+    const mockResponse: TransferResponse = { transactionId: 'txn-2', status: 'PENDING_APPROVAL', onUsTransfer: false };
     let result: TransferResponse | undefined;
 
     service

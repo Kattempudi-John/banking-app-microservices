@@ -4,17 +4,21 @@ import { of, throwError } from 'rxjs';
 
 import { ProfileComponent } from './profile.component';
 import { ProfileService } from '../../core/services/profile.service';
+import { AccountService } from '../../core/services/account.service';
 import { AuthService } from '../../core/auth.service';
 import { KycStatus } from '../../core/models/profile.models';
 
 describe('ProfileComponent', () => {
   let fixture: ComponentFixture<ProfileComponent>;
   let profileServiceSpy: jasmine.SpyObj<ProfileService>;
+  let accountServiceSpy: jasmine.SpyObj<AccountService>;
   let authServiceSpy: jasmine.SpyObj<AuthService>;
 
   async function setup(kycStatus: KycStatus = 'PENDING_VERIFICATION'): Promise<void> {
     profileServiceSpy = jasmine.createSpyObj('ProfileService', ['getKycStatus', 'updateContactInfo']);
     profileServiceSpy.getKycStatus.and.returnValue(of(kycStatus));
+    accountServiceSpy = jasmine.createSpyObj('AccountService', ['getAccounts']);
+    accountServiceSpy.getAccounts.and.returnValue(of([]));
     authServiceSpy = jasmine.createSpyObj('AuthService', ['logout'], { userId: () => 42 });
     authServiceSpy.logout.and.returnValue(of({}));
 
@@ -23,6 +27,7 @@ describe('ProfileComponent', () => {
       providers: [
         provideRouter([]),
         { provide: ProfileService, useValue: profileServiceSpy },
+        { provide: AccountService, useValue: accountServiceSpy },
         { provide: AuthService, useValue: authServiceSpy },
       ],
     });
@@ -112,5 +117,43 @@ describe('ProfileComponent', () => {
     fixture.detectChanges();
 
     expect(fixture.nativeElement.textContent).toContain('Something went wrong');
+  });
+
+  it('shows each account\'s IBAN and SWIFT code in the Receive Money section', async () => {
+    accountServiceSpy = jasmine.createSpyObj('AccountService', ['getAccounts']);
+    accountServiceSpy.getAccounts.and.returnValue(
+      of([
+        {
+          accountId: 1,
+          accountType: 'CHECKING',
+          availableBalance: 100,
+          routingNumber: '021000021',
+          maskedAccountNumber: '****1234',
+          iban: 'XB00021000021123456789012',
+          swiftCode: 'XBUSUS31',
+          status: 'ACTIVE',
+        },
+      ]),
+    );
+    profileServiceSpy = jasmine.createSpyObj('ProfileService', ['getKycStatus', 'updateContactInfo']);
+    profileServiceSpy.getKycStatus.and.returnValue(of('APPROVED'));
+    authServiceSpy = jasmine.createSpyObj('AuthService', ['logout'], { userId: () => 42 });
+    authServiceSpy.logout.and.returnValue(of({}));
+
+    TestBed.configureTestingModule({
+      imports: [ProfileComponent],
+      providers: [
+        provideRouter([]),
+        { provide: ProfileService, useValue: profileServiceSpy },
+        { provide: AccountService, useValue: accountServiceSpy },
+        { provide: AuthService, useValue: authServiceSpy },
+      ],
+    });
+    fixture = TestBed.createComponent(ProfileComponent);
+    fixture.detectChanges();
+    await fixture.whenStable();
+
+    expect(fixture.nativeElement.textContent).toContain('XB00021000021123456789012');
+    expect(fixture.nativeElement.textContent).toContain('XBUSUS31');
   });
 });

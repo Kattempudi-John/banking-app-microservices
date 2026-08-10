@@ -10,6 +10,13 @@ import com.example.accountservice.model.AccountEntity;
 @Component
 public class AccountMapper {
 
+    // SWIFT/BIC identifies the institution, not the individual account - every account here
+    // shares this one value, the same way they all share DEFAULT_ROUTING_NUMBER.
+    // Format: 4-char bank code + 2-char country code (6 letters total) + 2-char location code -
+    // matches transaction-service's IbanSwiftValidator/ExternalWireRequestDto validation, which
+    // requires the first 6 characters to be letters only.
+    private static final String PLATFORM_SWIFT_CODE = "XBUSUS31";
+
     public AccountOverviewResponseDto toOverviewDto(AccountEntity entity) {
         return new AccountOverviewResponseDto(
                 entity.getId(),
@@ -17,6 +24,8 @@ public class AccountMapper {
                 entity.getAvailableBalance(),
                 entity.getRoutingNumber(),
                 maskAccountNumber(entity.getAccountNumber()),
+                entity.getIban(),
+                PLATFORM_SWIFT_CODE,
                 entity.getStatus().name()
         );
     }

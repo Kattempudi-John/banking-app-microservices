@@ -22,6 +22,8 @@ public interface AccountRepository extends JpaRepository<AccountEntity, Long> {
 
     boolean existsByUserId(Long userId);
 
+    Optional<AccountEntity> findByIban(String iban);
+
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT a FROM AccountEntity a WHERE a.id = :id")
     Optional<AccountEntity> findByIdForUpdate(@Param("id") Long id);

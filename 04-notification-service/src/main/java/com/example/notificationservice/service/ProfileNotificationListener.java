@@ -7,13 +7,24 @@ import org.slf4j.LoggerFactory;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Service;
 
+import com.example.notificationservice.model.NotificationChannel;
+import com.example.notificationservice.model.NotificationRecord;
+import com.example.notificationservice.model.NotificationStatus;
+import com.example.notificationservice.model.NotificationType;
+import com.example.notificationservice.repository.NotificationRecordRepository;
+
 @Service
 public class ProfileNotificationListener {
 
     private static final Logger logger = LoggerFactory.getLogger(ProfileNotificationListener.class);
 
-    // In a real implementation, you would inject an EmailClient (e.g., SendGrid/AWS SES)
-    public ProfileNotificationListener() {
+    private final NotificationProviderService notificationProviderService;
+    private final NotificationRecordRepository notificationRecordRepository;
+
+    public ProfileNotificationListener(NotificationProviderService notificationProviderService,
+                                        NotificationRecordRepository notificationRecordRepository) {
+        this.notificationProviderService = notificationProviderService;
+        this.notificationRecordRepository = notificationRecordRepository;
     }
 
     // learned groupId matters a lot here, every service listening with the same group id shares
@@ -38,10 +49,25 @@ public class ProfileNotificationListener {
     }
 
     private void sendSecurityAlertEmail(Long userId, String eventType) {
-        // Implementation for third-party email provider (e.g., SendGrid/AWS SES)
         String subject = "Security Alert: Your profile was recently updated";
         String body = String.format("Dear customer, an update of type '%s' was made to your profile.", eventType);
-        
-        logger.info("Email dispatched to user {}: [Subject: {}] [Body: {}]", userId, subject, body);
+
+        // Same generated placeholder address TransactionAlertListener uses - no real user email
+        // lookup exists anywhere in this system yet (see README's known limitations).
+        String userEmail = "user_" + userId + "@bank.com";
+        boolean dispatched = notificationProviderService.dispatchEmail(userEmail, subject, body);
+
+        persistRecord(userId, subject, body, dispatched ? NotificationStatus.SENT : NotificationStatus.FAILED);
+    }
+
+    private void persistRecord(Long userId, String subject, String message, NotificationStatus status) {
+        NotificationRecord record = new NotificationRecord();
+        record.setUserId(userId);
+        record.setType(NotificationType.PROFILE_SECURITY);
+        record.setChannel(NotificationChannel.EMAIL);
+        record.setSubject(subject);
+        record.setMessage(message);
+        record.setStatus(status);
+        notificationRecordRepository.save(record);
     }
 }

@@ -26,6 +26,11 @@ spring:
     # would make Flyway skip it (thinking it's already covered by the baseline) - 0 guarantees
     # V1 onward still actually run.
     baseline-version: "0"
+    # transaction-service's V3/V4/V5 migrations already exist in this same shared history table
+    # (its own migration files aren't on this service's classpath) - tell Flyway that's expected
+    # instead of failing validation on "migration applied but not resolved locally". Mirrors the
+    # same tolerance transaction-service's own config already grants for this service's V1/V2.
+    ignore-migration-patterns: "*:missing"
 
 server:
   port: 8083

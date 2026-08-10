@@ -1,6 +1,7 @@
 package com.example.accountservice.controller;
 
 import com.example.accountservice.model.AccountEntity;
+import com.example.accountservice.model.AccountStatus;
 import com.example.accountservice.model.TransactionEntity;
 import com.example.accountservice.model.TransactionType;
 import com.example.accountservice.repository.AccountRepository;
@@ -16,6 +17,7 @@ import org.springframework.web.server.ResponseStatusException;
 
 import java.math.BigDecimal;
 import java.util.List;
+import java.util.Optional;
 
 @RestController
 public class InternalAccountController {
@@ -45,6 +47,28 @@ public class InternalAccountController {
     ) {}
 
     public record UserAggregateBalanceResponse(Long userId, BigDecimal totalBalance) {}
+
+    public record AccountLookupResponse(Long accountId, Long userId, String accountType, String status) {}
+
+    // transaction-service calls this to check whether an incoming wire's IBAN belongs to an
+    // account on this platform - if it does, the wire can be executed as a real instant transfer
+    // instead of the simulated debit-only external wire.
+    @GetMapping("/api/v1/internal/accounts/lookup")
+    public ResponseEntity<AccountLookupResponse> lookupByIban(@RequestParam String iban) {
+        return internalAccountService.findByIban(iban)
+                .map(account -> ResponseEntity.ok(new AccountLookupResponse(
+                        account.getId(), account.getUserId(), account.getAccountType().name(), account.getStatus().name())))
+                .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
+    // transaction-service's GET /api/v1/transfers (history) calls this to resolve which account
+    // IDs actually belong to the caller, rather than trusting client-supplied account IDs for
+    // something authorization-sensitive - the same "ask the owning service for the truth" pattern
+    // already used for KYC checks against profile-service.
+    @GetMapping("/api/v1/internal/accounts/by-user/{userId}")
+    public ResponseEntity<List<Long>> getAccountIdsByUser(@PathVariable Long userId) {
+        return ResponseEntity.ok(internalAccountService.findAccountIdsByUser(userId));
+    }
 
     @PostMapping("/api/v1/internal/accounts/transfer")
     public ResponseEntity<Void> transfer(@RequestBody TransferRequest request) {
@@ -120,6 +144,18 @@ class InternalAccountService {
         account.setAvailableBalance(account.getAvailableBalance().add(amount));
         accountRepository.save(account);
         recordTransaction(accountId, TransactionType.CREDIT, amount, description);
+    }
+
+    @Transactional(readOnly = true)
+    public Optional<AccountEntity> findByIban(String iban) {
+        return accountRepository.findByIban(iban);
+    }
+
+    @Transactional(readOnly = true)
+    public List<Long> findAccountIdsByUser(Long userId) {
+        return accountRepository.findByUserIdAndStatusNot(userId, AccountStatus.CLOSED).stream()
+                .map(AccountEntity::getId)
+                .toList();
     }
 
     @Transactional(readOnly = true)
