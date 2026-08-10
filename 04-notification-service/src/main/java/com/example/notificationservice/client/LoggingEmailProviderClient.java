@@ -2,12 +2,14 @@ package com.example.notificationservice.client;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
-// since this is the only @component implementing EmailProviderClient right now, spring
-// autowires it in everywhere that interface gets injected, swapping to a real sendgrid/ses
-// implementation later would just mean adding a second @component and disabling this one
+// default email provider so local dev and CI need no SendGrid account or key - active unless
+// email.provider names a real one. matchIfMissing is what makes "no configuration at all" land here.
+// Mirrors LoggingSmsProviderClient exactly.
 @Component
+@ConditionalOnProperty(name = "email.provider", havingValue = "logging", matchIfMissing = true)
 public class LoggingEmailProviderClient implements EmailProviderClient {
 
     private static final Logger log = LoggerFactory.getLogger(LoggingEmailProviderClient.class);

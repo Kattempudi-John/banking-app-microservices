@@ -4,6 +4,23 @@ export interface InternalTransferRequest {
   amount: number;
 }
 
+// Paying a different user: the recipient is identified by their full account number rather than an
+// account id, since that's the only account identifier they'd realistically pass along (the API
+// only ever returns numbers masked).
+export interface RecipientTransferRequest {
+  fromAccountId: number;
+  recipientAccountNumber: string;
+  amount: number;
+}
+
+// Shown back to the sender for confirmation before any money moves. displayName is null when
+// auth-service couldn't be reached - the masked number alone still identifies the account.
+export interface RecipientPreview {
+  maskedAccountNumber: string;
+  accountType: string;
+  displayName: string | null;
+}
+
 export interface ExternalWireRequest {
   iban: string;
   swiftCode: string;

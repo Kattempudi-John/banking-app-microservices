@@ -12,6 +12,10 @@ public class UserProfile {
     private Long id;
 
     private String phoneNumber;
+    // Copied from the user-events registration message. Lives here rather than being fetched from
+    // auth-service on every send, because notification-service already calls this service for a
+    // user's alert preferences - carrying the address on that same response costs nothing extra.
+    private String email;
     private String addressLine1;
     private String addressLine2;
     private String city;
@@ -29,6 +33,9 @@ public class UserProfile {
 
     public String getPhoneNumber() { return phoneNumber; }
     public void setPhoneNumber(String phoneNumber) { this.phoneNumber = phoneNumber; }
+
+    public String getEmail() { return email; }
+    public void setEmail(String email) { this.email = email; }
 
     public String getAddressLine1() { return addressLine1; }
     public void setAddressLine1(String addressLine1) { this.addressLine1 = addressLine1; }

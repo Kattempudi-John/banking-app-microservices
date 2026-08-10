@@ -7,6 +7,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Service;
 
+import com.example.notificationservice.client.ProfileServiceClient;
 import com.example.notificationservice.model.NotificationChannel;
 import com.example.notificationservice.model.NotificationRecord;
 import com.example.notificationservice.model.NotificationStatus;
@@ -20,11 +21,14 @@ public class ProfileNotificationListener {
 
     private final NotificationProviderService notificationProviderService;
     private final NotificationRecordRepository notificationRecordRepository;
+    private final ProfileServiceClient profileServiceClient;
 
     public ProfileNotificationListener(NotificationProviderService notificationProviderService,
-                                        NotificationRecordRepository notificationRecordRepository) {
+                                        NotificationRecordRepository notificationRecordRepository,
+                                        ProfileServiceClient profileServiceClient) {
         this.notificationProviderService = notificationProviderService;
         this.notificationRecordRepository = notificationRecordRepository;
+        this.profileServiceClient = profileServiceClient;
     }
 
     // learned groupId matters a lot here, every service listening with the same group id shares
@@ -52,12 +56,29 @@ public class ProfileNotificationListener {
         String subject = "Security Alert: Your profile was recently updated";
         String body = String.format("Dear customer, an update of type '%s' was made to your profile.", eventType);
 
-        // Same generated placeholder address TransactionAlertListener uses - no real user email
-        // lookup exists anywhere in this system yet (see README's known limitations).
-        String userEmail = "user_" + userId + "@bank.com";
+        // Unlike TransactionAlertListener, this listener has no preferences object already in hand,
+        // so it fetches one purely for the address - the call is @Cacheable, so repeated profile
+        // updates for the same user don't each cost a round trip.
+        String userEmail = resolveEmail(userId);
+        if (userEmail == null || userEmail.isBlank()) {
+            logger.warn("User {} has no email address on file - skipping the profile security alert", userId);
+            persistRecord(userId, subject, body, NotificationStatus.FAILED);
+            return;
+        }
+
         boolean dispatched = notificationProviderService.dispatchEmail(userEmail, subject, body);
 
         persistRecord(userId, subject, body, dispatched ? NotificationStatus.SENT : NotificationStatus.FAILED);
+    }
+
+    private String resolveEmail(Long userId) {
+        try {
+            ProfileServiceClient.UserPreferenceResponse preferences = profileServiceClient.getUserPreferences(userId);
+            return preferences != null ? preferences.email() : null;
+        } catch (RuntimeException e) {
+            logger.error("Could not resolve an email address for user {}", userId, e);
+            return null;
+        }
     }
 
     private void persistRecord(Long userId, String subject, String message, NotificationStatus status) {

@@ -18,6 +18,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -105,17 +106,29 @@ class ProfileServiceTestSuite {
         mockUser.setKycStatus(KycStatus.PENDING_VERIFICATION);
     }
 
-    // checking what happens when someone asks for the kyc status of a user id that does not exist
-    // stub the repository so looking up id 999 comes back completely empty
-    // hit the kyc-status endpoint for that same missing id
-    // right now that surfaces as a 500 since nothing catches the missing user case gracefully yet
+    // a user can hold valid credentials in auth-service and still have no profile row here, if the
+    // "user-events" message that normally provisions one was never consumed
+    // stub the repository so looking up id 999 comes back completely empty, and echo back whatever
+    // gets saved so the controller can read a status off it
+    // this used to answer 500, which quietly blocked every transfer that user attempted, since
+    // transaction-service's KycEnforcementAspect calls this same endpoint before moving any money
+    // now it provisions the missing profile on read and reports the PENDING_VERIFICATION it starts in
     @Test
-    @DisplayName("Block 1: Query KYC Status Returns Error for Non-Existent User - [MEANT TO FAIL]")
-    void testBlock1_GetKycStatus_UserNotFound_ReturnsError() throws Exception {
+    @DisplayName("Block 1: Query KYC Status Provisions a Missing Profile Instead of Failing - [MEANT TO PASS]")
+    void testBlock1_GetKycStatus_UserNotFound_ProvisionsProfile() throws Exception {
         given(userProfileRepository.findById(999L)).willReturn(Optional.empty());
+        given(userProfileRepository.save(any(UserProfile.class))).willAnswer(invocation -> invocation.getArgument(0));
 
         mockMvc.perform(get("/api/v1/profiles/999/kyc-status"))
-                .andExpect(status().isInternalServerError());
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("PENDING_VERIFICATION"));
+
+        // the row has to actually be written, not just reported - otherwise the user would re-provision
+        // on every single page load and still have nothing on file for transfers to check against
+        ArgumentCaptor<UserProfile> savedProfile = ArgumentCaptor.forClass(UserProfile.class);
+        verify(userProfileRepository).save(savedProfile.capture());
+        assertThat(savedProfile.getValue().getId()).isEqualTo(999L);
+        assertThat(savedProfile.getValue().getKycStatus()).isEqualTo(KycStatus.PENDING_VERIFICATION);
     }
 
     // happy path check that the kyc-status endpoint reports back whatever state the user is actually in

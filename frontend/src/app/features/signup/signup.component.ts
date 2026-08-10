@@ -9,6 +9,9 @@ import { ButtonComponent } from '../../shared/button/button.component';
 import { AlertBannerComponent } from '../../shared/alert-banner/alert-banner.component';
 
 const MIN_PASSWORD_LENGTH = 8;
+// Matches the equally-permissive check in auth-service's register endpoint - just enough to catch a
+// missing @ or domain before it becomes an undeliverable address on file.
+const EMAIL_PATTERN = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 
 @Component({
   selector: 'app-signup',
@@ -22,6 +25,7 @@ export class SignupComponent {
   readonly password = signal('');
   readonly confirmPassword = signal('');
   readonly phoneNumber = signal('');
+  readonly email = signal('');
 
   readonly loading = signal(false);
   readonly errorMessage = signal<string | null>(null);
@@ -42,6 +46,10 @@ export class SignupComponent {
       this.errorMessage.set('Passwords do not match.');
       return;
     }
+    if (!EMAIL_PATTERN.test(this.email())) {
+      this.errorMessage.set('Please enter a valid email address.');
+      return;
+    }
 
     this.loading.set(true);
     this.authService
@@ -49,6 +57,7 @@ export class SignupComponent {
         username: this.username(),
         password: this.password(),
         phoneNumber: this.phoneNumber(),
+        email: this.email(),
       })
       .subscribe({
         next: () => {

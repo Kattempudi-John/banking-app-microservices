@@ -121,13 +121,23 @@ public class DailyBalanceSummaryJob {
         for (ProfileServiceClient.UserPreferenceResponse user : users) {
             AccountServiceClient.UserAggregateBalanceResponse userBalance = balanceMap.get(user.userId());
 
-            if (userBalance != null) {
-                String emailSubject = "Your Daily Balance Summary";
-                String emailHtml = buildHtmlSummary(userBalance);
-                String userEmail = "user_" + user.userId() + "@bank.com"; // Placeholder mapping
-
-                notificationProviderService.dispatchEmail(userEmail, emailSubject, emailHtml);
+            if (userBalance == null) {
+                continue;
             }
+
+            // The address arrives on the same preferences record that selected this user for a
+            // summary in the first place. Users registered before the email field existed have none;
+            // skip them rather than dispatching to a fabricated address that can never be delivered.
+            String userEmail = user.email();
+            if (userEmail == null || userEmail.isBlank()) {
+                log.warn("Skipping the daily summary for user {} - no email address on file", user.userId());
+                continue;
+            }
+
+            String emailSubject = "Your Daily Balance Summary";
+            String emailHtml = buildHtmlSummary(userBalance);
+
+            notificationProviderService.dispatchEmail(userEmail, emailSubject, emailHtml);
         }
     }
 

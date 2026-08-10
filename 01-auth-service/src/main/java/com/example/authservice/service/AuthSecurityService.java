@@ -146,12 +146,16 @@ public class AuthSecurityService {
     // profile-service and account-service each own their own slice of "user" data (KYC/contact
     // info, accounts) and provision it themselves by consuming this event - auth-service only
     // owns credentials, so this is the only way those other services learn a new user exists.
-    public void publishUserRegisteredEvent(Long userId, String username, String phoneNumber) {
+    public void publishUserRegisteredEvent(Long userId, String username, String phoneNumber, String email) {
         try {
             Map<String, String> event = new HashMap<>();
             event.put("userId", String.valueOf(userId));
             event.put("username", username);
             event.put("phoneNumber", phoneNumber);
+            // profile-service stores this so notification-service has somewhere real to send balance
+            // summaries and transaction alerts - before this, those were addressed to a fabricated
+            // "user_<id>@bank.com" that could never receive anything.
+            event.put("email", email);
 
             kafkaTemplate.send("user-events", objectMapper.writeValueAsString(event));
         } catch (Exception e) {

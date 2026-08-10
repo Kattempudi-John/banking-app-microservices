@@ -13,6 +13,21 @@
   <div class="card">
     @if (activeTab() === 'internal') {
       <form class="stack" (submit)="submitInternal(); $event.preventDefault()">
+        <div class="mode-row">
+          <app-button
+            [variant]="internalMode() === 'own' ? 'primary' : 'secondary'"
+            (clicked)="selectInternalMode('own')"
+          >
+            Between My Accounts
+          </app-button>
+          <app-button
+            [variant]="internalMode() === 'recipient' ? 'primary' : 'secondary'"
+            (clicked)="selectInternalMode('recipient')"
+          >
+            To Someone Else
+          </app-button>
+        </div>
+
         <div class="select-group">
           <label for="fromAccount">From Account</label>
           <select id="fromAccount" (change)="onFromAccountChange($any($event.target).value)">
@@ -22,15 +37,46 @@
             }
           </select>
         </div>
-        <div class="select-group">
-          <label for="toAccount">To Account</label>
-          <select id="toAccount" (change)="onToAccountChange($any($event.target).value)">
-            <option value="" selected>Select account</option>
-            @for (acc of accounts(); track acc.accountId) {
-              <option [value]="acc.accountId">{{ acc.accountType }} {{ acc.maskedAccountNumber }}</option>
-            }
-          </select>
-        </div>
+
+        @if (internalMode() === 'own') {
+          @if (hasSingleAccount()) {
+            <p class="text-muted">
+              You need a second account to transfer between your own accounts. Open one from the
+              Dashboard, or switch to <strong>To Someone Else</strong> to pay another person.
+            </p>
+          } @else {
+            <div class="select-group">
+              <label for="toAccount">To Account</label>
+              <select id="toAccount" (change)="onToAccountChange($any($event.target).value)">
+                <option value="" selected>Select account</option>
+                @for (acc of destinationAccounts(); track acc.accountId) {
+                  <option [value]="acc.accountId">{{ acc.accountType }} {{ acc.maskedAccountNumber }}</option>
+                }
+              </select>
+            </div>
+          }
+        } @else {
+          <div class="recipient-group">
+            <app-input
+              id="recipientAccountNumber"
+              label="Recipient Account Number"
+              [ngModel]="recipientAccountNumber()"
+              (ngModelChange)="onRecipientAccountNumberChange($event)"
+              name="recipientAccountNumber"
+            />
+            <app-button variant="secondary" (clicked)="lookupRecipient()">
+              {{ recipientLoading() ? 'Looking up…' : 'Look Up' }}
+            </app-button>
+          </div>
+          @if (recipientPreview(); as recipient) {
+            <p class="recipient-confirmed">
+              Sending to <strong>{{ recipient.displayName ?? 'this account' }}</strong>
+              — {{ recipient.accountType }} {{ recipient.maskedAccountNumber }}
+            </p>
+          }
+          <app-alert-banner type="error" [message]="recipientLookupError()" />
+        }
+
         <app-input
           id="amount"
           label="Amount"

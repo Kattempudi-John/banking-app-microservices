@@ -9,12 +9,12 @@ import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 import org.springframework.web.client.RestTemplate;
 
-// real SMS delivery via Textbelt (https://textbelt.com) - only active when sms.enabled=true (see
-// application.yml), mutually exclusive with LoggingSmsProviderClient so Spring never sees two
-// candidate beans. The free "textbelt" key needs no account/signup, just 1 text/day/IP - plenty
-// for testing this app's own login flow. sms.textbelt-key can be overridden with a paid key later.
+// SMS delivery via Textbelt (https://textbelt.com) - active when sms.provider=textbelt, mutually
+// exclusive with the other SmsProviderClient beans so Spring never sees two candidates. The free
+// "textbelt" key needs no account/signup, just 1 text/day/IP, which makes it a decent zero-setup way
+// to prove the 2FA path end-to-end. sms.provider=twilio is the real option for actual volume.
 @Component
-@ConditionalOnProperty(name = "sms.enabled", havingValue = "true")
+@ConditionalOnProperty(name = "sms.provider", havingValue = "textbelt")
 public class TextBeltSmsProviderClient implements SmsProviderClient {
 
     private static final Logger log = LoggerFactory.getLogger(TextBeltSmsProviderClient.class);

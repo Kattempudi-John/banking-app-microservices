@@ -25,9 +25,22 @@ profile-service:
 account-service:
   url: ${ACCOUNT_SERVICE_URL:http://account-service:8080}
 
+# Prod defaults to the real providers, unlike the dev profile which defaults to logging. Every
+# credential comes from the environment - none of these have an inline fallback, so a missing secret
+# fails startup loudly instead of quietly downgrading to logging and dropping real notifications.
 sms:
-  enabled: ${SMS_ENABLED:true}
+  provider: ${SMS_PROVIDER:twilio}
   textbelt-key: ${TEXTBELT_KEY:textbelt}
+  twilio:
+    account-sid: ${TWILIO_ACCOUNT_SID:}
+    auth-token: ${TWILIO_AUTH_TOKEN:}
+    from-number: ${TWILIO_FROM_NUMBER:}
+
+email:
+  provider: ${EMAIL_PROVIDER:sendgrid}
+  sendgrid:
+    api-key: ${SENDGRID_API_KEY:}
+    from-email: ${SENDGRID_FROM_EMAIL:}
 
 server:
   port: 8080

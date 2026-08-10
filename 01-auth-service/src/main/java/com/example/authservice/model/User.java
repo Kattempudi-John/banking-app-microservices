@@ -34,6 +34,12 @@ public class User implements UserDetails {
 
     private String phoneNumber;
 
+    // Where notification-service sends balance summaries and transaction alerts. Nullable rather
+    // than required, because users registered before this field existed have none - the notification
+    // listeners skip a user with no address instead of inventing one.
+    @Column(unique = true)
+    private String email;
+
     private Boolean totpEnabled = false;
     private String totpSecret;
 

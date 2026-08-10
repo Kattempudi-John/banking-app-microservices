@@ -2,11 +2,14 @@ package com.example.transactionservice.service;
 
 import com.example.transactionservice.annotation.RequiresKyc;
 import com.example.transactionservice.client.AccountServiceClient;
+import com.example.transactionservice.client.AuthServiceClient;
 import com.example.transactionservice.dto.TransferResponseDto;
 import com.example.transactionservice.event.FundsTransferredEvent;
 import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.math.BigDecimal;
 import java.util.UUID;
@@ -15,11 +18,14 @@ import java.util.UUID;
 public class TransferService {
 
     private final AccountServiceClient accountServiceClient;
+    private final AuthServiceClient authServiceClient;
     private final ApplicationEventPublisher eventPublisher;
 
     public TransferService(AccountServiceClient accountServiceClient,
+                           AuthServiceClient authServiceClient,
                            ApplicationEventPublisher eventPublisher) {
         this.accountServiceClient = accountServiceClient;
+        this.authServiceClient = authServiceClient;
         this.eventPublisher = eventPublisher;
     }
 
@@ -43,6 +49,55 @@ public class TransferService {
 
         // Return confirmation payload - always on-us, both accounts are on this platform by definition
         return new TransferResponseDto(transactionId, "COMPLETED", true);
+    }
+
+    // Pays an account belonging to a different user, identified by the account number the sender
+    // typed. Same KYC gate and same post-commit event as executeTransfer above - only the ownership
+    // rule on the destination differs, which is enforced over in account-service.
+    @Transactional
+    @RequiresKyc
+    public TransferResponseDto executeTransferToRecipient(Long userId, Long fromAccountId,
+                                                          String recipientAccountNumber, BigDecimal amount) {
+
+        AccountServiceClient.RecipientLookupResponse recipient = resolveRecipient(recipientAccountNumber);
+
+        accountServiceClient.transferToRecipient(new AccountServiceClient.TransferRequest(
+                userId, fromAccountId, recipient.accountId(), amount));
+
+        UUID transactionId = UUID.randomUUID();
+
+        // The destination account id is what the notification/alert path cares about, same as an
+        // own-accounts transfer - the recipient being a different person doesn't change the event.
+        publishTransferEvent(userId, fromAccountId, recipient.accountId(), amount, transactionId);
+
+        return new TransferResponseDto(transactionId, "COMPLETED", true);
+    }
+
+    // Shared by the transfer itself and by the frontend's pre-send confirmation lookup, so both agree
+    // on what counts as a valid recipient. The ErrorDecoder turns account-service's 404 into a
+    // ResponseStatusException; rewriting it here gives the sender a message about the number they
+    // typed rather than an internal "account not found".
+    public AccountServiceClient.RecipientLookupResponse resolveRecipient(String recipientAccountNumber) {
+        try {
+            return accountServiceClient.lookupByAccountNumber(recipientAccountNumber);
+        } catch (ResponseStatusException e) {
+            if (e.getStatusCode() == HttpStatus.NOT_FOUND) {
+                throw new ResponseStatusException(HttpStatus.NOT_FOUND,
+                        "No account found with that number. Double-check it with the person you're paying.");
+            }
+            throw e;
+        }
+    }
+
+    // Best-effort: a recipient whose name can't be resolved is still payable, the sender just sees the
+    // masked account number alone rather than a name to confirm against.
+    public String resolveRecipientName(Long ownerUserId) {
+        try {
+            AuthServiceClient.DisplayNameResponse response = authServiceClient.getDisplayName(ownerUserId);
+            return response != null ? response.displayName() : null;
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 
     private void publishTransferEvent(Long userId, Long fromAccountId, Long toAccountId, BigDecimal amount, UUID transactionId) {

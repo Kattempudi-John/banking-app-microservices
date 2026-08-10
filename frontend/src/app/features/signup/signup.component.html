@@ -32,6 +32,14 @@
         (ngModelChange)="phoneNumber.set($event)"
         name="phoneNumber"
       />
+      <app-input
+        id="email"
+        label="Email"
+        type="email"
+        [ngModel]="email()"
+        (ngModelChange)="email.set($event)"
+        name="email"
+      />
       <app-alert-banner type="error" [message]="errorMessage()" />
       <app-button type="submit" [disabled]="loading()">Sign Up</app-button>
     </form>

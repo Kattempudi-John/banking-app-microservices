@@ -12,11 +12,14 @@ import java.util.List;
 @FeignClient(name = "profile-service", url = "${profile-service.url:http://localhost:8082}")
 public interface ProfileServiceClient {
 
+    // email is null for users who registered before the field existed - every caller checks for that
+    // rather than sending to an address that can't receive anything.
     record UserPreferenceResponse(
             Long userId,
             BigDecimal alertThresholdAmount,
             Boolean dailySummaryEnabled,
-            String timezone
+            String timezone,
+            String email
     ) {}
 
     // learned @cacheable can go directly on a feign client method, not just on a normal service

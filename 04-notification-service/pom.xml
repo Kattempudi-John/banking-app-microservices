@@ -53,6 +53,20 @@
 			<groupId>org.springframework.cloud</groupId>
 			<artifactId>spring-cloud-starter-openfeign</artifactId>
 		</dependency>
+		<!-- real SMS delivery for 2FA codes and alerts, used by TwilioSmsProviderClient. Only on the
+		     path when sms.provider=twilio; the logging default needs no credentials at all -->
+		<dependency>
+			<groupId>com.twilio.sdk</groupId>
+			<artifactId>twilio</artifactId>
+			<version>10.4.1</version>
+		</dependency>
+		<!-- Twilio's email product, a separate API with its own key - backs SendGridEmailProviderClient
+		     for balance summaries and transaction alerts -->
+		<dependency>
+			<groupId>com.sendgrid</groupId>
+			<artifactId>sendgrid-java</artifactId>
+			<version>4.10.2</version>
+		</dependency>
 		<!-- first-ever persistence for this service - backs NotificationRecord, the durable log
 		     each Kafka listener writes to so GET /api/v1/notifications has something real to read -->
 		<dependency>

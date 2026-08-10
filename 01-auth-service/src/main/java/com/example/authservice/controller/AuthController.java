@@ -6,6 +6,7 @@ import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
+import java.util.regex.Pattern;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
@@ -76,11 +77,16 @@ public class AuthController {
 
     private static final int MIN_PASSWORD_LENGTH = 8;
 
+    // Deliberately loose - just enough to catch a typo like a missing @ before it becomes an address
+    // nothing can ever be delivered to. Real deliverability is SendGrid's problem, not a regex's.
+    private static final Pattern EMAIL_PATTERN = Pattern.compile("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$");
+
     @PostMapping("/register")
     public ResponseEntity<?> register(@RequestBody Map<String, String> request) {
         String username = request.get("username");
         String password = request.get("password");
         String phoneNumber = request.get("phoneNumber");
+        String email = request.get("email");
 
         if (username == null || username.isBlank() || password == null || password.isBlank()) {
             return ResponseEntity.badRequest().body(Map.of("error", "Username and password are required"));
@@ -89,17 +95,30 @@ public class AuthController {
             return ResponseEntity.badRequest()
                     .body(Map.of("error", "Password must be at least " + MIN_PASSWORD_LENGTH + " characters"));
         }
+        // Required for new registrations even though the column is nullable: the column has to allow
+        // nulls for accounts that predate it, but there's no reason to create another one.
+        if (email == null || email.isBlank()) {
+            return ResponseEntity.badRequest().body(Map.of("error", "Email is required"));
+        }
+        if (!EMAIL_PATTERN.matcher(email).matches()) {
+            return ResponseEntity.badRequest().body(Map.of("error", "Please enter a valid email address"));
+        }
         if (userRepository.existsByUsername(username)) {
             return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of("error", "Username is already taken"));
+        }
+        if (userRepository.existsByEmail(email)) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of("error", "That email is already registered"));
         }
 
         User newUser = new User();
         newUser.setUsername(username);
         newUser.setPassword(passwordEncoder.encode(password));
         newUser.setPhoneNumber(phoneNumber);
+        newUser.setEmail(email);
         newUser.setTotpEnabled(false);
         userRepository.save(newUser);
-        authSecurityService.publishUserRegisteredEvent(newUser.getId(), newUser.getUsername(), newUser.getPhoneNumber());
+        authSecurityService.publishUserRegisteredEvent(
+                newUser.getId(), newUser.getUsername(), newUser.getPhoneNumber(), newUser.getEmail());
 
         return ResponseEntity.status(HttpStatus.CREATED)
                 .body(Map.of("status", "SUCCESS", "message", "Account created successfully"));

@@ -3,6 +3,8 @@ package com.example.profileservice.controller;
 import com.example.profileservice.dto.UpdateAlertThresholdRequestDto;
 import com.example.profileservice.dto.UpdateDailySummaryRequestDto;
 import com.example.profileservice.model.UserPreferenceEntity;
+import com.example.profileservice.model.UserProfile;
+import com.example.profileservice.repository.UserProfileRepository;
 import com.example.profileservice.service.PreferenceService;
 import jakarta.validation.Valid;
 import org.springframework.http.ResponseEntity;
@@ -23,9 +25,11 @@ import java.util.List;
 public class PreferenceController {
 
     private final PreferenceService preferenceService;
+    private final UserProfileRepository userProfileRepository;
 
-    public PreferenceController(PreferenceService preferenceService) {
+    public PreferenceController(PreferenceService preferenceService, UserProfileRepository userProfileRepository) {
         this.preferenceService = preferenceService;
+        this.userProfileRepository = userProfileRepository;
     }
 
     // @Valid tells spring to run bean validation on the incoming dto before this method body
@@ -50,29 +54,44 @@ public class PreferenceController {
         return ResponseEntity.ok("Daily summary preferences successfully updated.");
     }
 
+    // email rides along on the preferences response rather than getting its own endpoint: every
+    // caller that needs to email a user (notification-service's alert listener and daily summary job)
+    // already fetches their preferences first, so this saves a second round trip per send.
     public record UserPreferenceResponse(
             Long userId,
             BigDecimal alertThresholdAmount,
             Boolean dailySummaryEnabled,
-            String timezone
+            String timezone,
+            String email
     ) {}
 
     @GetMapping("/{userId}")
     @PreAuthorize("permitAll()")
     public ResponseEntity<UserPreferenceResponse> getPreferences(@PathVariable Long userId) {
         UserPreferenceEntity entity = preferenceService.getPreferences(userId);
-        return ResponseEntity.ok(new UserPreferenceResponse(
-                entity.getUserId(), entity.getAlertThresholdAmount(), entity.getDailySummaryEnabled(), entity.getTimezone()));
+        return ResponseEntity.ok(toResponse(entity));
     }
 
     @GetMapping("/daily-summary-users")
     @PreAuthorize("permitAll()")
     public ResponseEntity<List<UserPreferenceResponse>> getUsersForDailySummary(@RequestParam String timezone) {
         List<UserPreferenceResponse> users = preferenceService.getUsersForDailySummary(timezone).stream()
-                .map(entity -> new UserPreferenceResponse(
-                        entity.getUserId(), entity.getAlertThresholdAmount(), entity.getDailySummaryEnabled(), entity.getTimezone()))
+                .map(this::toResponse)
                 .toList();
         return ResponseEntity.ok(users);
+    }
+
+    // Preferences and profile are separate tables keyed by the same user id, so the address is looked
+    // up alongside. A user with no profile row (or one registered before the email field existed)
+    // simply reports a null address, which the notification listeners treat as "can't email this user".
+    private UserPreferenceResponse toResponse(UserPreferenceEntity entity) {
+        String email = userProfileRepository.findById(entity.getUserId())
+                .map(UserProfile::getEmail)
+                .orElse(null);
+
+        return new UserPreferenceResponse(
+                entity.getUserId(), entity.getAlertThresholdAmount(), entity.getDailySummaryEnabled(),
+                entity.getTimezone(), email);
     }
 
     private Long extractUserIdFromAuth() {

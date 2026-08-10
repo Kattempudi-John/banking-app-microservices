@@ -3,7 +3,13 @@ import { HttpClient, HttpParams } from '@angular/common/http';
 import { Observable } from 'rxjs';
 
 import { environment } from '../../../environments/environment';
-import { ExternalWireRequest, InternalTransferRequest, TransferResponse } from '../models/transfer.models';
+import {
+  ExternalWireRequest,
+  InternalTransferRequest,
+  RecipientPreview,
+  RecipientTransferRequest,
+  TransferResponse,
+} from '../models/transfer.models';
 import { HistoryStatus, WireTransferPage } from '../models/history.models';
 
 export interface TransferHistoryQuery {
@@ -22,6 +28,16 @@ export class TransferService {
 
   transferInternal(request: InternalTransferRequest): Observable<TransferResponse> {
     return this.http.post<TransferResponse>(`${this.baseUrl}/internal`, request);
+  }
+
+  transferToRecipient(request: RecipientTransferRequest): Observable<TransferResponse> {
+    return this.http.post<TransferResponse>(`${this.baseUrl}/to-recipient`, request);
+  }
+
+  // Called as the sender finishes typing a recipient account number, so they can confirm the name
+  // before sending. Read-only - nothing moves until transferToRecipient above is called.
+  previewRecipient(accountNumber: string): Observable<RecipientPreview> {
+    return this.http.get<RecipientPreview>(`${this.baseUrl}/recipients/${accountNumber}`);
   }
 
   transferExternal(fromAccountId: number, request: ExternalWireRequest): Observable<TransferResponse> {

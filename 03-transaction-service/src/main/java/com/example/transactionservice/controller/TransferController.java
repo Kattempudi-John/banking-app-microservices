@@ -9,6 +9,7 @@ import com.example.transactionservice.repository.TransactionRepository;
 import com.example.transactionservice.service.ExternalWireService;
 import com.example.transactionservice.service.TransferService;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Positive;
 import org.springframework.data.domain.Page;
@@ -74,16 +75,54 @@ public class TransferController {
     @PostMapping("/internal")
     public ResponseEntity<TransferResponseDto> executeInternalTransfer(
             @RequestBody @Valid InternalTransferRequestDto request) {
-        
+
         Long userId = extractUserIdFromAuth();
-        
+
         TransferResponseDto response = transferService.executeTransfer(
-                userId, 
-                request.fromAccountId(), 
-                request.toAccountId(), 
+                userId,
+                request.fromAccountId(),
+                request.toAccountId(),
                 request.amount()
         );
-        
+
+        return ResponseEntity.ok(response);
+    }
+
+    public record RecipientTransferRequestDto(
+            @NotNull Long fromAccountId,
+            @NotBlank String recipientAccountNumber,
+            @NotNull @Positive BigDecimal amount
+    ) {}
+
+    public record RecipientPreviewDto(String maskedAccountNumber, String accountType, String displayName) {}
+
+    // Read-only lookup the Transfer page calls as soon as a recipient account number is entered, so the
+    // sender can confirm who they're paying before any money moves. Intentionally does NOT carry
+    // @RequiresKyc - looking up a name moves no funds, and failing this with a KYC error would be
+    // confusing. It leaks nothing beyond a name and a masked number, both of which the sender needs
+    // to have been told by the recipient already.
+    @GetMapping("/recipients/{accountNumber}")
+    public ResponseEntity<RecipientPreviewDto> previewRecipient(@PathVariable String accountNumber) {
+        var recipient = transferService.resolveRecipient(accountNumber);
+        String displayName = transferService.resolveRecipientName(recipient.ownerUserId());
+
+        return ResponseEntity.ok(new RecipientPreviewDto(
+                recipient.maskedAccountNumber(), recipient.accountType(), displayName));
+    }
+
+    @PostMapping("/to-recipient")
+    public ResponseEntity<TransferResponseDto> executeTransferToRecipient(
+            @RequestBody @Valid RecipientTransferRequestDto request) {
+
+        Long userId = extractUserIdFromAuth();
+
+        TransferResponseDto response = transferService.executeTransferToRecipient(
+                userId,
+                request.fromAccountId(),
+                request.recipientAccountNumber(),
+                request.amount()
+        );
+
         return ResponseEntity.ok(response);
     }
 

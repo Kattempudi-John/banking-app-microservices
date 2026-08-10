@@ -30,13 +30,36 @@ spring:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
 
-# real SMS delivery for 2FA codes via Textbelt (https://textbelt.com) - disabled by default so
-# local dev never needs this (LoggingSmsProviderClient handles that case). Set SMS_ENABLED=true
-# in your own shell to actually send texts. The free "textbelt" key needs no signup/account at
-# all (1 text/day/IP) - only override sms.textbelt-key if you buy a paid key later.
+# Which SMS provider actually delivers 2FA codes. "logging" is the default so local dev and CI never
+# need credentials - LoggingSmsProviderClient just writes the message to the log. Exactly one client
+# bean matches the chosen value (@ConditionalOnProperty on each), so Spring is never ambiguous.
+#
+#   logging  - no credentials, logs instead of sending (default)
+#   textbelt - free tier needs no signup at all, 1 text/day/IP, good for a one-off end-to-end check
+#   twilio   - real delivery; paste your three values below or export the env vars
 sms:
-  enabled: ${SMS_ENABLED:false}
+  provider: ${SMS_PROVIDER:logging}
   textbelt-key: ${TEXTBELT_KEY:textbelt}
+  twilio:
+    # From the Twilio console. Leaving these blank with provider=twilio fails startup on purpose,
+    # rather than letting a login hang on a 2FA code that was never really sent.
+    account-sid: ${TWILIO_ACCOUNT_SID:}
+    auth-token: ${TWILIO_AUTH_TOKEN:}
+    # Must be a number Twilio has actually issued to your account, in E.164 format (+15551234567).
+    from-number: ${TWILIO_FROM_NUMBER:}
+
+# Which provider delivers balance summaries, transaction alerts, and profile security notices.
+# Email is a separate product from SMS with its own key - SendGrid is Twilio's, but the Twilio
+# credentials above do not work here. 2FA never goes over email; it's SMS only.
+#
+#   logging  - no credentials, logs instead of sending (default)
+#   sendgrid - real delivery
+email:
+  provider: ${EMAIL_PROVIDER:logging}
+  sendgrid:
+    api-key: ${SENDGRID_API_KEY:}
+    # Has to be an address verified as a sender in SendGrid, or every send is rejected.
+    from-email: ${SENDGRID_FROM_EMAIL:}
 
 server:
   port: 8085

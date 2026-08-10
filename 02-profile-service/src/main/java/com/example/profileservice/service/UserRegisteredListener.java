@@ -40,6 +40,7 @@ public class UserRegisteredListener {
             UserProfile profile = new UserProfile();
             profile.setId(userId);
             profile.setPhoneNumber((String) event.get("phoneNumber"));
+            profile.setEmail((String) event.get("email"));
             userProfileRepository.save(profile);
 
             logger.info("Provisioned profile for newly registered user id {}", userId);

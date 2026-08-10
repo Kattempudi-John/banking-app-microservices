@@ -4,10 +4,37 @@
   margin-bottom: var(--space-4);
 }
 
+/* Secondary switch inside the Internal tab, between own-accounts and paying someone else. Sits
+   tighter than .tab-row above it so the nesting reads as a sub-choice, not a second top-level tab. */
+.mode-row {
+  display: flex;
+  gap: var(--space-2);
+}
+
 .select-group {
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
+}
+
+/* Account-number field and its Look Up button share a row; align-items: end keeps the button lined
+   up with the input itself rather than floating against the label above it. */
+.recipient-group {
+  display: flex;
+  gap: var(--space-2);
+  align-items: end;
+}
+
+.recipient-group app-input {
+  flex: 1;
+}
+
+.recipient-confirmed {
+  font-size: var(--text-sm);
+  color: var(--foreground);
+  background: var(--color-accent-100);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
 }
 
 .select-group label {

@@ -30,6 +30,9 @@ export interface RegisterRequest {
   username: string;
   password: string;
   phoneNumber: string;
+  // Where balance summaries and transaction alerts get delivered. Required at registration even
+  // though the backend column is nullable, since older accounts predate the field.
+  email: string;
 }
 
 export interface RegisterResponse {

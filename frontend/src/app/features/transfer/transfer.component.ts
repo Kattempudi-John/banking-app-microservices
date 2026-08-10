@@ -1,4 +1,4 @@
-import { Component, OnInit, signal } from '@angular/core';
+import { Component, OnInit, computed, signal } from '@angular/core';
 import { HttpErrorResponse } from '@angular/common/http';
 import { FormsModule } from '@angular/forms';
 
@@ -6,7 +6,7 @@ import { extractApiError } from '../../core/api-error';
 import { AccountService } from '../../core/services/account.service';
 import { TransferService } from '../../core/services/transfer.service';
 import { AccountOverview } from '../../core/models/account.models';
-import { TransferResponse } from '../../core/models/transfer.models';
+import { RecipientPreview, TransferResponse } from '../../core/models/transfer.models';
 import { ButtonComponent } from '../../shared/button/button.component';
 import { AlertBannerComponent } from '../../shared/alert-banner/alert-banner.component';
 import { NavComponent } from '../../shared/nav/nav.component';
@@ -14,6 +14,9 @@ import { InputComponent } from '../../shared/input/input.component';
 
 type Tab = 'internal' | 'external';
 type ResultType = 'success' | 'error' | 'info';
+// The Internal tab covers two different jobs: shuffling money between your own accounts, and paying
+// somebody else. They need different inputs and different backend endpoints, so the tab tracks which.
+type InternalMode = 'own' | 'recipient';
 
 const IBAN_PATTERN = /^[A-Z]{2}[0-9]{2}[A-Z0-9]{11,30}$/;
 
@@ -28,9 +31,26 @@ export class TransferComponent implements OnInit {
   readonly accounts = signal<AccountOverview[]>([]);
   readonly activeTab = signal<Tab>('internal');
 
+  readonly internalMode = signal<InternalMode>('own');
+
   readonly fromAccountId = signal<number | null>(null);
   readonly toAccountId = signal<number | null>(null);
   readonly amount = signal('');
+
+  // The "To" list never offers the account already chosen as the source - picking the same account
+  // on both sides is rejected by the backend, so there's no reason to let it be selected at all.
+  readonly destinationAccounts = computed(() =>
+    this.accounts().filter((account) => account.accountId !== this.fromAccountId()),
+  );
+
+  // A user with a single account has nothing to transfer between, which used to present as two
+  // dropdowns holding the same one entry and a failure on submit.
+  readonly hasSingleAccount = computed(() => this.accounts().length < 2);
+
+  readonly recipientAccountNumber = signal('');
+  readonly recipientPreview = signal<RecipientPreview | null>(null);
+  readonly recipientLookupError = signal<string | null>(null);
+  readonly recipientLoading = signal(false);
 
   readonly extFromAccountId = signal<number | null>(null);
   readonly iban = signal('');
@@ -57,8 +77,50 @@ export class TransferComponent implements OnInit {
     this.resultMessage.set(null);
   }
 
+  selectInternalMode(mode: InternalMode): void {
+    this.internalMode.set(mode);
+    this.validationError.set(null);
+    this.resultMessage.set(null);
+  }
+
   onFromAccountChange(value: string): void {
     this.fromAccountId.set(value ? Number(value) : null);
+    // Changing the source can invalidate the destination, since the source is excluded from that
+    // list - clear it rather than leaving a stale selection the user can no longer see.
+    if (this.toAccountId() === this.fromAccountId()) {
+      this.toAccountId.set(null);
+    }
+  }
+
+  onRecipientAccountNumberChange(value: string): void {
+    this.recipientAccountNumber.set(value);
+    // Any edit invalidates a previously confirmed recipient - never let a stale name sit next to a
+    // number it no longer belongs to.
+    this.recipientPreview.set(null);
+    this.recipientLookupError.set(null);
+  }
+
+  lookupRecipient(): void {
+    const accountNumber = this.recipientAccountNumber().trim();
+    this.recipientPreview.set(null);
+    this.recipientLookupError.set(null);
+
+    if (!accountNumber) {
+      this.recipientLookupError.set('Enter the recipient\'s account number.');
+      return;
+    }
+
+    this.recipientLoading.set(true);
+    this.transferService.previewRecipient(accountNumber).subscribe({
+      next: (preview) => {
+        this.recipientLoading.set(false);
+        this.recipientPreview.set(preview);
+      },
+      error: (error: unknown) => {
+        this.recipientLoading.set(false);
+        this.recipientLookupError.set(extractApiError(error, 'Could not find that account.'));
+      },
+    });
   }
 
   onToAccountChange(value: string): void {
@@ -78,8 +140,22 @@ export class TransferComponent implements OnInit {
       this.validationError.set('Please enter a positive amount.');
       return;
     }
-    if (this.fromAccountId() === null || this.toAccountId() === null) {
-      this.validationError.set('Please select both accounts.');
+    if (this.fromAccountId() === null) {
+      this.validationError.set('Please select the account to send from.');
+      return;
+    }
+
+    if (this.internalMode() === 'recipient') {
+      this.submitToRecipient(amountNum);
+      return;
+    }
+
+    if (this.toAccountId() === null) {
+      this.validationError.set('Please select the account to send to.');
+      return;
+    }
+    if (this.fromAccountId() === this.toAccountId()) {
+      this.validationError.set("You can't transfer to the same account you're sending from.");
       return;
     }
 
@@ -87,6 +163,26 @@ export class TransferComponent implements OnInit {
       .transferInternal({
         fromAccountId: this.fromAccountId()!,
         toAccountId: this.toAccountId()!,
+        amount: amountNum,
+      })
+      .subscribe({
+        next: (response) => this.handleResult(response),
+        error: (error: unknown) => this.handleError(error),
+      });
+  }
+
+  private submitToRecipient(amountNum: number): void {
+    // Requiring a confirmed lookup first means the sender has always seen who they're paying before
+    // the money leaves - the account number alone is easy to fat-finger.
+    if (this.recipientPreview() === null) {
+      this.validationError.set('Look up the recipient account number first, so you can confirm who you\'re paying.');
+      return;
+    }
+
+    this.transferService
+      .transferToRecipient({
+        fromAccountId: this.fromAccountId()!,
+        recipientAccountNumber: this.recipientAccountNumber().trim(),
         amount: amountNum,
       })
       .subscribe({

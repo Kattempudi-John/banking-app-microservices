@@ -66,9 +66,16 @@ public class TransactionAlertListener {
             String subject = "Bank Alert: Large Debit Transaction";
             String htmlMessage = buildHtmlMessage(event);
 
-            // Note: In a full system, we would fetch the user's email address here.
-            // We use a generated placeholder for the dispatch signature contract.
-            String userEmail = "user_" + event.userId() + "@bank.com";
+            // The real address, carried on the same preferences response the threshold above came
+            // from. A user without one can't be alerted by email at all, so record the miss and stop
+            // rather than dispatching to an address that would silently bounce.
+            String userEmail = preferences.email();
+            if (userEmail == null || userEmail.isBlank()) {
+                log.warn("User {} has no email address on file - skipping the alert for transaction {}",
+                        event.userId(), event.transactionId());
+                persistRecord(event.userId(), subject, htmlMessage, NotificationStatus.FAILED);
+                return;
+            }
 
             // Delegate to the provider service (which handles its own external retries)
             boolean dispatched = notificationProviderService.dispatchEmail(userEmail, subject, htmlMessage);
