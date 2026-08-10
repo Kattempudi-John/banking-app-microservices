@@ -2,6 +2,7 @@ import { Component, OnInit, signal } from '@angular/core';
 import { HttpErrorResponse } from '@angular/common/http';
 import { FormsModule } from '@angular/forms';
 
+import { extractApiError } from '../../core/api-error';
 import { AccountService } from '../../core/services/account.service';
 import { TransferService } from '../../core/services/transfer.service';
 import { AccountOverview } from '../../core/models/account.models';
@@ -157,10 +158,14 @@ export class TransferComponent implements OnInit {
 
   private handleError(error: unknown): void {
     this.resultType.set('error');
+    // A 403 is always the KYC gate, and KycEnforcementAspect's message names the actual status
+    // ("KYC verification is PENDING_VERIFICATION..."), which is more than the old hardcoded line
+    // said - but it reads like an internal error code, so keep the friendlier wording there.
+    // Everything else now surfaces the real reason instead of a blanket "something went wrong".
     if (error instanceof HttpErrorResponse && error.status === 403) {
       this.resultMessage.set('Please verify your identity to enable transfers.');
-    } else {
-      this.resultMessage.set('Something went wrong. Please try again.');
+      return;
     }
+    this.resultMessage.set(extractApiError(error));
   }
 }

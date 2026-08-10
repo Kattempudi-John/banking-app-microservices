@@ -4,7 +4,13 @@
   <div class="card stack profile-card">
     <div class="stack">
       <h1>Profile</h1>
-      <p class="text-muted">KYC Status: {{ kycStatus() }}</p>
+      @if (kycLoading()) {
+        <p class="text-muted">KYC Status: Checking…</p>
+      } @else if (kycError()) {
+        <p class="text-muted">KYC Status: Unavailable — we couldn't reach the verification service.</p>
+      } @else {
+        <p class="text-muted">KYC Status: {{ kycStatus() }}</p>
+      }
       @if (kycStatus() && kycStatus() !== 'APPROVED') {
         <app-alert-banner type="warning" message="Your identity has not been verified yet. Please verify your identity to enable transfers." />
         <app-button variant="secondary" (clicked)="simulateKycApproval()">Simulate KYC Approval (Demo)</app-button>
@@ -23,10 +29,14 @@
             <p class="text-muted">{{ account.accountType }} {{ account.maskedAccountNumber }}</p>
             <div class="receive-money-row">
               <span class="receive-money-label">IBAN</span>
-              <span class="receive-money-value">{{ account.iban }}</span>
-              <app-button variant="secondary" (clicked)="copyToClipboard(account.accountId + '-iban', account.iban)">
-                {{ copiedField() === account.accountId + '-iban' ? 'Copied!' : 'Copy' }}
-              </app-button>
+              @if (account.iban) {
+                <span class="receive-money-value">{{ account.iban }}</span>
+                <app-button variant="secondary" (clicked)="copyToClipboard(account.accountId + '-iban', account.iban)">
+                  {{ copiedField() === account.accountId + '-iban' ? 'Copied!' : 'Copy' }}
+                </app-button>
+              } @else {
+                <span class="receive-money-value text-muted">Not yet assigned</span>
+              }
             </div>
             <div class="receive-money-row">
               <span class="receive-money-label">SWIFT/BIC</span>

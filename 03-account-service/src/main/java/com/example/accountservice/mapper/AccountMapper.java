@@ -30,7 +30,9 @@ public class AccountMapper {
         );
     }
 
-    private String maskAccountNumber(String rawAccountNumber) {
+    // Public because InternalAccountController's recipient lookup masks a number it didn't build a
+    // full overview DTO for - same masking rule, so it reuses this rather than repeating it.
+    public String maskAccountNumber(String rawAccountNumber) {
         if (rawAccountNumber == null) {
             return rawAccountNumber; // Failsafe for unusually short or malformed numbers
         }

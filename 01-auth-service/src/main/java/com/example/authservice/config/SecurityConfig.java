@@ -53,6 +53,11 @@ public class SecurityConfig {
                 .requestMatchers("/api/v1/auth/refresh").permitAll()
                 // Swagger/OpenAPI UI - documentation, not application data
                 .requestMatchers("/swagger-ui/**", "/swagger-ui.html", "/v3/api-docs/**").permitAll()
+                // Internal, service-to-service only (transaction-service resolves a transfer
+                // recipient's display name here) - not exposed through the k8s ingress, so there is
+                // no end-user token available to authenticate it. Same rule account-service already
+                // applies to its own /api/v1/internal/** endpoints.
+                .requestMatchers("/api/v1/internal/**").permitAll()
                 .requestMatchers("/api/v1/auth/logout").authenticated()
                 
                 // Any other backend endpoints require authentication

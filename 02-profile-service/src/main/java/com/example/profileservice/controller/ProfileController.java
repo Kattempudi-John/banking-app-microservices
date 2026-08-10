@@ -6,21 +6,23 @@ import com.example.profileservice.model.UserProfile;
 import com.example.profileservice.repository.UserProfileRepository;
 import com.example.profileservice.service.ProfileManagementService;
 import jakarta.validation.Valid;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.*;
-import org.springframework.web.server.ResponseStatusException;
 
 import java.util.Map;
 
 @RestController
 @RequestMapping("/api/v1")
 public class ProfileController {
+
+    private static final Logger logger = LoggerFactory.getLogger(ProfileController.class);
 
     private final ProfileManagementService profileManagementService;
     private final UserProfileRepository userProfileRepository;
@@ -53,9 +55,28 @@ public class ProfileController {
     @GetMapping("/profiles/{userId}/kyc-status")
     public ResponseEntity<?> getKycStatus(@PathVariable Long userId) {
         UserProfile user = userProfileRepository.findById(userId)
-                .orElseThrow(() -> new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "User not found"));
-                
+                .orElseGet(() -> provisionMissingProfile(userId));
+
         return ResponseEntity.ok(Map.of("status", user.getKycStatus().name()));
+    }
+
+    // A user can hold valid credentials in auth-service and still have no profile row here, if the
+    // "user-events" Kafka message that normally provisions one was never consumed (broker down at
+    // registration time, or the account predates that fan-out existing at all). This used to throw
+    // a 500, which was worse than it looked: transaction-service's KycEnforcementAspect calls this
+    // same endpoint before every transfer, so one missing row silently blocked all money movement
+    // AND left the Profile page's KYC line blank, with no way for the user to recover on their own.
+    // Provisioning on read is idempotent and mirrors exactly what UserRegisteredListener would have
+    // created, so the affected user self-heals on their next page load. No @Transactional here: this
+    // is called from a lambda inside the same class, so a proxy-based annotation would be bypassed
+    // anyway - the single save() carries its own transaction, which is all this needs.
+    private UserProfile provisionMissingProfile(Long userId) {
+        logger.warn("No profile found for user id {} - provisioning a PENDING_VERIFICATION profile on read. "
+                + "This means the user-events message for this user was never consumed.", userId);
+
+        UserProfile profile = new UserProfile();
+        profile.setId(userId);
+        return userProfileRepository.save(profile);
     }
 
     @PostMapping("/webhooks/kyc-update")

@@ -1,8 +1,8 @@
 import { Component, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
-import { HttpErrorResponse } from '@angular/common/http';
 import { Router } from '@angular/router';
 
+import { extractApiError } from '../../core/api-error';
 import { AuthService } from '../../core/auth.service';
 import { InputComponent } from '../../shared/input/input.component';
 import { ButtonComponent } from '../../shared/button/button.component';
@@ -57,15 +57,8 @@ export class SignupComponent {
         },
         error: (error: unknown) => {
           this.loading.set(false);
-          this.errorMessage.set(this.extractErrorMessage(error));
+          this.errorMessage.set(extractApiError(error));
         },
       });
-  }
-
-  private extractErrorMessage(error: unknown): string {
-    if (error instanceof HttpErrorResponse && typeof error.error?.error === 'string') {
-      return error.error.error;
-    }
-    return 'Something went wrong. Please try again.';
   }
 }

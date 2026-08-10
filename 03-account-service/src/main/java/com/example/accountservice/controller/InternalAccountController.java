@@ -1,5 +1,6 @@
 package com.example.accountservice.controller;
 
+import com.example.accountservice.mapper.AccountMapper;
 import com.example.accountservice.model.AccountEntity;
 import com.example.accountservice.model.AccountStatus;
 import com.example.accountservice.model.TransactionEntity;
@@ -23,9 +24,11 @@ import java.util.Optional;
 public class InternalAccountController {
 
     private final InternalAccountService internalAccountService;
+    private final AccountMapper accountMapper;
 
-    public InternalAccountController(InternalAccountService internalAccountService) {
+    public InternalAccountController(InternalAccountService internalAccountService, AccountMapper accountMapper) {
         this.internalAccountService = internalAccountService;
+        this.accountMapper = accountMapper;
     }
 
     public record TransferRequest(
@@ -49,6 +52,14 @@ public class InternalAccountController {
     public record UserAggregateBalanceResponse(Long userId, BigDecimal totalBalance) {}
 
     public record AccountLookupResponse(Long accountId, Long userId, String accountType, String status) {}
+
+    public record RecipientLookupResponse(
+            Long accountId,
+            Long ownerUserId,
+            String accountType,
+            String maskedAccountNumber,
+            String status
+    ) {}
 
     // transaction-service calls this to check whether an incoming wire's IBAN belongs to an
     // account on this platform - if it does, the wire can be executed as a real instant transfer
@@ -74,6 +85,30 @@ public class InternalAccountController {
     public ResponseEntity<Void> transfer(@RequestBody TransferRequest request) {
         internalAccountService.transfer(request.userId(), request.fromAccountId(), request.toAccountId(), request.amount());
         return ResponseEntity.ok().build();
+    }
+
+    // Same shape as /transfer, but the destination is someone else's account - see
+    // InternalAccountService.transferToRecipient for why that's a separate method rather than a flag.
+    @PostMapping("/api/v1/internal/accounts/transfer-to-recipient")
+    public ResponseEntity<Void> transferToRecipient(@RequestBody TransferRequest request) {
+        internalAccountService.transferToRecipient(request.userId(), request.fromAccountId(), request.toAccountId(), request.amount());
+        return ResponseEntity.ok().build();
+    }
+
+    // Resolves a full account number typed by a sender into the internal id needed to credit it.
+    // Returns the owner's user id (not their name - account-service has no idea who anyone is; the
+    // caller resolves that through auth-service) and re-masks the number so the response can be shown
+    // back to the sender as confirmation without echoing the whole thing.
+    @GetMapping("/api/v1/internal/accounts/by-number/{accountNumber}")
+    public ResponseEntity<RecipientLookupResponse> lookupByAccountNumber(@PathVariable String accountNumber) {
+        return internalAccountService.findByAccountNumber(accountNumber)
+                .map(account -> ResponseEntity.ok(new RecipientLookupResponse(
+                        account.getId(),
+                        account.getUserId(),
+                        account.getAccountType().name(),
+                        accountMapper.maskAccountNumber(account.getAccountNumber()),
+                        account.getStatus().name())))
+                .orElseGet(() -> ResponseEntity.notFound().build());
     }
 
     @PostMapping("/api/v1/internal/accounts/{accountId}/debit")
@@ -105,11 +140,45 @@ class InternalAccountService {
         this.transactionRepository = transactionRepository;
     }
 
+    // Moves money between two accounts the SAME user owns. Both sides are ownership-checked, which
+    // is what separates this from transferToRecipient below.
     @Transactional
     public void transfer(Long userId, Long fromAccountId, Long toAccountId, BigDecimal amount) {
+        rejectSameAccount(fromAccountId, toAccountId);
+
         AccountEntity fromAccount = lockAndVerifyOwnership(fromAccountId, userId);
         AccountEntity toAccount = lockAndVerifyOwnership(toAccountId, userId);
 
+        moveFunds(fromAccount, toAccount, amount);
+
+        recordTransaction(fromAccountId, TransactionType.DEBIT, amount, "Internal transfer to account " + toAccountId);
+        recordTransaction(toAccountId, TransactionType.CREDIT, amount, "Internal transfer from account " + fromAccountId);
+    }
+
+    // Pays a DIFFERENT user's account. Ownership is enforced on the source only - the whole point is
+    // that the destination belongs to someone else - so the destination is merely locked and must be
+    // open for business. Deliberately a separate method rather than a flag on transfer() above, so
+    // the own-accounts path keeps its stricter check and can't be loosened by accident.
+    @Transactional
+    public void transferToRecipient(Long userId, Long fromAccountId, Long toAccountId, BigDecimal amount) {
+        rejectSameAccount(fromAccountId, toAccountId);
+
+        AccountEntity fromAccount = lockAndVerifyOwnership(fromAccountId, userId);
+        AccountEntity toAccount = accountRepository.findByIdForUpdate(toAccountId)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Recipient account not found"));
+
+        if (toAccount.getStatus() != AccountStatus.ACTIVE) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "That account can't receive transfers right now.");
+        }
+
+        moveFunds(fromAccount, toAccount, amount);
+
+        recordTransaction(fromAccountId, TransactionType.DEBIT, amount, "Transfer to account " + toAccount.getAccountNumber());
+        recordTransaction(toAccountId, TransactionType.CREDIT, amount, "Transfer from account " + fromAccount.getAccountNumber());
+    }
+
+    // Both accounts are already locked by the time this runs, so the read-check-write below is safe.
+    private void moveFunds(AccountEntity fromAccount, AccountEntity toAccount, BigDecimal amount) {
         if (fromAccount.getAvailableBalance().compareTo(amount) < 0) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "INSUFFICIENT_FUNDS");
         }
@@ -118,9 +187,16 @@ class InternalAccountService {
         toAccount.setAvailableBalance(toAccount.getAvailableBalance().add(amount));
         accountRepository.save(fromAccount);
         accountRepository.save(toAccount);
+    }
 
-        recordTransaction(fromAccountId, TransactionType.DEBIT, amount, "Internal transfer to account " + toAccountId);
-        recordTransaction(toAccountId, TransactionType.CREDIT, amount, "Internal transfer from account " + fromAccountId);
+    // Has to happen before the two lookups, not after: locking the same id twice hands back the very
+    // same managed entity from the persistence context, so the subtract and the add cancel out and the
+    // balance looks untouched - while a DEBIT and a CREDIT row are still both written and the caller is
+    // told the transfer succeeded. Phantom history for money that never moved.
+    private void rejectSameAccount(Long fromAccountId, Long toAccountId) {
+        if (fromAccountId.equals(toAccountId)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "SAME_ACCOUNT");
+        }
     }
 
     @Transactional
@@ -149,6 +225,11 @@ class InternalAccountService {
     @Transactional(readOnly = true)
     public Optional<AccountEntity> findByIban(String iban) {
         return accountRepository.findByIban(iban);
+    }
+
+    @Transactional(readOnly = true)
+    public Optional<AccountEntity> findByAccountNumber(String accountNumber) {
+        return accountRepository.findByAccountNumber(accountNumber);
     }
 
     @Transactional(readOnly = true)

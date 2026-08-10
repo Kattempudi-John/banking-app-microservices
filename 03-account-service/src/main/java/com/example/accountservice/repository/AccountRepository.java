@@ -24,6 +24,15 @@ public interface AccountRepository extends JpaRepository<AccountEntity, Long> {
 
     Optional<AccountEntity> findByIban(String iban);
 
+    // Backs the recipient lookup on the Transfer page's "send to someone else" mode - the sender
+    // types a full account number, which is the only account identifier a recipient would realistically
+    // read out loud (the API only ever returns it masked).
+    Optional<AccountEntity> findByAccountNumber(String accountNumber);
+
+    // Used once at startup by IbanBackfillRunner. Accounts created before the iban column existed
+    // have none, and an account with no IBAN can't be sent money on the External Wire tab.
+    List<AccountEntity> findByIbanIsNull();
+
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT a FROM AccountEntity a WHERE a.id = :id")
     Optional<AccountEntity> findByIdForUpdate(@Param("id") Long id);

@@ -18,8 +18,21 @@ public interface AccountServiceClient {
     record CreditRequest(BigDecimal amount, String description) {}
     record AccountLookupResponse(Long accountId, Long userId, String accountType, String status) {}
 
+    record RecipientLookupResponse(Long accountId, Long ownerUserId, String accountType,
+                                   String maskedAccountNumber, String status) {}
+
     @PostMapping("/api/v1/internal/accounts/transfer")
     void transfer(@RequestBody TransferRequest request);
+
+    // Same payload as transfer() above, but account-service only ownership-checks the source side -
+    // the destination is expected to belong to someone else.
+    @PostMapping("/api/v1/internal/accounts/transfer-to-recipient")
+    void transferToRecipient(@RequestBody TransferRequest request);
+
+    // Turns a full account number the sender typed into the internal account id needed to credit it.
+    // 404s through the same ErrorDecoder path as lookupByIban when no such account exists.
+    @GetMapping("/api/v1/internal/accounts/by-number/{accountNumber}")
+    RecipientLookupResponse lookupByAccountNumber(@PathVariable("accountNumber") String accountNumber);
 
     @PostMapping("/api/v1/internal/accounts/{accountId}/debit")
     void debit(@PathVariable("accountId") Long accountId, @RequestBody DebitRequest request);

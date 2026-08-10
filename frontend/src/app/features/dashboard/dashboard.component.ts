@@ -1,8 +1,8 @@
 import { Component, OnInit, signal } from '@angular/core';
 import { Router } from '@angular/router';
 import { FormsModule } from '@angular/forms';
-import { HttpErrorResponse } from '@angular/common/http';
 
+import { extractApiError } from '../../core/api-error';
 import { AccountService } from '../../core/services/account.service';
 import { AccountOverview, AccountType } from '../../core/models/account.models';
 import { TableColumn, TableComponent } from '../../shared/table/table.component';
@@ -117,11 +117,7 @@ export class DashboardComponent implements OnInit {
         this.depositAmount.set('');
       },
       error: (error: unknown) => {
-        if (error instanceof HttpErrorResponse && error.status === 400) {
-          this.depositError.set(error.error?.message ?? 'Deposit amount is invalid.');
-        } else {
-          this.depositError.set('Something went wrong. Please try again.');
-        }
+        this.depositError.set(extractApiError(error, 'Deposit amount is invalid.'));
       },
     });
   }
@@ -149,11 +145,7 @@ export class DashboardComponent implements OnInit {
         this.openAccountModalOpen.set(false);
       },
       error: (error: unknown) => {
-        if (error instanceof HttpErrorResponse && error.status === 400) {
-          this.openAccountError.set(error.error?.message ?? 'Could not open account.');
-        } else {
-          this.openAccountError.set('Something went wrong. Please try again.');
-        }
+        this.openAccountError.set(extractApiError(error, 'Could not open account.'));
       },
     });
   }

@@ -1,6 +1,7 @@
 import { Component, OnInit, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 
+import { extractApiError } from '../../core/api-error';
 import { ProfileService } from '../../core/services/profile.service';
 import { AccountService } from '../../core/services/account.service';
 import { AuthService } from '../../core/auth.service';
@@ -22,6 +23,11 @@ const PHONE_PATTERN = /^\+?[1-9]\d{1,14}$/;
 })
 export class ProfileComponent implements OnInit {
   readonly kycStatus = signal<KycStatus | null>(null);
+  // Without these two the template interpolated a null straight into "KYC Status:", so a slow or
+  // failed lookup was indistinguishable from a user who genuinely has no status - it just rendered
+  // a bare label forever.
+  readonly kycLoading = signal(true);
+  readonly kycError = signal(false);
 
   readonly phoneNumber = signal('');
   readonly addressLine1 = signal('');
@@ -48,13 +54,30 @@ export class ProfileComponent implements OnInit {
 
   ngOnInit(): void {
     const userId = this.authService.userId();
-    if (userId !== null) {
-      this.profileService.getKycStatus(userId).subscribe((status) => this.kycStatus.set(status));
+    if (userId === null) {
+      this.kycLoading.set(false);
+      this.kycError.set(true);
+    } else {
+      this.profileService.getKycStatus(userId).subscribe({
+        next: (status) => {
+          this.kycStatus.set(status);
+          this.kycLoading.set(false);
+        },
+        error: () => {
+          this.kycLoading.set(false);
+          this.kycError.set(true);
+        },
+      });
     }
     this.accountService.getAccounts().subscribe((accounts) => this.accounts.set(accounts));
   }
 
-  copyToClipboard(field: string, value: string): void {
+  // The Copy button is hidden when there's no value, but guard anyway - clipboard.writeText(null)
+  // rejects, and an unhandled rejection here would be invisible to the user.
+  copyToClipboard(field: string, value: string | null | undefined): void {
+    if (!value) {
+      return;
+    }
     navigator.clipboard.writeText(value).then(() => {
       this.copiedField.set(field);
       setTimeout(() => this.copiedField.set(null), 2000);
@@ -88,9 +111,9 @@ export class ProfileComponent implements OnInit {
           this.saveMessageType.set('success');
           this.saveMessage.set('Your contact info has been saved.');
         },
-        error: () => {
+        error: (error: unknown) => {
           this.saveMessageType.set('error');
-          this.saveMessage.set('Something went wrong. Please try again.');
+          this.saveMessage.set(extractApiError(error));
         },
       });
   }
@@ -104,9 +127,9 @@ export class ProfileComponent implements OnInit {
         this.kycMessageType.set('success');
         this.kycMessage.set('KYC approval simulated successfully.');
       },
-      error: () => {
+      error: (error: unknown) => {
         this.kycMessageType.set('error');
-        this.kycMessage.set('Could not simulate KYC approval. Please try again.');
+        this.kycMessage.set(extractApiError(error, 'Could not simulate KYC approval. Please try again.'));
       },
     });
   }
