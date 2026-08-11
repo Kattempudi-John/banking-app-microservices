@@ -3,6 +3,7 @@ package com.example.notificationservice;
 import com.example.notificationservice.client.ProfileServiceClient;
 import com.example.notificationservice.event.FundsTransferredEvent;
 import com.example.notificationservice.model.NotificationChannel;
+import org.mockito.ArgumentCaptor;
 import com.example.notificationservice.model.NotificationRecord;
 import com.example.notificationservice.model.NotificationStatus;
 import com.example.notificationservice.model.NotificationType;
@@ -26,8 +27,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.never;
@@ -85,6 +88,31 @@ class NotificationPersistenceTestSuite {
                         && record.getChannel() == NotificationChannel.SMS
                         && record.getStatus() == NotificationStatus.SENT
         ));
+    }
+
+    // The record used to store the SMS body verbatim, which put a live one-time code into
+    // GET /api/v1/notifications - readable off the notifications page long after the login it
+    // belonged to. The SMS itself still has to carry the code; the audit row must not.
+    @Test
+    @DisplayName("2FA record stores a masked line, never the code itself - [MEANT TO PASS]")
+    void testTwoFactorSms_RecordNeverContainsTheCode() {
+        given(notificationProviderService.dispatchSms(any(), any())).willReturn(true);
+        Map<String, Object> event = Map.of(
+                "action", "SMS_2FA_REQUESTED", "userId", "42", "phoneNumber", "+15551234567", "code", "987654");
+
+        twoFactorSmsListener.consumeSmsRequest(event);
+
+        // The real SMS keeps the code - redacting that would defeat the point of sending it.
+        verify(notificationProviderService).dispatchSms(eq("+15551234567"), contains("987654"));
+
+        ArgumentCaptor<NotificationRecord> saved = ArgumentCaptor.forClass(NotificationRecord.class);
+        verify(notificationRecordRepository).save(saved.capture());
+
+        assertThat(saved.getValue().getMessage())
+                .as("a one-time code must never be persisted to the notification feed")
+                .doesNotContain("987654");
+        // Masked to the last four digits, so the row still says which number was texted.
+        assertThat(saved.getValue().getMessage()).isEqualTo("Verification code sent to ***4567.");
     }
 
     @Test
@@ -195,7 +223,7 @@ class NotificationPersistenceTestSuite {
         record.setUserId(userId);
         record.setType(NotificationType.SMS_2FA);
         record.setChannel(NotificationChannel.SMS);
-        record.setMessage("Your verification code is 123456.");
+        record.setMessage("Verification code sent to ***4567.");
         record.setStatus(NotificationStatus.SENT);
         return record;
     }

@@ -36,9 +36,7 @@ describe('toReadableMessage', () => {
   });
 
   it('leaves an already-plain message untouched', () => {
-    expect(toReadableMessage('Your verification code is 123456. It expires in 5 minutes.')).toBe(
-      'Your verification code is 123456. It expires in 5 minutes.',
-    );
+    expect(toReadableMessage('Verification code sent to ***4567.')).toBe('Verification code sent to ***4567.');
   });
 
   it('keeps a plain message containing comparison operators intact', () => {

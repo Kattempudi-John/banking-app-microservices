@@ -248,6 +248,11 @@ key is marked `optional: true`, so the pod still starts without it and falls bac
 `textbelt` is a middle option for SMS: its free tier needs no signup at all (1 text/day/IP), enough
 to prove the 2FA path end-to-end without opening a Twilio account.
 
+The notification feed records that a 2FA code was sent, not the code itself — the stored line is
+`Verification code sent to ***4567.` while the real SMS carries the code. A one-time code written
+into a page the user can reopen later is a credential sitting in an audit trail, so `V3` in
+`04-notification-service` also redacts any historical rows.
+
 Email is delivered to the address captured at registration and stored on the user's profile. A user
 registered before that field existed has none, and is skipped with a logged warning rather than
 being mailed at a fabricated address.

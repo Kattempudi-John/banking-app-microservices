@@ -13,7 +13,7 @@ describe('NotificationsComponent', () => {
 
   const onePage: NotificationPage = {
     content: [
-      { id: 1, type: 'SMS_2FA', channel: 'SMS', subject: null, message: 'Your verification code is 123456.', status: 'SENT', createdAt: '2026-08-01T10:00:00Z' },
+      { id: 1, type: 'SMS_2FA', channel: 'SMS', subject: null, message: 'Verification code sent to ***4567.', status: 'SENT', createdAt: '2026-08-01T10:00:00Z' },
       { id: 2, type: 'TRANSACTION_ALERT', channel: 'EMAIL', subject: 'Bank Alert', message: 'Large debit detected.', status: 'SENT', createdAt: '2026-07-31T09:00:00Z' },
     ],
     totalPages: 1,
@@ -48,7 +48,7 @@ describe('NotificationsComponent', () => {
     setup();
     const text = fixture.nativeElement.textContent;
     expect(text).toContain('SMS_2FA');
-    expect(text).toContain('Your verification code is 123456.');
+    expect(text).toContain('Verification code sent to ***4567.');
     expect(text).toContain('TRANSACTION_ALERT');
     expect(text).toContain('SENT');
   });
