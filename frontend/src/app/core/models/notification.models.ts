@@ -1,4 +1,4 @@
-export type NotificationType = 'SMS_2FA' | 'TRANSACTION_ALERT' | 'PROFILE_SECURITY';
+export type NotificationType = 'SMS_2FA' | 'TRANSACTION_ALERT' | 'PROFILE_SECURITY' | 'DAILY_SUMMARY';
 export type NotificationChannel = 'SMS' | 'EMAIL';
 export type NotificationDeliveryStatus = 'SENT' | 'FAILED';
 

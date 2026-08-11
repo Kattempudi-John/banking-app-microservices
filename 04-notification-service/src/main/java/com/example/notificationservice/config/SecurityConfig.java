@@ -46,6 +46,12 @@ public class SecurityConfig {
                 // back as a bodyless 401 and the real reason never reaches the caller. Matching on
                 // the ERROR dispatch type keeps /error itself from being publicly reachable.
                 .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
+                // Operator/service-to-service only, and the ONE prefix the k8s ingress does not
+                // route. Anything unauthenticated has to live here: the ingress matches by path
+                // prefix, so a permitAll endpoint under a routed prefix is published to the
+                // internet. That matters more than usual for InternalNotificationController, which
+                // triggers real email sends.
+                .requestMatchers("/api/v1/internal/**").permitAll()
                 .anyRequest().authenticated()
             )
             .sessionManagement(session -> session

@@ -61,17 +61,38 @@ sms:
     from-number: ${TWILIO_FROM_NUMBER:}
 
 # Which provider delivers balance summaries, transaction alerts, and profile security notices.
-# Email is a separate product from SMS with its own key - SendGrid is Twilio's, but the Twilio
-# credentials above do not work here. 2FA never goes over email; it's SMS only.
+# 2FA never goes over email; it's SMS only.
 #
 #   logging  - no credentials, logs instead of sending (default)
-#   sendgrid - real delivery
+#   twilio   - real delivery via Twilio Email (POST https://comms.twilio.com/v1/Emails)
+#   sendgrid - real delivery via the classic SendGrid v3 API
+#
+# The two real options are different products with different credentials, which is the whole reason
+# both clients exist. Twilio Email reuses the sms.twilio.* account SID and auth token above, so it
+# needs no new secret - only a verified sender. SendGrid is a separate API with its own key, and its
+# single-sender verification works without DNS access, which makes it the fallback when domain
+# authentication isn't possible.
 email:
   provider: ${EMAIL_PROVIDER:logging}
+  twilio:
+    # No credentials here on purpose - they come from sms.twilio.* above. One Twilio account, one
+    # SID/token pair; a second copy would just be a second thing to rotate and forget.
+    # Has to be an address whose sender identity is verified in the Twilio console, or every send
+    # is rejected.
+    from-email: ${TWILIO_FROM_EMAIL:}
+    # Display name on the From header. Cosmetic, so unlike the address it gets a real default.
+    from-name: ${TWILIO_FROM_NAME:Banking Alerts}
   sendgrid:
     api-key: ${SENDGRID_API_KEY:}
     # Has to be an address verified as a sender in SendGrid, or every send is rejected.
     from-email: ${SENDGRID_FROM_EMAIL:}
+
+# DailyBalanceSummaryJob's hourly cron sweeps for timezones whose local time is currently this hour
+# and mails the opted-in users there. Configurable purely so it can be pointed at the current hour
+# to watch the scheduled path run for real, instead of waiting until 8am somewhere relevant.
+notification:
+  daily-summary:
+    hour: ${DAILY_SUMMARY_HOUR:8}
 
 server:
   port: 8085

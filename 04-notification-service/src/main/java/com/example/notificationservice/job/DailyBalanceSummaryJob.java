@@ -10,11 +10,17 @@ import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import com.example.notificationservice.client.AccountServiceClient;
 import com.example.notificationservice.client.ProfileServiceClient;
+import com.example.notificationservice.model.NotificationChannel;
+import com.example.notificationservice.model.NotificationRecord;
+import com.example.notificationservice.model.NotificationStatus;
+import com.example.notificationservice.model.NotificationType;
+import com.example.notificationservice.repository.NotificationRecordRepository;
 import com.example.notificationservice.service.NotificationProviderService;
 
 @Component
@@ -22,34 +28,45 @@ public class DailyBalanceSummaryJob {
 
     private static final Logger log = LoggerFactory.getLogger(DailyBalanceSummaryJob.class);
 
+    private static final String EMAIL_SUBJECT = "Your Daily Balance Summary";
+
     private final ProfileServiceClient profileServiceClient;
     private final AccountServiceClient accountServiceClient;
     private final NotificationProviderService notificationProviderService;
+    private final NotificationRecordRepository notificationRecordRepository;
     private final Clock clock;
+
+    // The local hour this sweep targets. Configurable only so the scheduled path can be pointed at
+    // the current hour and watched running for real, rather than taking it on faith until 8am.
+    private final int summaryHour;
 
     // injecting a plain java.time.Clock instead of calling Instant.now() directly everywhere,
     // learned this is what actually let the test suite freeze time and stub a fixed 8am instant
     public DailyBalanceSummaryJob(ProfileServiceClient profileServiceClient,
                                   AccountServiceClient accountServiceClient,
                                   NotificationProviderService notificationProviderService,
-                                  Clock clock) {
+                                  NotificationRecordRepository notificationRecordRepository,
+                                  Clock clock,
+                                  @Value("${notification.daily-summary.hour:8}") int summaryHour) {
         this.profileServiceClient = profileServiceClient;
         this.accountServiceClient = accountServiceClient;
         this.notificationProviderService = notificationProviderService;
+        this.notificationRecordRepository = notificationRecordRepository;
         this.clock = clock;
+        this.summaryHour = summaryHour;
     }
 
     @Scheduled(cron = "0 0 * * * *")
     public void processDailySummaries() {
-        log.info("Starting hourly sweep for 8:00 AM Daily Balance Summaries.");
+        log.info("Starting hourly sweep for {}:00 Daily Balance Summaries.", summaryHour);
 
         Instant now = Instant.now(clock);
 
-        // 1. Find all global timezones where the current local time is 8:00 AM
-        List<String> targetTimezones = findTimezonesAtHour(now, 8);
+        // 1. Find all global timezones where the current local time is the target hour
+        List<String> targetTimezones = findTimezonesAtHour(now, summaryHour);
 
         if (targetTimezones.isEmpty()) {
-            log.info("No timezones are currently at 8:00 AM. Job ending.");
+            log.info("No timezones are currently at {}:00. Job ending.", summaryHour);
             return;
         }
 
@@ -77,7 +94,10 @@ public class DailyBalanceSummaryJob {
                 .toList();
     }
 
-    private void processUsersForTimezone(String timezone) {
+    // Public rather than private so InternalNotificationController can run a single zone on demand,
+    // skipping the hour check entirely - that bypass is the whole point of the manual trigger, since
+    // otherwise testing a summary means waiting for the target hour to come round somewhere.
+    public void processUsersForTimezone(String timezone) {
         // 3. Fetch users who opted in and belong to this timezone
         List<ProfileServiceClient.UserPreferenceResponse> users =
                 profileServiceClient.getUsersForDailySummary(timezone);
@@ -125,20 +145,38 @@ public class DailyBalanceSummaryJob {
                 continue;
             }
 
+            String emailHtml = buildHtmlSummary(userBalance);
+
             // The address arrives on the same preferences record that selected this user for a
             // summary in the first place. Users registered before the email field existed have none;
             // skip them rather than dispatching to a fabricated address that can never be delivered.
+            // Recorded as FAILED rather than passed over silently, the same way TransactionAlertListener
+            // treats this case - "we owed you a summary and could not send it" is exactly the kind of
+            // thing the notification feed exists to show.
             String userEmail = user.email();
             if (userEmail == null || userEmail.isBlank()) {
                 log.warn("Skipping the daily summary for user {} - no email address on file", user.userId());
+                persistRecord(user.userId(), emailHtml, NotificationStatus.FAILED);
                 continue;
             }
 
-            String emailSubject = "Your Daily Balance Summary";
-            String emailHtml = buildHtmlSummary(userBalance);
+            boolean dispatched = notificationProviderService.dispatchEmail(userEmail, EMAIL_SUBJECT, emailHtml);
 
-            notificationProviderService.dispatchEmail(userEmail, emailSubject, emailHtml);
+            persistRecord(user.userId(), emailHtml, dispatched ? NotificationStatus.SENT : NotificationStatus.FAILED);
         }
+    }
+
+    // Same shape as TransactionAlertListener.persistRecord - this job was the one dispatcher that
+    // never left a durable trace, so its emails were invisible in GET /api/v1/notifications.
+    private void persistRecord(Long userId, String message, NotificationStatus status) {
+        NotificationRecord record = new NotificationRecord();
+        record.setUserId(userId);
+        record.setType(NotificationType.DAILY_SUMMARY);
+        record.setChannel(NotificationChannel.EMAIL);
+        record.setSubject(EMAIL_SUBJECT);
+        record.setMessage(message);
+        record.setStatus(status);
+        notificationRecordRepository.save(record);
     }
 
     private String buildHtmlSummary(AccountServiceClient.UserAggregateBalanceResponse balanceData) {

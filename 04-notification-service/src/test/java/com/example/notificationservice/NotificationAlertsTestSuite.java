@@ -6,11 +6,17 @@ import com.example.notificationservice.client.ProfileServiceClient;
 import com.example.notificationservice.client.ProfileServiceClient.UserPreferenceResponse;
 import com.example.notificationservice.event.FundsTransferredEvent;
 import com.example.notificationservice.job.DailyBalanceSummaryJob;
+import com.example.notificationservice.model.NotificationChannel;
+import com.example.notificationservice.model.NotificationRecord;
+import com.example.notificationservice.model.NotificationStatus;
+import com.example.notificationservice.model.NotificationType;
+import com.example.notificationservice.repository.NotificationRecordRepository;
 import com.example.notificationservice.service.NotificationProviderService;
 import com.example.notificationservice.service.TransactionAlertListener;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
@@ -21,6 +27,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -47,6 +54,12 @@ class NotificationAlertsTestSuite {
 
     @MockBean
     private NotificationProviderService notificationProviderService;
+
+    // Mocked rather than hitting the real table: these tests assert on WHAT gets recorded, and a
+    // mock makes that a direct verify instead of a save-then-query round trip against a database
+    // this suite otherwise never needs.
+    @MockBean
+    private NotificationRecordRepository notificationRecordRepository;
 
     @MockBean
     private Clock clock;
@@ -234,5 +247,93 @@ class NotificationAlertsTestSuite {
         assertThatCode(() -> dailyBalanceSummaryJob.processDailySummaries()).doesNotThrowAnyException();
 
         verify(notificationProviderService, never()).dispatchEmail(any(), any(), any());
+    }
+
+    // the daily summary used to be the one dispatcher that left no durable trace, so a summary that
+    // went out was invisible in GET /api/v1/notifications while every kafka-driven alert showed up
+    // stub a successful dispatch and capture what the job saved
+    // verify the record is typed DAILY_SUMMARY on the EMAIL channel and marked SENT
+    @Test
+    @DisplayName("Block 10: A dispatched daily summary is recorded as a SENT DAILY_SUMMARY notification - [MEANT TO PASS]")
+    void testBlock10_dispatchedSummary_isRecordedAsSent() {
+        given(profileServiceClient.getUsersForDailySummary(eq(NEW_YORK_ZONE)))
+                .willReturn(List.of(new UserPreferenceResponse(100L, new BigDecimal("100.00"), true, NEW_YORK_ZONE, "summary@example.com")));
+        given(accountServiceClient.getAggregateBalancesBatch(eq(List.of(100L))))
+                .willReturn(List.of(new UserAggregateBalanceResponse(100L, new BigDecimal("5432.10"))));
+        given(notificationProviderService.dispatchEmail(anyString(), anyString(), anyString())).willReturn(true);
+
+        dailyBalanceSummaryJob.processDailySummaries();
+
+        ArgumentCaptor<NotificationRecord> captor = ArgumentCaptor.forClass(NotificationRecord.class);
+        verify(notificationRecordRepository, times(1)).save(captor.capture());
+
+        NotificationRecord saved = captor.getValue();
+        assertThat(saved.getUserId()).isEqualTo(100L);
+        assertThat(saved.getType()).isEqualTo(NotificationType.DAILY_SUMMARY);
+        assertThat(saved.getChannel()).isEqualTo(NotificationChannel.EMAIL);
+        assertThat(saved.getStatus()).isEqualTo(NotificationStatus.SENT);
+        // the balance has to survive into the stored body, otherwise the feed shows an empty shell
+        assertThat(saved.getMessage()).contains("5432.10");
+    }
+
+    // dispatchEmail returns false once @Recover has swallowed the exception and exhausted the retries,
+    // that boolean is the only signal the send actually failed, so the record has to follow it
+    @Test
+    @DisplayName("Block 11: A failed summary dispatch is recorded as FAILED, not SENT - [MEANT TO PASS]")
+    void testBlock11_failedSummaryDispatch_isRecordedAsFailed() {
+        given(profileServiceClient.getUsersForDailySummary(eq(NEW_YORK_ZONE)))
+                .willReturn(List.of(new UserPreferenceResponse(101L, new BigDecimal("100.00"), true, NEW_YORK_ZONE, "summary@example.com")));
+        given(accountServiceClient.getAggregateBalancesBatch(eq(List.of(101L))))
+                .willReturn(List.of(new UserAggregateBalanceResponse(101L, new BigDecimal("10.00"))));
+        given(notificationProviderService.dispatchEmail(anyString(), anyString(), anyString())).willReturn(false);
+
+        dailyBalanceSummaryJob.processDailySummaries();
+
+        ArgumentCaptor<NotificationRecord> captor = ArgumentCaptor.forClass(NotificationRecord.class);
+        verify(notificationRecordRepository, times(1)).save(captor.capture());
+        assertThat(captor.getValue().getStatus()).isEqualTo(NotificationStatus.FAILED);
+    }
+
+    // a user opted into summaries but with no email on file is a real state, users registered before
+    // the email field existed have none, no send is possible so nothing is dispatched, but the miss
+    // is still recorded rather than passed over in silence
+    @Test
+    @DisplayName("Block 12: A user with no email on file is recorded as FAILED and never dispatched - [MEANT TO PASS]")
+    void testBlock12_userWithoutEmail_isRecordedFailedAndNotDispatched() {
+        given(profileServiceClient.getUsersForDailySummary(eq(NEW_YORK_ZONE)))
+                .willReturn(List.of(new UserPreferenceResponse(102L, new BigDecimal("100.00"), true, NEW_YORK_ZONE, null)));
+        given(accountServiceClient.getAggregateBalancesBatch(eq(List.of(102L))))
+                .willReturn(List.of(new UserAggregateBalanceResponse(102L, new BigDecimal("77.00"))));
+
+        dailyBalanceSummaryJob.processDailySummaries();
+
+        verify(notificationProviderService, never()).dispatchEmail(any(), any(), any());
+
+        ArgumentCaptor<NotificationRecord> captor = ArgumentCaptor.forClass(NotificationRecord.class);
+        verify(notificationRecordRepository, times(1)).save(captor.capture());
+        assertThat(captor.getValue().getUserId()).isEqualTo(102L);
+        assertThat(captor.getValue().getStatus()).isEqualTo(NotificationStatus.FAILED);
+    }
+
+    // the manual trigger path InternalNotificationController uses, running one zone directly without
+    // consulting the clock at all - this is what makes an end-to-end email check possible at any hour
+    // rather than only when the configured summary hour comes round somewhere
+    @Test
+    @DisplayName("Block 13: Running a single timezone directly bypasses the hour check - [MEANT TO PASS]")
+    void testBlock13_processUsersForTimezone_runsRegardlessOfHour() {
+        String offHourZone = "Asia/Tokyo";
+        given(profileServiceClient.getUsersForDailySummary(eq(offHourZone)))
+                .willReturn(List.of(new UserPreferenceResponse(103L, new BigDecimal("100.00"), true, offHourZone, "tokyo@example.com")));
+        given(accountServiceClient.getAggregateBalancesBatch(eq(List.of(103L))))
+                .willReturn(List.of(new UserAggregateBalanceResponse(103L, new BigDecimal("900.00"))));
+        given(notificationProviderService.dispatchEmail(anyString(), anyString(), anyString())).willReturn(true);
+
+        // The stubbed clock is 08:00 in New York, which is 22:00 in Tokyo - so the scheduled sweep
+        // would skip this zone entirely. Calling it directly still sends.
+        dailyBalanceSummaryJob.processUsersForTimezone(offHourZone);
+
+        verify(notificationProviderService, times(1))
+                .dispatchEmail(eq("tokyo@example.com"), anyString(), anyString());
+        verify(notificationRecordRepository, times(1)).save(any(NotificationRecord.class));
     }
 }

@@ -176,7 +176,17 @@ zero setup. Exactly one client bean matches the chosen value, so there is never 
 | Property | Values | Delivers |
 |---|---|---|
 | `sms.provider` | `logging` (default), `textbelt`, `twilio` | 2FA codes |
-| `email.provider` | `logging` (default), `sendgrid` | Balance summaries, transaction alerts, profile security notices |
+| `email.provider` | `logging` (default), `twilio`, `sendgrid` | Balance summaries, transaction alerts, profile security notices |
+
+The two real email options are different products, which is why both clients exist:
+
+- **`twilio`** — Twilio Email (`POST https://comms.twilio.com/v1/Emails`). Authenticates with the
+  same `TWILIO_ACCOUNT_SID`/`TWILIO_AUTH_TOKEN` pair the SMS client uses, so enabling email adds no
+  new secret — only `TWILIO_FROM_EMAIL`. Requires the sender domain to be authenticated via DNS in
+  the Twilio console.
+- **`sendgrid`** — the classic SendGrid v3 API, a separate product with its own key. Its
+  single-sender verification works without DNS access, which makes it the practical fallback when
+  domain authentication isn't an option.
 
 To send for real, copy the template and fill in your credentials:
 
@@ -220,6 +230,31 @@ Email is delivered to the address captured at registration and stored on the use
 registered before that field existed has none, and is skipped with a logged warning rather than
 being mailed at a fabricated address.
 
+### Daily balance summary
+
+`DailyBalanceSummaryJob` runs hourly, finds every IANA timezone whose local time is currently the
+configured hour, and emails the users there who opted in on `/profile/alerts`. The target hour is
+`notification.daily-summary.hour` (env `DAILY_SUMMARY_HOUR`, default `8`) — point it at the current
+hour to watch the scheduled path run without waiting for morning.
+
+For an immediate check, trigger it directly:
+
+```bash
+# One timezone, right now - skips the hour check entirely
+curl -X POST "http://localhost:8085/api/v1/internal/notifications/daily-summary/run?timezone=America/New_York"
+
+# Or the exact sweep the scheduler would run
+curl -X POST "http://localhost:8085/api/v1/internal/notifications/daily-summary/run"
+```
+
+Like every other unauthenticated endpoint in this project it lives under `/api/v1/internal/`, the one
+prefix `k8s/08-ingress-routes.yaml` deliberately does not route — it sends real email, so a routed
+version would be reachable by anyone who could reach the load balancer.
+
+Each summary is written to `notification_records` as a `DAILY_SUMMARY`, so it appears in
+`/notifications` alongside the Kafka-driven alerts. A user who opted in but has no email address on
+file is recorded `FAILED` rather than passed over silently.
+
 ## Infrastructure
 
 Terraform (`terraform/`) defines the target AWS footprint (VPC, RDS Postgres, EKS with a managed node group); Helm values (`helm/`) configure Kafka/Redis/ingress-nginx on the cluster; `k8s/` holds the namespace, config/secrets, and per-service Deployment/Service manifests. `.github/workflows/build-and-test.yml` runs every service's test suite on every push/PR to `main`. `.github/workflows/deploy-to-eks.yml` (GHCR image build/push + `kubectl apply` to EKS) exists but is entirely commented out until the four AWS secrets it needs are actually configured — see the comment at the top of that file to re-enable it.
@@ -230,7 +265,9 @@ Terraform (`terraform/`) defines the target AWS footprint (VPC, RDS Postgres, EK
 
 Being upfront about what's intentionally not production-complete:
 
-- **Notification providers default to logging.** Real delivery is wired and ready — Twilio for SMS, SendGrid for email — but `sms.provider`/`email.provider` default to `logging` so the project runs with zero credentials. Set them to `twilio`/`sendgrid` and supply the keys (see [Notification providers](#notification-providers) below) to send for real.
+- **Notification providers default to logging.** Real delivery is wired and ready — Twilio for SMS, Twilio Email or SendGrid for email — but `sms.provider`/`email.provider` default to `logging` so the project runs with zero credentials. Set them to `twilio` and supply the keys (see [Notification providers](#notification-providers) below) to send for real.
+- **Twilio Email sends are fire-and-forget.** The API is asynchronous: a `202 Accepted` means queued, not delivered, and returns an `operationId` the client logs. Polling `operationLocation` for the final per-message outcome isn't implemented, so a message accepted by Twilio and then bounced is recorded `SENT` here.
+- **The daily summary has no distributed lock.** `k8s/07-notification-service.yaml` pins `replicas: 1` precisely because a second replica would run the same hourly sweep and double-send. Scaling that deployment out needs ShedLock or equivalent first.
 - **No role-based authorization system yet.** Profile-service's admin KYC-override endpoint requires `ADMIN`/`COMPLIANCE_OFFICER` roles, but nothing in the system currently grants roles to a user — that endpoint is reachable in code but not yet in a real deployment.
 - **Kafka-provisioned profiles/accounts are minimal.** The `user-events` consumer in `profile-service`/`account-service` (see [Frontend](#frontend) above) only sets the bare minimum — a `PENDING_VERIFICATION` profile with no address, and a single `$0` checking account. If Kafka is down when a user registers, they end up with credentials but no profile/account until manually backfilled (no dead-letter/retry queue yet, just a logged error).
 - **IaC is validated, not deployed** (see [Infrastructure](#infrastructure) above).
