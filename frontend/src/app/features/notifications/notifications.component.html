@@ -16,7 +16,7 @@
     </div>
   } @else {
     <div class="card table-card">
-      <app-table [columns]="columns" [rows]="notifications()" />
+      <app-table [columns]="columns" [rows]="displayRows()" />
     </div>
 
     <div class="pagination">

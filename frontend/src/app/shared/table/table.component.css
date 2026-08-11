@@ -17,6 +17,11 @@ td {
   padding: var(--space-3);
   border-bottom: var(--border-width) solid var(--border);
   font-size: var(--text-sm);
+  /* Notification bodies are full sentences rather than short labels, and the cards these tables sit
+     in clip their overflow - without this a long cell pushes the table wider than its container and
+     the end of the row is simply lost. anywhere (not break-word) so an unbroken token like a
+     transaction UUID also wraps instead of overflowing on its own. */
+  overflow-wrap: anywhere;
 }
 
 tbody tr:hover {

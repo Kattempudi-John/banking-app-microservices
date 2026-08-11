@@ -1,6 +1,7 @@
-import { Component, OnInit, signal } from '@angular/core';
+import { Component, OnInit, computed, signal } from '@angular/core';
 
 import { NotificationService } from '../../core/services/notification.service';
+import { toReadableMessage } from '../../core/notification-message';
 import { Notification } from '../../core/models/notification.models';
 import { TableColumn, TableComponent } from '../../shared/table/table.component';
 import { ButtonComponent } from '../../shared/button/button.component';
@@ -23,6 +24,18 @@ export class NotificationsComponent implements OnInit {
   ];
 
   readonly notifications = signal<Notification[]>([]);
+
+  // What the table actually renders. The stored notification is left untouched - it is the record of
+  // what was dispatched - and only the presentation is reshaped here: the email types hold full HTML
+  // documents, and every cell renders as text, so those rows previously showed raw markup.
+  readonly displayRows = computed(() =>
+    this.notifications().map((notification) => ({
+      ...notification,
+      createdAt: this.formatDate(notification.createdAt),
+      message: toReadableMessage(notification.message),
+    })),
+  );
+
   readonly currentPage = signal(0);
   readonly totalPages = signal(0);
   readonly loading = signal(false);
@@ -40,6 +53,24 @@ export class NotificationsComponent implements OnInit {
 
   retry(): void {
     this.loadPage(this.currentPage());
+  }
+
+  // The API returns a raw LocalDateTime ("2026-08-10T20:40:35.79046"), which was being printed
+  // verbatim including the microseconds. Falls back to the original string rather than showing
+  // "Invalid Date" if anything unexpected ever arrives.
+  private formatDate(value: string): string {
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) {
+      return value;
+    }
+
+    return parsed.toLocaleString(undefined, {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    });
   }
 
   private loadPage(page: number): void {

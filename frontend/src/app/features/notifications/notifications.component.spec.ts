@@ -53,6 +53,37 @@ describe('NotificationsComponent', () => {
     expect(text).toContain('SENT');
   });
 
+  it('renders an HTML email body as readable text, not raw markup', () => {
+    setup({
+      ...onePage,
+      content: [
+        {
+          id: 3,
+          type: 'DAILY_SUMMARY',
+          channel: 'EMAIL',
+          subject: 'Your Daily Balance Summary',
+          message: '<html>\n  <body>\n    <h2>Good Morning!</h2>\n    <div style="color: #2E86C1;">Total Aggregate Balance: $20000.0000</div>\n  </body>\n</html>',
+          status: 'SENT',
+          createdAt: '2026-08-01T10:00:00Z',
+        },
+      ],
+    });
+
+    const text = fixture.nativeElement.textContent;
+    expect(text).toContain('Good Morning!');
+    expect(text).toContain('Total Aggregate Balance: $20000.0000');
+    expect(text).not.toContain('<h2>');
+    expect(text).not.toContain('<html>');
+    expect(text).not.toContain('2E86C1');
+  });
+
+  it('formats the raw timestamp instead of printing it verbatim', () => {
+    setup();
+    const text = fixture.nativeElement.textContent;
+    // The API sends a bare LocalDateTime; the microsecond-precision ISO string should not survive.
+    expect(text).not.toContain('2026-08-01T10:00:00Z');
+  });
+
   it('shows an empty state when there are no notifications', () => {
     setup({ content: [], totalPages: 0, totalElements: 0, number: 0, size: 50 });
     expect(fixture.nativeElement.textContent).toContain('No notifications yet');
