@@ -12,8 +12,7 @@
         <p class="text-muted">KYC Status: {{ kycStatus() }}</p>
       }
       @if (kycStatus() && kycStatus() !== 'APPROVED') {
-        <app-alert-banner type="warning" message="Your identity has not been verified yet. Please verify your identity to enable transfers." />
-        <app-button variant="secondary" (clicked)="simulateKycApproval()">Simulate KYC Approval (Demo)</app-button>
+        <app-alert-banner type="warning" message="Your identity has not been verified yet. Complete the verification details below to enable transfers." />
       }
       <app-alert-banner [type]="kycMessageType()" [message]="kycMessage()" />
     </div>
@@ -22,11 +21,22 @@
       <div class="stack receive-money">
         <h2>Receive Money</h2>
         <p class="text-muted">
-          Share an account's IBAN with another user on this platform to receive an instant transfer via the Transfer page's External Wire tab.
+          Share an account's number with another user on this platform to be paid via the Transfer page, or its IBAN to receive an instant transfer via the External Wire tab.
         </p>
         @for (account of accounts(); track account.accountId) {
           <div class="stack receive-money-account">
             <p class="text-muted">{{ account.accountType }} {{ account.maskedAccountNumber }}</p>
+            <div class="receive-money-row">
+              <span class="receive-money-label">Account number</span>
+              @if (account.accountNumber) {
+                <span class="receive-money-value">{{ account.accountNumber }}</span>
+                <app-button variant="secondary" (clicked)="copyToClipboard(account.accountId + '-number', account.accountNumber)">
+                  {{ copiedField() === account.accountId + '-number' ? 'Copied!' : 'Copy' }}
+                </app-button>
+              } @else {
+                <span class="receive-money-value text-muted">Not available</span>
+              }
+            </div>
             <div class="receive-money-row">
               <span class="receive-money-label">IBAN</span>
               @if (account.iban) {
@@ -51,6 +61,25 @@
     }
 
     <form class="stack" (submit)="submit(); $event.preventDefault()">
+      <h2>Identity verification</h2>
+      <p class="text-muted">
+        Your details are checked against our records. Once verified, transfers are enabled on your accounts.
+      </p>
+      <app-input
+        id="legalName"
+        label="Full Legal Name"
+        [ngModel]="legalName()"
+        (ngModelChange)="legalName.set($event)"
+        name="legalName"
+      />
+      <app-input
+        id="dateOfBirth"
+        label="Date of Birth"
+        type="date"
+        [ngModel]="dateOfBirth()"
+        (ngModelChange)="dateOfBirth.set($event)"
+        name="dateOfBirth"
+      />
       <app-input
         id="phoneNumber"
         label="Phone Number"
@@ -95,7 +124,7 @@
       />
       <app-alert-banner type="error" [message]="validationError()" />
       <app-alert-banner [type]="saveMessageType()" [message]="saveMessage()" />
-      <app-button type="submit">Save</app-button>
+      <app-button type="submit">{{ kycStatus() === 'APPROVED' ? 'Save' : 'Verify my identity' }}</app-button>
     </form>
   </div>
 </div>

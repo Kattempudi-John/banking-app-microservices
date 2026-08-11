@@ -7,13 +7,16 @@ import com.example.profileservice.model.UserProfile;
 import com.example.profileservice.repository.KycOverrideAuditLogRepository;
 import com.example.profileservice.repository.UserProfileRepository;
 import com.example.profileservice.util.PhoneNumberNormalizer;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.server.ResponseStatusException;
 
+import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.Period;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -28,6 +31,14 @@ public class ProfileManagementService {
     // Kafka Topic Constants
     private static final String PROFILE_EVENTS_TOPIC = "profile-events";
     private static final String KYC_EVENTS_TOPIC = "kyc-events";
+
+    private static final int MINIMUM_AGE_YEARS = 18;
+
+    // The same flag that used to gate the Simulate-KYC-Approval button (true in application.yml,
+    // false in application-prod.yml). Reused deliberately: this is the same affordance, just moved
+    // from a fake button onto the real verification form.
+    @Value("${app.demo.enabled:false}")
+    private boolean demoAutoApprovalEnabled;
 
     public ProfileManagementService(UserProfileRepository userProfileRepository,
                                     KycOverrideAuditLogRepository auditLogRepository,
@@ -54,6 +65,11 @@ public class ProfileManagementService {
         String normalizedPhone = phoneNumberNormalizer.normalize(dto.getPhoneNumber())
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.BAD_REQUEST,
                         "Please enter a valid phone number, e.g. 571-285-6947 or +15712856947"));
+
+        requireApplicantIsAdult(dto.getDateOfBirth());
+
+        user.setLegalName(dto.getLegalName());
+        user.setDateOfBirth(dto.getDateOfBirth());
         user.setPhoneNumber(normalizedPhone);
         user.setAddressLine1(dto.getAddressLine1());
         user.setAddressLine2(dto.getAddressLine2());
@@ -66,6 +82,49 @@ public class ProfileManagementService {
 
         // 4. Publish to Kafka with userId as the routing key
         publishContactInfoChangedEvent(userId, oldState, dto);
+
+        // 5. Submitting a complete identity IS the verification here - the user has given a legal
+        // name, date of birth and address, and every field was validated before reaching this point.
+        autoApproveKycIfEligible(userId, user);
+    }
+
+    // The DTO's @Past only rejects future dates; the minimum-age rule needs real date arithmetic, so
+    // it lives here. Rejecting rather than silently leaving the profile PENDING_VERIFICATION because
+    // a user who is told nothing would just keep resubmitting the same form wondering why transfers
+    // are still blocked.
+    private void requireApplicantIsAdult(LocalDate dateOfBirth) {
+        if (dateOfBirth == null) {
+            return; // @NotNull on the DTO already covers this; nothing useful to add here.
+        }
+        if (Period.between(dateOfBirth, LocalDate.now()).getYears() < MINIMUM_AGE_YEARS) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "You must be at least " + MINIMUM_AGE_YEARS + " years old to open an account.");
+        }
+    }
+
+    // Stands in for the identity vendor's callback, which is the only thing that would approve a user
+    // in a real deployment (see ProfileController.handleKycWebhook). Gated on app.demo.enabled for
+    // exactly that reason: locally this makes the app usable end to end without a vendor account,
+    // while a real deployment still has to hear from the vendor before any money can move.
+    //
+    // Only ever promotes from PENDING_VERIFICATION. A REJECTED user editing their address must not
+    // be able to clear their own rejection - that decision belongs to the vendor or a compliance
+    // officer's override, not to the applicant.
+    private void autoApproveKycIfEligible(Long userId, UserProfile user) {
+        if (!demoAutoApprovalEnabled) {
+            return;
+        }
+        if (user.getKycStatus() != KycStatus.PENDING_VERIFICATION) {
+            return;
+        }
+
+        // Routed through the same method the real webhook uses, so the status change, the idempotency
+        // guard and the kyc-events broadcast all behave identically no matter what triggered it.
+        // This is a self-invocation, so processKycWebhook's own @Transactional is bypassed by the
+        // proxy - which is harmless and in fact wanted here, because updateContactInfo's transaction
+        // is already open and the approval should commit or roll back together with the identity it
+        // was granted on, never on its own.
+        processKycWebhook(userId, KycStatus.APPROVED);
     }
 
     private Map<String, String> captureOldContactState(UserProfile user) {

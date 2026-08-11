@@ -39,15 +39,18 @@ import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.time.LocalDate;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.times;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
@@ -312,6 +315,8 @@ class ProfileServiceTestSuite {
     @WithMockUser(username = "100")
     void testBlock1_UpdateContactInfo_InvalidPhoneNumber_ReturnsBadRequest() throws Exception {
         UpdateContactInfoRequestDto dto = new UpdateContactInfoRequestDto();
+        dto.setLegalName("Jane Q Public");
+        dto.setDateOfBirth(LocalDate.of(1990, 4, 17));
         dto.setPhoneNumber("INVALID_PHONE_123");
         dto.setAddressLine1("123 Main St");
         dto.setCity("Boston");
@@ -337,6 +342,8 @@ class ProfileServiceTestSuite {
         given(userProfileRepository.findById(100L)).willReturn(Optional.of(mockUser));
 
         UpdateContactInfoRequestDto dto = new UpdateContactInfoRequestDto();
+        dto.setLegalName("Jane Q Public");
+        dto.setDateOfBirth(LocalDate.of(1990, 4, 17));
         dto.setPhoneNumber("+12025550143");
         dto.setAddressLine1("456 Innovation Blvd");
         dto.setCity("San Jose");
@@ -348,11 +355,93 @@ class ProfileServiceTestSuite {
                 .contentType(MediaType.APPLICATION_JSON)
                 .content(objectMapper.writeValueAsString(dto)))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.message").value("Profile updated successfully"));
+                .andExpect(jsonPath("$.message").value("Profile updated successfully"))
+                // Submitting a complete identity IS the verification, so the response reports the
+                // status it produced rather than making the page ask for it separately.
+                .andExpect(jsonPath("$.kycStatus").value("APPROVED"));
 
+        assertThat(mockUser.getLegalName()).isEqualTo("Jane Q Public");
+        assertThat(mockUser.getDateOfBirth()).isEqualTo(LocalDate.of(1990, 4, 17));
         assertThat(mockUser.getPhoneNumber()).isEqualTo("+12025550143");
         assertThat(mockUser.getAddressLine1()).isEqualTo("456 Innovation Blvd");
-        verify(userProfileRepository).save(mockUser);
+        assertThat(mockUser.getKycStatus()).isEqualTo(KycStatus.APPROVED);
+
+        // Twice, not once: the contact-info write and the KYC promotion are separate saves inside the
+        // one transaction.
+        verify(userProfileRepository, times(2)).save(mockUser);
+        verify(kafkaTemplate).send(eq("kyc-events"), eq("100"), any(KycStatusUpdatedEvent.class));
+    }
+
+    // the counterpart to the above - a REJECTED applicant editing their details must not be able to
+    // clear their own rejection, that call belongs to the vendor or a compliance officer's override
+    @Test
+    @DisplayName("Block: Contact Info Update Does Not Re-Approve A REJECTED Applicant - [MEANT TO PASS]")
+    void testUpdateContactInfo_RejectedApplicant_IsNotAutoApproved() throws Exception {
+        mockUser.setKycStatus(KycStatus.REJECTED);
+        given(userProfileRepository.findById(100L)).willReturn(Optional.of(mockUser));
+
+        UpdateContactInfoRequestDto dto = new UpdateContactInfoRequestDto();
+        dto.setLegalName("Jane Q Public");
+        dto.setDateOfBirth(LocalDate.of(1990, 4, 17));
+        dto.setPhoneNumber("+12025550143");
+        dto.setAddressLine1("456 Innovation Blvd");
+        dto.setCity("San Jose");
+        dto.setState("CA");
+        dto.setZipCode("95110");
+
+        mockMvc.perform(put("/api/v1/profiles/me/contact-info")
+                .with(jwt().jwt(j -> j.claim("userId", 100L)))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(dto)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.kycStatus").value("REJECTED"));
+
+        assertThat(mockUser.getKycStatus()).isEqualTo(KycStatus.REJECTED);
+        verify(kafkaTemplate, never()).send(eq("kyc-events"), anyString(), any(KycStatusUpdatedEvent.class));
+    }
+
+    // an applicant under the minimum age is rejected outright rather than saved and left silently
+    // unverified, which would leave them resubmitting the same form wondering why transfers are blocked
+    @Test
+    @DisplayName("Block: Contact Info Update Rejects An Applicant Under 18 - [MEANT TO FAIL]")
+    void testUpdateContactInfo_UnderageApplicant_ReturnsBadRequest() throws Exception {
+        given(userProfileRepository.findById(100L)).willReturn(Optional.of(mockUser));
+
+        UpdateContactInfoRequestDto dto = new UpdateContactInfoRequestDto();
+        dto.setLegalName("Too Young");
+        dto.setDateOfBirth(LocalDate.now().minusYears(10));
+        dto.setPhoneNumber("+12025550143");
+        dto.setAddressLine1("456 Innovation Blvd");
+        dto.setCity("San Jose");
+        dto.setState("CA");
+        dto.setZipCode("95110");
+
+        mockMvc.perform(put("/api/v1/profiles/me/contact-info")
+                .with(jwt().jwt(j -> j.claim("userId", 100L)))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(dto)))
+                .andExpect(status().isBadRequest());
+
+        assertThat(mockUser.getKycStatus()).isEqualTo(KycStatus.PENDING_VERIFICATION);
+    }
+
+    // a legal name and date of birth are what make this a verification rather than an address change,
+    // so the endpoint must not accept a submission missing either
+    @Test
+    @DisplayName("Block: Contact Info Update Rejects A Missing Legal Name And Date Of Birth - [MEANT TO FAIL]")
+    void testUpdateContactInfo_MissingIdentityFields_ReturnsBadRequest() throws Exception {
+        UpdateContactInfoRequestDto dto = new UpdateContactInfoRequestDto();
+        dto.setPhoneNumber("+12025550143");
+        dto.setAddressLine1("456 Innovation Blvd");
+        dto.setCity("San Jose");
+        dto.setState("CA");
+        dto.setZipCode("95110");
+
+        mockMvc.perform(put("/api/v1/profiles/me/contact-info")
+                .with(jwt().jwt(j -> j.claim("userId", 100L)))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(dto)))
+                .andExpect(status().isBadRequest());
     }
 
     // this one calls the service layer directly instead of going through mockmvc

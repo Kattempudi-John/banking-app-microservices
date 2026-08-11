@@ -24,6 +24,8 @@ describe('ProfileService', () => {
 
   it('sends a PUT request to update contact info', () => {
     const request = {
+      legalName: 'Jane Q Public',
+      dateOfBirth: '1990-04-17',
       phoneNumber: '+15551234567',
       addressLine1: '123 Main St',
       city: 'Springfield',
@@ -31,12 +33,17 @@ describe('ProfileService', () => {
       zipCode: '62704',
     };
 
-    service.updateContactInfo(request).subscribe();
+    let result: KycStatus | undefined;
+    service.updateContactInfo(request).subscribe((status) => (result = status));
 
     const req = httpMock.expectOne(`${environment.profileApiUrl}/profiles/me/contact-info`);
     expect(req.request.method).toBe('PUT');
     expect(req.request.body).toEqual(request);
-    req.flush({});
+
+    // Submitting the identity form IS the verification step, so the response carries the resulting
+    // status and the service surfaces it rather than the wrapper object.
+    req.flush({ message: 'Profile updated successfully', kycStatus: 'APPROVED' });
+    expect(result).toBe('APPROVED');
   });
 
   it('fetches the KYC status for a given user id', () => {

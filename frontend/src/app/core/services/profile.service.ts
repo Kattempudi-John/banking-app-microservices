@@ -11,8 +11,13 @@ export class ProfileService {
 
   constructor(private readonly http: HttpClient) {}
 
-  updateContactInfo(request: ContactInfo): Observable<unknown> {
-    return this.http.put(`${this.baseUrl}/profiles/me/contact-info`, request);
+  // Returns the resulting KYC status, because submitting this form IS the verification step - the
+  // backend approves off the back of a complete identity, so the caller needs the outcome without
+  // re-reading it and racing the commit.
+  updateContactInfo(request: ContactInfo): Observable<KycStatus> {
+    return this.http
+      .put<{ message: string; kycStatus: KycStatus }>(`${this.baseUrl}/profiles/me/contact-info`, request)
+      .pipe(map((response) => response.kycStatus));
   }
 
   // No userId in the path on purpose - the backend reads it from the JWT. Passing one from the
@@ -23,13 +28,8 @@ export class ProfileService {
       .pipe(map((response) => response.status));
   }
 
-  // Demo-only: simulates the KYC vendor's webhook callback for the logged-in user themselves.
-  // 404s if the backend's app.demo.enabled flag is off.
-  simulateKycApproval(): Observable<KycStatus> {
-    return this.http
-      .post<{ status: KycStatus }>(`${this.baseUrl}/profiles/kyc/simulate-approval`, {})
-      .pipe(map((response) => response.status));
-  }
+  // simulateKycApproval() is gone along with the endpoint behind it. Verification now happens by
+  // submitting the identity form - see updateContactInfo above, which returns the resulting status.
 
   // Like getKycStatus above, no userId in the path - the backend takes it from the JWT. This
   // response carries an email address, so letting the client name the user was worth removing.

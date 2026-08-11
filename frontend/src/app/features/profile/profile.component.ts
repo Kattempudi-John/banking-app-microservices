@@ -16,6 +16,11 @@ import { InputComponent } from '../../shared/input/input.component';
 // isn't a phone number; profile-service returns a specific message if it can't resolve one.
 const PHONE_PATTERN = /^[+()\-.\s0-9]{7,20}$/;
 
+// Matched to profile-service's own rule (ProfileManagementService.MINIMUM_AGE_YEARS). Checked here
+// too so the user is told before a round trip, not because the client is trusted - the backend
+// rejects an underage date regardless of what this does.
+const MINIMUM_AGE_YEARS = 18;
+
 @Component({
   selector: 'app-profile',
   standalone: true,
@@ -31,6 +36,8 @@ export class ProfileComponent implements OnInit {
   readonly kycLoading = signal(true);
   readonly kycError = signal(false);
 
+  readonly legalName = signal('');
+  readonly dateOfBirth = signal('');
   readonly phoneNumber = signal('');
   readonly addressLine1 = signal('');
   readonly addressLine2 = signal('');
@@ -83,7 +90,20 @@ export class ProfileComponent implements OnInit {
   submit(): void {
     this.validationError.set(null);
     this.saveMessage.set(null);
+    this.kycMessage.set(null);
 
+    if (!this.legalName().trim()) {
+      this.validationError.set('Please enter your full legal name.');
+      return;
+    }
+    if (!this.dateOfBirth()) {
+      this.validationError.set('Please enter your date of birth.');
+      return;
+    }
+    if (!this.isAtLeastMinimumAge(this.dateOfBirth())) {
+      this.validationError.set(`You must be at least ${MINIMUM_AGE_YEARS} years old to open an account.`);
+      return;
+    }
     if (!PHONE_PATTERN.test(this.phoneNumber())) {
       this.validationError.set('Please enter a valid phone number (e.g. 571-285-6947 or +15712856947).');
       return;
@@ -93,8 +113,12 @@ export class ProfileComponent implements OnInit {
       return;
     }
 
+    const wasUnverified = this.kycStatus() !== 'APPROVED';
+
     this.profileService
       .updateContactInfo({
+        legalName: this.legalName(),
+        dateOfBirth: this.dateOfBirth(),
         phoneNumber: this.phoneNumber(),
         addressLine1: this.addressLine1(),
         ...(this.addressLine2() ? { addressLine2: this.addressLine2() } : {}),
@@ -103,9 +127,17 @@ export class ProfileComponent implements OnInit {
         zipCode: this.zipCode(),
       })
       .subscribe({
-        next: () => {
+        next: (status) => {
           this.saveMessageType.set('success');
-          this.saveMessage.set('Your contact info has been saved.');
+          this.saveMessage.set('Your details have been saved.');
+
+          // The backend hands back the status this submission produced, so the banner and the
+          // Transfers-enabled state update without a second request.
+          this.kycStatus.set(status);
+          if (status === 'APPROVED' && wasUnverified) {
+            this.kycMessageType.set('success');
+            this.kycMessage.set('Your identity has been verified. Transfers are now enabled.');
+          }
         },
         error: (error: unknown) => {
           this.saveMessageType.set('error');
@@ -114,19 +146,16 @@ export class ProfileComponent implements OnInit {
       });
   }
 
-  simulateKycApproval(): void {
-    this.kycMessage.set(null);
+  // <input type="date"> gives an ISO yyyy-MM-dd string. Comparing against the date exactly
+  // MINIMUM_AGE_YEARS ago avoids the off-by-one that month/day arithmetic invites around birthdays.
+  private isAtLeastMinimumAge(isoDate: string): boolean {
+    const birthDate = new Date(isoDate);
+    if (Number.isNaN(birthDate.getTime())) {
+      return false;
+    }
 
-    this.profileService.simulateKycApproval().subscribe({
-      next: (status) => {
-        this.kycStatus.set(status);
-        this.kycMessageType.set('success');
-        this.kycMessage.set('KYC approval simulated successfully.');
-      },
-      error: (error: unknown) => {
-        this.kycMessageType.set('error');
-        this.kycMessage.set(extractApiError(error, 'Could not simulate KYC approval. Please try again.'));
-      },
-    });
+    const cutoff = new Date();
+    cutoff.setFullYear(cutoff.getFullYear() - MINIMUM_AGE_YEARS);
+    return birthDate <= cutoff;
   }
 }

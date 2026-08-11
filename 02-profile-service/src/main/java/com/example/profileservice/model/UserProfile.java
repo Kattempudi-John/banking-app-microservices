@@ -1,5 +1,7 @@
 package com.example.profileservice.model;
 
+import java.time.LocalDate;
+
 import jakarta.persistence.*;
 
 @Entity
@@ -16,6 +18,15 @@ public class UserProfile {
     // auth-service on every send, because notification-service already calls this service for a
     // user's alert preferences - carrying the address on that same response costs nothing extra.
     private String email;
+
+    // The identity half of KYC. An address on its own verifies nothing - who someone is and when
+    // they were born is what an identity vendor actually checks - so these are collected together
+    // with the contact fields and are what gates the automatic approval in ProfileManagementService.
+    // Nullable because every profile that existed before this was added has neither, and those users
+    // stay PENDING_VERIFICATION until they fill the form in.
+    private String legalName;
+    private LocalDate dateOfBirth;
+
     private String addressLine1;
     private String addressLine2;
     private String city;
@@ -36,6 +47,12 @@ public class UserProfile {
 
     public String getEmail() { return email; }
     public void setEmail(String email) { this.email = email; }
+
+    public String getLegalName() { return legalName; }
+    public void setLegalName(String legalName) { this.legalName = legalName; }
+
+    public LocalDate getDateOfBirth() { return dateOfBirth; }
+    public void setDateOfBirth(LocalDate dateOfBirth) { this.dateOfBirth = dateOfBirth; }
 
     public String getAddressLine1() { return addressLine1; }
     public void setAddressLine1(String addressLine1) { this.addressLine1 = addressLine1; }

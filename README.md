@@ -81,7 +81,7 @@ This system was implemented against 10 functional-requirement documents (FR1–F
 | Service | Port | Responsibility |
 |---|---|---|
 | `01-auth-service` | 8081 | Login, registration, device fingerprinting, TOTP/SMS 2FA, refresh/logout, JWT issuance |
-| `02-profile-service` | 8082 | KYC status/webhook/admin override, contact info, alert & daily-summary preferences; provisions a profile on registration |
+| `02-profile-service` | 8082 | KYC verification/webhook/admin override, identity & contact info, alert & daily-summary preferences; provisions a profile on registration |
 | `03-account-service` | 8083 | Account dashboard, paginated transaction history — sole owner of the accounts ledger; provisions a starter account on registration |
 | `03-transaction-service` | 8084 | Internal transfers, external wires, fraud-threshold review |
 | `04-notification-service` | 8085 | Kafka-driven real-time alerts + scheduled daily balance summary; real SMS/email delivery via Twilio/SendGrid; exposes `/api/v1/notifications` |
@@ -92,9 +92,9 @@ This system was implemented against 10 functional-requirement documents (FR1–F
 
 `frontend/` is an Angular 22 single-page app that talks to `auth-service`, `profile-service`, `account-service`, `transaction-service`, and `notification-service` directly over REST (`audit-service` has no REST API, so the frontend never calls it). Each of those services has a `CorsConfigurationSource` bean scoped to `http://localhost:4200` with credentials enabled, since the frontend and backend run on different ports locally.
 
-**Pages:** `/signup` (self-service registration) → `/login` (credentials + SMS 2FA) → `/dashboard` (account list) → `/accounts/:id/transactions` (paginated history) → `/transfer` (own-account transfers, paying another user by account number, and external wire — all KYC-gated) → `/history` (ledger entries and wires merged, filterable) → `/notifications` (delivered alert log) → `/profile` (contact info, KYC status, IBAN/SWIFT to receive money) → `/profile/alerts` (threshold + daily summary).
+**Pages:** `/signup` (self-service registration) → `/login` (credentials + SMS 2FA) → `/dashboard` (account list) → `/accounts/:id/transactions` (paginated history) → `/transfer` (own-account transfers, paying another user by account number, and external wire — all KYC-gated) → `/history` (ledger entries and wires merged, filterable) → `/notifications` (delivered alert log) → `/profile` (identity verification, KYC status, account number/IBAN/SWIFT to receive money) → `/profile/alerts` (threshold + daily summary).
 
-**Registration provisioning:** `POST /api/v1/auth/register` (or the `/signup` page) creates the auth-service credentials, then publishes a `user-events` Kafka event that `profile-service` and `account-service` each consume independently to provision their own initial row — a `PENDING_VERIFICATION` profile and a `$0` `CHECKING` account — so a freshly-registered user has a usable (if empty) dashboard and KYC status immediately, no manual seeding required. See [Running this project](#running-this-project) below if you want to seed additional accounts or approve KYC for testing transfers.
+**Registration provisioning:** `POST /api/v1/auth/register` (or the `/signup` page) creates the auth-service credentials, then publishes a `user-events` Kafka event that `profile-service` and `account-service` each consume independently to provision their own initial row — a `PENDING_VERIFICATION` profile and a `$0` `CHECKING` account — so a freshly-registered user has a usable (if empty) dashboard and KYC status immediately, no manual seeding required. See [Identity verification (KYC)](#identity-verification-kyc) below for how a user gets verified so transfers are enabled.
 
 ## Running this project
 
@@ -140,7 +140,7 @@ VALUES ('e2etest', '\$2b\$10\$FQ/4MWYZrC9XB.zJl1TFuemdJY2lMP7hFzpdHAkweAHHhZP2UB
 "
 ```
 
-Either way, if you want to test transfers, KYC starts out `PENDING_VERIFICATION` (they're KYC-gated) — update it to `APPROVED` directly in `user_profiles`. First login from a new browser is a 2FA challenge — the SMS code is only published to Kafka (`notification-service` just logs it, since email/SMS providers are placeholders) — so for local testing without running `notification-service`, insert a `recognized_devices` row for that user (`device_hash` = base64(SHA-256(raw-device-id))) and send that raw value as a `Device-ID` cookie on login to skip 2FA entirely.
+Either way, if you want to test transfers, KYC starts out `PENDING_VERIFICATION` (they're KYC-gated) — fill in the verification form on `/profile` to get approved (see [Identity verification (KYC)](#identity-verification-kyc)), or update `user_profiles` directly. First login from a new browser is a 2FA challenge — the SMS code is only published to Kafka (`notification-service` just logs it, since email/SMS providers are placeholders) — so for local testing without running `notification-service`, insert a `recognized_devices` row for that user (`device_hash` = base64(SHA-256(raw-device-id))) and send that raw value as a `Device-ID` cookie on login to skip 2FA entirely.
 
 **6. Start the frontend** from `frontend/`:
 
@@ -165,6 +165,28 @@ docker-compose down
 - http://localhost:8082/swagger-ui.html
 - http://localhost:8083/swagger-ui.html
 - http://localhost:8084/swagger-ui.html
+
+### Identity verification (KYC)
+
+Transfers are KYC-gated: `transaction-service`'s `KycEnforcementAspect` checks a user's status before
+any money moves, and a new registration starts at `PENDING_VERIFICATION`.
+
+A user verifies themselves by submitting the identity form on `/profile` — full legal name, date of
+birth, phone and address. On a valid submission `profile-service` promotes them straight to
+`APPROVED` and returns the new status on the same response, so the page reflects it immediately and
+transfers unlock without a reload.
+
+This stands in for the identity vendor's callback (`POST /api/v1/webhooks/kyc-update`, HMAC-signed),
+which is what would approve a user in a real deployment. It is therefore gated on `app.demo.enabled`
+— `true` in `application.yml`, `false` in `application-prod.yml` — so a real deployment still has to
+hear from the vendor. Two rules hold regardless of that flag:
+
+- **Minimum age 18.** An underage date of birth is a `400`, not a silent non-approval.
+- **A `REJECTED` applicant is never re-approved** by editing their details. Clearing a rejection
+  belongs to the vendor or a compliance officer's override, not to the applicant.
+
+An earlier "Simulate KYC Approval (Demo)" button approved a user on a click with no information
+collected at all; it has been removed in favour of the form above.
 
 ### Notification providers
 

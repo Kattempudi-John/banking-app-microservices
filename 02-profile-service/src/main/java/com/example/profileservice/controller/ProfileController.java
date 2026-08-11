@@ -8,7 +8,6 @@ import com.example.profileservice.service.ProfileManagementService;
 import jakarta.validation.Valid;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
@@ -27,11 +26,9 @@ public class ProfileController {
     private final ProfileManagementService profileManagementService;
     private final UserProfileRepository userProfileRepository;
 
-    // Portfolio-demo affordance: lets the logged-in user flip their own KYC to APPROVED without an
-    // admin role (none can be granted today, see README known limitations) or manual DB access.
-    // Explicitly off in prod (application-prod.yml) — see AuthController for the same pattern.
-    @Value("${app.demo.enabled:false}")
-    private boolean demoModeEnabled;
+    // app.demo.enabled used to be read here to gate the simulate-approval endpoint. That endpoint is
+    // gone and the flag now lives on ProfileManagementService, which is where the approval decision
+    // is actually made.
 
     public ProfileController(ProfileManagementService profileManagementService,
                              UserProfileRepository userProfileRepository) {
@@ -46,8 +43,14 @@ public class ProfileController {
         Long currentUserId = extractUserIdFromAuth(authentication);
 
         profileManagementService.updateContactInfo(currentUserId, dto);
-        
-        return ResponseEntity.ok(Map.of("message", "Profile updated successfully"));
+
+        // The resulting KYC status rides back on this response. Submitting this form is what triggers
+        // verification now, so the page has to be able to show the outcome immediately - returning it
+        // here saves the UI a second round trip and removes the race where it re-reads the status
+        // before the approval has committed.
+        return ResponseEntity.ok(Map.of(
+                "message", "Profile updated successfully",
+                "kycStatus", resolveKycStatus(currentUserId)));
     }
 
     // What the frontend's Profile page calls. Takes no userId at all - it reads the caller's own id
@@ -112,23 +115,12 @@ public class ProfileController {
         return ResponseEntity.ok().build(); 
     }
 
-    // Simulates the same vendor-webhook callback handleKycWebhook() above receives, but triggered
-    // by the user themselves for demo purposes and scoped to their own userId from the JWT only —
-    // unlike the admin override below, there is no reason/audit trail since this isn't a real override.
-    @PostMapping("/profiles/kyc/simulate-approval")
-    @PreAuthorize("hasAuthority('SCOPE_FULL_AUTH')")
-    public ResponseEntity<?> simulateKycApproval() {
-        if (!demoModeEnabled) {
-            return ResponseEntity.notFound().build();
-        }
-
-        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
-        Long userId = extractUserIdFromAuth(authentication);
-
-        profileManagementService.processKycWebhook(userId, KycStatus.APPROVED);
-
-        return ResponseEntity.ok(Map.of("status", KycStatus.APPROVED.name()));
-    }
+    // The "Simulate KYC Approval (Demo)" endpoint that used to live here is gone. It approved a user
+    // on a button press with no information collected at all, which meant KYC could be cleared
+    // without ever saying who you were. Verification is now driven by PUT /profiles/me/contact-info:
+    // supply a legal name, date of birth and address, and ProfileManagementService approves you off
+    // the back of that submission - still only when app.demo.enabled is true, exactly as this
+    // endpoint was gated.
 
     // @PreAuthorize runs before the method body even starts, checking the spring expression
     // language string against the logged in user's roles, request never even reaches this
