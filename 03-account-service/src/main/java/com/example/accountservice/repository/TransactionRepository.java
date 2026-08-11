@@ -26,10 +26,17 @@ public interface TransactionRepository extends JpaRepository<TransactionEntity, 
     // single-account-narrowed) set, resolved and ownership-checked in AccountService before this
     // is ever called. type/from/to are each optional; the "IS NULL OR ..." pattern lets one query
     // cover every filter combination instead of a derived-method-name explosion.
+    //
+    // The CAST(... AS string) around each null check is load-bearing, not decoration. A bare
+    // ":from IS NULL" sends an untyped null to Postgres, which refuses it with
+    // "ERROR: could not determine data type of parameter $5" and fails the whole query - so History
+    // returned a 500 for every user whenever a filter was left blank, which is the default state of
+    // the page. The cast gives that bind a concrete type; the comparison beside it still binds the
+    // parameter as its real type, so filtering behaviour is unchanged.
     @Query("SELECT t FROM TransactionEntity t WHERE t.accountId IN :accountIds " +
-           "AND (:type IS NULL OR t.transactionType = :type) " +
-           "AND (:from IS NULL OR t.createdAt >= :from) " +
-           "AND (:to IS NULL OR t.createdAt <= :to)")
+           "AND (CAST(:type AS string) IS NULL OR t.transactionType = :type) " +
+           "AND (CAST(:from AS string) IS NULL OR t.createdAt >= :from) " +
+           "AND (CAST(:to AS string) IS NULL OR t.createdAt <= :to)")
     Page<TransactionEntity> findByAccountIdInWithFilters(@Param("accountIds") List<Long> accountIds,
                                                           @Param("type") TransactionType type,
                                                           @Param("from") LocalDateTime from,

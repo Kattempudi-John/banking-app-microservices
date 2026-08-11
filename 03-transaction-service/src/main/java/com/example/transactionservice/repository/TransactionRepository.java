@@ -22,10 +22,15 @@ public interface TransactionRepository extends JpaRepository<TransactionEntity, 
     // ownership-verified via account-service's internal by-user endpoint before this is ever
     // called. status/from/to are each optional; the "IS NULL OR ..." pattern covers every filter
     // combination with one query, same approach account-service's own history query uses.
+    //
+    // CAST(... AS string) on each null check for the same reason as account-service's copy of this
+    // query: an untyped null bind makes Postgres fail with "could not determine data type of
+    // parameter $5", which 500'd the History page whenever a filter was left blank. The comparison
+    // beside each cast still binds the parameter as its real type, so filtering is unaffected.
     @Query("SELECT t FROM TransactionEntity t WHERE t.accountId IN :accountIds " +
-           "AND (:status IS NULL OR t.status = :status) " +
-           "AND (:from IS NULL OR t.createdAt >= :from) " +
-           "AND (:to IS NULL OR t.createdAt <= :to)")
+           "AND (CAST(:status AS string) IS NULL OR t.status = :status) " +
+           "AND (CAST(:from AS string) IS NULL OR t.createdAt >= :from) " +
+           "AND (CAST(:to AS string) IS NULL OR t.createdAt <= :to)")
     Page<TransactionEntity> findByAccountIdInWithFilters(@Param("accountIds") List<Long> accountIds,
                                                           @Param("status") TransactionStatus status,
                                                           @Param("from") LocalDateTime from,
