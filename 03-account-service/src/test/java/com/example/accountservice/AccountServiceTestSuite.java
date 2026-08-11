@@ -114,6 +114,11 @@ class AccountServiceTestSuite {
                 .andExpect(jsonPath("$.length()").value(1))
                 .andExpect(jsonPath("$[0].accountType").value("CHECKING"))
                 .andExpect(jsonPath("$[0].maskedAccountNumber").value("......3210"))
+                // The unmasked number rides along beside the masked one on this endpoint only. The
+                // dashboard shows the masked form, but the Receive Money panel has to be able to
+                // hand the owner their whole number - paying another user goes by account number,
+                // so a user who cannot read their own can never be paid.
+                .andExpect(jsonPath("$[0].accountNumber").value("9876543210"))
                 .andExpect(jsonPath("$[0].routingNumber").value("021000021"));
     }
 
@@ -401,6 +406,22 @@ class AccountServiceTestSuite {
 
         mockMvc.perform(get("/api/v1/internal/accounts/lookup").param("iban", "XB00000000000000000000000"))
                 .andExpect(status().isNotFound());
+    }
+
+    // The counterpart to Block 1's accountNumber assertion, and the reason the two responses are
+    // separate records rather than one shared DTO. GET /api/v1/accounts is scoped to the caller's own
+    // accounts, so returning the raw number there is fine. This lookup describes SOMEBODY ELSE's
+    // account - a sender confirming who they're about to pay - so it must never echo the full number
+    // back, only the masked confirmation the sender already typed.
+    @Test
+    @DisplayName("Recipient lookup masks the number and never exposes the raw one - [MEANT TO PASS]")
+    void testInternalLookupByAccountNumber_NeverExposesRawNumber() throws Exception {
+        given(accountRepository.findByAccountNumber("9876543210")).willReturn(Optional.of(activeChecking));
+
+        mockMvc.perform(get("/api/v1/internal/accounts/by-number/9876543210"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.maskedAccountNumber").value("......3210"))
+                .andExpect(jsonPath("$.accountNumber").doesNotExist());
     }
 
     // ==========================================

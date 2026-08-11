@@ -15,8 +15,8 @@ describe('TransferComponent', () => {
   let accountServiceSpy: jasmine.SpyObj<AccountService>;
 
   const mockAccounts: AccountOverview[] = [
-    { accountId: 1, accountType: 'CHECKING', availableBalance: 1000, routingNumber: '021000021', maskedAccountNumber: '****1234', iban: 'XB00021000021123456789012', swiftCode: 'XBUSUS31', status: 'ACTIVE' },
-    { accountId: 2, accountType: 'SAVINGS', availableBalance: 5000, routingNumber: '021000021', maskedAccountNumber: '****5678', iban: 'XB00021000021987654321098', swiftCode: 'XBUSUS31', status: 'ACTIVE' },
+    { accountId: 1, accountType: 'CHECKING', availableBalance: 1000, routingNumber: '021000021', maskedAccountNumber: '****1234', accountNumber: '9876541234', iban: 'XB00021000021123456789012', swiftCode: 'XBUSUS31', status: 'ACTIVE' },
+    { accountId: 2, accountType: 'SAVINGS', availableBalance: 5000, routingNumber: '021000021', maskedAccountNumber: '****5678', accountNumber: '9876545678', iban: 'XB00021000021987654321098', swiftCode: 'XBUSUS31', status: 'ACTIVE' },
   ];
 
   beforeEach(async () => {

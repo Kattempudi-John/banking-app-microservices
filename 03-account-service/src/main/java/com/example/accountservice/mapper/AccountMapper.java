@@ -24,6 +24,10 @@ public class AccountMapper {
                 entity.getAvailableBalance(),
                 entity.getRoutingNumber(),
                 maskAccountNumber(entity.getAccountNumber()),
+                // Both forms travel together: the masked one is what the dashboard renders at a
+                // glance, the raw one backs the Copy button on the Receive Money panel. Safe here
+                // because this DTO is only ever built for the account's own owner.
+                entity.getAccountNumber(),
                 entity.getIban(),
                 PLATFORM_SWIFT_CODE,
                 entity.getStatus().name()

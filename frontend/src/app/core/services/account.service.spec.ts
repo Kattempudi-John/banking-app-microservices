@@ -30,6 +30,7 @@ describe('AccountService', () => {
         availableBalance: 1204.55,
         routingNumber: '021000021',
         maskedAccountNumber: '****1234',
+        accountNumber: '9876541234',
         iban: 'XB00021000021123456789012',
         swiftCode: 'XBUSUS31',
         status: 'ACTIVE',

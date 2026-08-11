@@ -15,7 +15,7 @@ describe('HistoryComponent', () => {
   let transferServiceSpy: jasmine.SpyObj<TransferService>;
 
   const mockAccounts: AccountOverview[] = [
-    { accountId: 1, accountType: 'CHECKING', availableBalance: 1000, routingNumber: '021000021', maskedAccountNumber: '****1234', iban: 'XB00021000021123456789012', swiftCode: 'XBUSUS31', status: 'ACTIVE' },
+    { accountId: 1, accountType: 'CHECKING', availableBalance: 1000, routingNumber: '021000021', maskedAccountNumber: '****1234', accountNumber: '9876541234', iban: 'XB00021000021123456789012', swiftCode: 'XBUSUS31', status: 'ACTIVE' },
   ];
 
   const ledgerPage: TransactionPage = {

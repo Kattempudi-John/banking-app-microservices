@@ -8,6 +8,10 @@ export interface AccountOverview {
   availableBalance: number;
   routingNumber: string;
   maskedAccountNumber: string;
+  // The unmasked number, returned only by the owner-scoped GET /api/v1/accounts. Needed because
+  // paying another user goes BY account number, so the recipient has to be able to read and share
+  // their own. Nullable to stay safe against an older backend that doesn't send the field yet.
+  accountNumber: string | null;
   // Nullable: accounts created before the IBAN column existed have none until the backfill in
   // account-service assigns one. swiftCode is a platform-wide constant, so it's always present.
   iban: string | null;
