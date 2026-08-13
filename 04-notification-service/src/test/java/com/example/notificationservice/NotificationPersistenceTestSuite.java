@@ -1,5 +1,7 @@
 package com.example.notificationservice;
 
+import com.example.notificationservice.client.AccountServiceClient;
+import com.example.notificationservice.client.AuthServiceClient;
 import com.example.notificationservice.client.ProfileServiceClient;
 import com.example.notificationservice.event.FundsTransferredEvent;
 import com.example.notificationservice.model.NotificationChannel;
@@ -19,15 +21,19 @@ import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMock
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.domain.Specification;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.request.RequestPostProcessor;
 
 import java.math.BigDecimal;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.contains;
@@ -68,6 +74,16 @@ class NotificationPersistenceTestSuite {
 
     @MockBean
     private ProfileServiceClient profileServiceClient;
+
+    // Both mocked so the counterparty lookups a transaction alert now makes stay inside the test.
+    // Left real, these are Feign clients pointed at localhost - the suite would either make live HTTP
+    // calls to whichever services happen to be running or depend on their being down, and "who owns
+    // account 2" would answer differently on a developer's machine than in CI.
+    @MockBean
+    private AccountServiceClient accountServiceClient;
+
+    @MockBean
+    private AuthServiceClient authServiceClient;
 
     private static RequestPostProcessor fullAuthUser(long userId) {
         return jwt().jwt(j -> j.claim("scope", "FULL_AUTH").claim("userId", userId));
@@ -133,7 +149,7 @@ class NotificationPersistenceTestSuite {
     @DisplayName("Transaction alert above threshold persists a SENT notification record - [MEANT TO PASS]")
     void testTransactionAlert_AboveThreshold_PersistsRecord() {
         given(profileServiceClient.getUserPreferences(42L))
-                .willReturn(new ProfileServiceClient.UserPreferenceResponse(42L, new BigDecimal("100.00"), true, "UTC", "alerts@example.com"));
+                .willReturn(new ProfileServiceClient.UserPreferenceResponse(42L, new BigDecimal("100.00"), true, 8, "UTC", "alerts@example.com"));
         given(notificationProviderService.dispatchEmail(any(), any(), any())).willReturn(true);
         FundsTransferredEvent event = new FundsTransferredEvent(42L, 1L, 2L, new BigDecimal("500.00"), UUID.randomUUID());
 
@@ -151,7 +167,7 @@ class NotificationPersistenceTestSuite {
     @DisplayName("Transaction alert below threshold does not persist a notification record - [MEANT TO FAIL]")
     void testTransactionAlert_BelowThreshold_DoesNotPersist() {
         given(profileServiceClient.getUserPreferences(42L))
-                .willReturn(new ProfileServiceClient.UserPreferenceResponse(42L, new BigDecimal("1000.00"), true, "UTC", "alerts@example.com"));
+                .willReturn(new ProfileServiceClient.UserPreferenceResponse(42L, new BigDecimal("1000.00"), true, 8, "UTC", "alerts@example.com"));
         FundsTransferredEvent event = new FundsTransferredEvent(42L, 1L, 2L, new BigDecimal("50.00"), UUID.randomUUID());
 
         transactionAlertListener.consumeTransferEvent(event);
@@ -166,7 +182,7 @@ class NotificationPersistenceTestSuite {
     @DisplayName("Transaction alert for a user with no email records FAILED and dispatches nothing - [MEANT TO PASS]")
     void testTransactionAlert_NoEmailOnFile_RecordsFailedWithoutDispatching() {
         given(profileServiceClient.getUserPreferences(42L))
-                .willReturn(new ProfileServiceClient.UserPreferenceResponse(42L, new BigDecimal("100.00"), true, "UTC", null));
+                .willReturn(new ProfileServiceClient.UserPreferenceResponse(42L, new BigDecimal("100.00"), true, 8, "UTC", null));
 
         transactionAlertListener.consumeTransferEvent(new FundsTransferredEvent(
                 42L, 1L, 2L, new BigDecimal("500.00"), UUID.randomUUID()));
@@ -185,7 +201,7 @@ class NotificationPersistenceTestSuite {
         // Unlike the transaction alert above, this listener has no preferences object handed to it, so
         // it fetches one purely to resolve where the notice should be delivered.
         given(profileServiceClient.getUserPreferences(42L))
-                .willReturn(new ProfileServiceClient.UserPreferenceResponse(42L, new BigDecimal("100.00"), true, "UTC", "alerts@example.com"));
+                .willReturn(new ProfileServiceClient.UserPreferenceResponse(42L, new BigDecimal("100.00"), true, 8, "UTC", "alerts@example.com"));
         given(notificationProviderService.dispatchEmail(any(), any(), any())).willReturn(true);
         Map<String, Object> event = Map.of("userId", "42", "eventType", "CONTACT_INFO_UPDATED");
 
@@ -216,6 +232,329 @@ class NotificationPersistenceTestSuite {
     void testGetNotifications_UnauthenticatedDenied() throws Exception {
         mockMvc.perform(get("/api/v1/notifications"))
                 .andExpect(status().is4xxClientError());
+    }
+
+    // ==========================================
+    // What the stored profile notice actually says
+    // ==========================================
+
+    // The whole point of reading the "changes" map profile-service has always published: the notice
+    // used to read "an update of type 'CONTACT_INFO_CHANGE' was made to your profile", which names
+    // neither the field that moved nor what it moved from.
+    @Test
+    @DisplayName("Profile notice names only the fields that actually changed, before and after - [MEANT TO PASS]")
+    void testProfileNotice_NamesOnlyChangedFields() {
+        givenProfileEmailOnFile();
+
+        profileNotificationListener.consumeProfileUpdate(contactInfoEvent(
+                oldState("+15712856947", "123 Main St", "Fairfax"),
+                newState("+1 (571) 285-1234", "123 Main St", "Reston")));
+
+        String message = capturedMessage();
+        assertThat(message).isEqualTo(
+                "Your profile was updated: phone number changed from ***6947 to ***1234; "
+                        + "city changed from Fairfax to Reston.");
+        // addressLine1 was resubmitted unchanged, so it must not appear at all - a form that echoes
+        // back every field it was given is the noise this message replaces.
+        assertThat(message).doesNotContain("address line 1");
+    }
+
+    // A user who opens the form, changes nothing and presses save still produces an event. Listing
+    // all eight fields as "changed" there would train them to ignore the notice entirely.
+    @Test
+    @DisplayName("Profile notice claims no change when the form was resubmitted unedited - [MEANT TO PASS]")
+    void testProfileNotice_UnchangedResubmissionClaimsNothing() {
+        givenProfileEmailOnFile();
+
+        profileNotificationListener.consumeProfileUpdate(contactInfoEvent(
+                oldState("+15712856947", "123 Main St", "Fairfax"),
+                newState("+15712856947", "123 Main St", "Fairfax")));
+
+        String message = capturedMessage();
+        assertThat(message).doesNotContain("changed from");
+        assertThat(message).doesNotContain("set to");
+    }
+
+    // A field being filled in for the first time is a different sentence from a field being edited.
+    // "city changed from null to Reston" is what the naive version of this reads like.
+    @Test
+    @DisplayName("Profile notice reads naturally for a field that was previously empty - [MEANT TO PASS]")
+    void testProfileNotice_PreviouslyEmptyFieldReadsAsSet() {
+        givenProfileEmailOnFile();
+
+        profileNotificationListener.consumeProfileUpdate(contactInfoEvent(
+                oldState("+15712856947", "123 Main St", null),
+                newState("+15712856947", "123 Main St", "Reston")));
+
+        String message = capturedMessage();
+        assertThat(message).contains("city set to Reston");
+        assertThat(message).doesNotContain("null");
+    }
+
+    // The privacy half of this message. The record is served back by GET /api/v1/notifications every
+    // time the user reopens the page, which is exactly why V3 scrubbed 2FA codes out of stored rows -
+    // a phone number written in full would sit in the feed indefinitely.
+    @Test
+    @DisplayName("Profile notice masks the phone number and stores no full number anywhere - [MEANT TO PASS]")
+    void testProfileNotice_PhoneNumberIsMaskedInTheRecord() {
+        givenProfileEmailOnFile();
+
+        profileNotificationListener.consumeProfileUpdate(contactInfoEvent(
+                oldState("+15712856947", "123 Main St", "Fairfax"),
+                newState("571-285-1234", "123 Main St", "Fairfax")));
+
+        String message = capturedMessage();
+        assertThat(message).contains("phone number changed from ***6947 to ***1234");
+        assertThat(message)
+                .as("neither the old nor the new number may be recoverable from a stored record")
+                .doesNotContain("+15712856947")
+                .doesNotContain("5712856947")
+                .doesNotContain("571-285-1234")
+                .doesNotContain("2851234");
+    }
+
+    // This runs on a Kafka listener, so an exception thrown while describing the change would be
+    // caught upstream and the notification would simply never be written. A vague notice beats none.
+    @Test
+    @DisplayName("Profile notice falls back to the generic wording when the changes map is malformed - [MEANT TO PASS]")
+    void testProfileNotice_MalformedChangesFallsBackWithoutThrowing() {
+        givenProfileEmailOnFile();
+
+        Map<String, Object> garbage = new HashMap<>();
+        garbage.put("userId", "42");
+        garbage.put("eventType", "CONTACT_INFO_CHANGE");
+        garbage.put("changes", "this is not a map at all");
+
+        assertThatCode(() -> profileNotificationListener.consumeProfileUpdate(garbage))
+                .doesNotThrowAnyException();
+
+        assertThat(capturedMessage())
+                .isEqualTo("Dear customer, an update of type 'CONTACT_INFO_CHANGE' was made to your profile.");
+    }
+
+    @Test
+    @DisplayName("Profile notice falls back to the generic wording when no changes map is present - [MEANT TO PASS]")
+    void testProfileNotice_MissingChangesFallsBack() {
+        givenProfileEmailOnFile();
+
+        // The shape a legacy publisher (or a different profile event type) sends: no changes at all.
+        profileNotificationListener.consumeProfileUpdate(
+                Map.of("userId", "42", "eventType", "CONTACT_INFO_CHANGE"));
+
+        assertThat(capturedMessage())
+                .isEqualTo("Dear customer, an update of type 'CONTACT_INFO_CHANGE' was made to your profile.");
+    }
+
+    // ==========================================
+    // What the stored transaction alert actually says
+    // ==========================================
+
+    @Test
+    @DisplayName("Transaction alert names the amount, both masked accounts and the counterparty - [MEANT TO PASS]")
+    void testTransactionAlert_NamesAmountAccountsAndCounterparty() {
+        givenAlertThresholdOf("100.00");
+        given(notificationProviderService.dispatchEmail(any(), any(), any())).willReturn(true);
+        given(accountServiceClient.getAccountOwner(770015570L))
+                .willReturn(new AccountServiceClient.AccountOwnerResponse(77L));
+        given(authServiceClient.getDisplayName(77L))
+                .willReturn(new AuthServiceClient.DisplayNameResponse(77L, "Mark"));
+
+        transactionAlertListener.consumeTransferEvent(new FundsTransferredEvent(
+                42L, 990013400L, 770015570L, new BigDecimal("1000.00"), UUID.randomUUID()));
+
+        String message = capturedMessage();
+        assertThat(message).contains("$1,000.00");
+        assertThat(message).contains("........3400");
+        assertThat(message).contains("........5570");
+        assertThat(message).contains("Mark");
+        // Same masking rule the rest of the project applies to account numbers - the stored row must
+        // not carry a whole account reference for either side of the transfer.
+        assertThat(message)
+                .doesNotContain("990013400")
+                .doesNotContain("770015570");
+    }
+
+    // The name is a nicety; the alert is not. transaction-service's resolveRecipientName degrades the
+    // same way for the same reason.
+    @Test
+    @DisplayName("Transaction alert still sends with the masked account when the name lookup fails - [MEANT TO PASS]")
+    void testTransactionAlert_FailedNameLookupStillSends() {
+        givenAlertThresholdOf("100.00");
+        given(notificationProviderService.dispatchEmail(any(), any(), any())).willReturn(true);
+        given(accountServiceClient.getAccountOwner(770015570L))
+                .willReturn(new AccountServiceClient.AccountOwnerResponse(77L));
+        given(authServiceClient.getDisplayName(77L)).willThrow(new RuntimeException("auth-service unavailable"));
+
+        transactionAlertListener.consumeTransferEvent(new FundsTransferredEvent(
+                42L, 990013400L, 770015570L, new BigDecimal("1000.00"), UUID.randomUUID()));
+
+        verify(notificationProviderService).dispatchEmail(eq("alerts@example.com"), any(), any());
+        verify(notificationRecordRepository).save(argThat(record ->
+                record.getStatus() == NotificationStatus.SENT
+                        && record.getMessage().contains("........5570")));
+    }
+
+    // An owner lookup that fails takes the display name with it - there is no user id left to ask
+    // about - and the alert still has to go out.
+    @Test
+    @DisplayName("Transaction alert still sends when the owner lookup itself fails - [MEANT TO PASS]")
+    void testTransactionAlert_FailedOwnerLookupStillSends() {
+        givenAlertThresholdOf("100.00");
+        given(notificationProviderService.dispatchEmail(any(), any(), any())).willReturn(true);
+        given(accountServiceClient.getAccountOwner(any())).willThrow(new RuntimeException("account-service unavailable"));
+
+        transactionAlertListener.consumeTransferEvent(new FundsTransferredEvent(
+                42L, 990013400L, 770015570L, new BigDecimal("1000.00"), UUID.randomUUID()));
+
+        verify(notificationProviderService).dispatchEmail(eq("alerts@example.com"), any(), any());
+        assertThat(capturedMessage()).contains("........5570");
+        verify(authServiceClient, never()).getDisplayName(any());
+    }
+
+    // Moving money between your own checking and savings is not a payment to a stranger, and an alert
+    // that describes it as one is the kind of thing that gets a support call.
+    @Test
+    @DisplayName("A transfer between the user's own accounts is worded as such - [MEANT TO PASS]")
+    void testTransactionAlert_OwnAccountTransferIsWordedAsAMove() {
+        givenAlertThresholdOf("100.00");
+        given(notificationProviderService.dispatchEmail(any(), any(), any())).willReturn(true);
+        // Same user on both ends of the transfer.
+        given(accountServiceClient.getAccountOwner(770015570L))
+                .willReturn(new AccountServiceClient.AccountOwnerResponse(42L));
+
+        transactionAlertListener.consumeTransferEvent(new FundsTransferredEvent(
+                42L, 990013400L, 770015570L, new BigDecimal("1000.00"), UUID.randomUUID()));
+
+        String message = capturedMessage();
+        assertThat(message).contains("moved between your own accounts");
+        assertThat(message).contains("........3400");
+        assertThat(message).contains("........5570");
+        // Their own name has no business appearing as a recipient, so the lookup is never made.
+        verify(authServiceClient, never()).getDisplayName(any());
+    }
+
+    // ==========================================
+    // Filtering on the feed
+    // ==========================================
+
+    @Test
+    @DisplayName("GET /api/v1/notifications accepts every filter at once and still answers - [MEANT TO PASS]")
+    void testGetNotifications_AllFiltersCombined() throws Exception {
+        given(notificationRecordRepository.findAll(any(Specification.class), any(Pageable.class)))
+                .willReturn(new PageImpl<>(List.of(buildRecord(42L))));
+
+        mockMvc.perform(get("/api/v1/notifications")
+                        .param("type", "SMS_2FA")
+                        .param("channel", "SMS")
+                        .param("status", "SENT")
+                        .param("from", "2020-01-01T00:00:00")
+                        .param("to", "2030-01-01T00:00:00")
+                        .with(fullAuthUser(42)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.content.length()").value(1))
+                .andExpect(jsonPath("$.content[0].type").value("SMS_2FA"));
+
+        // A filtered request goes through the Specification, never through the unfiltered lookup.
+        verify(notificationRecordRepository, never()).findByUserId(any(), any());
+    }
+
+    // The response is still a Spring Page of the same DTO, filters or not - the existing page reads
+    // content/totalElements and must keep working without being taught anything new.
+    @Test
+    @DisplayName("A filtered response keeps the unfiltered response shape - [MEANT TO PASS]")
+    void testGetNotifications_FilteredResponseShapeIsUnchanged() throws Exception {
+        given(notificationRecordRepository.findAll(any(Specification.class), any(Pageable.class)))
+                .willReturn(new PageImpl<>(List.of(buildRecord(42L))));
+
+        mockMvc.perform(get("/api/v1/notifications").param("status", "SENT").with(fullAuthUser(42)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.totalElements").value(1))
+                .andExpect(jsonPath("$.content[0].channel").value("SMS"))
+                .andExpect(jsonPath("$.content[0].status").value("SENT"))
+                // createdAt is deliberately not asserted here: buildRecord is never persisted, so
+                // @PrePersist never runs and the field is legitimately null on this fixture. The real
+                // ordering-by-createdAt behaviour is proven against the database in
+                // NotificationFeedFilterTestSuite instead.
+                .andExpect(jsonPath("$.content[0].message").exists());
+    }
+
+    @Test
+    @DisplayName("An unparseable enum filter is a 400 naming the accepted values - [MEANT TO PASS]")
+    void testGetNotifications_BadEnumFilterIsReadable400() throws Exception {
+        mockMvc.perform(get("/api/v1/notifications").param("type", "NOT_A_TYPE").with(fullAuthUser(42)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value(org.hamcrest.Matchers.containsString("NOT_A_TYPE")))
+                .andExpect(jsonPath("$.error").value(org.hamcrest.Matchers.containsString("TRANSACTION_ALERT")));
+    }
+
+    @Test
+    @DisplayName("An unparseable date filter is a 400, not a 500 - [MEANT TO PASS]")
+    void testGetNotifications_BadDateFilterIsReadable400() throws Exception {
+        mockMvc.perform(get("/api/v1/notifications").param("from", "last tuesday").with(fullAuthUser(42)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value(org.hamcrest.Matchers.containsString("ISO date-time")));
+    }
+
+    // ==========================================
+    // Helpers
+    // ==========================================
+
+    private void givenProfileEmailOnFile() {
+        given(profileServiceClient.getUserPreferences(42L))
+                .willReturn(new ProfileServiceClient.UserPreferenceResponse(
+                        42L, new BigDecimal("100.00"), true, 8, "UTC", "alerts@example.com"));
+        given(notificationProviderService.dispatchEmail(any(), any(), any())).willReturn(true);
+    }
+
+    private void givenAlertThresholdOf(String threshold) {
+        given(profileServiceClient.getUserPreferences(42L))
+                .willReturn(new ProfileServiceClient.UserPreferenceResponse(
+                        42L, new BigDecimal(threshold), true, 8, "UTC", "alerts@example.com"));
+    }
+
+    // The exact envelope ProfileManagementService.publishContactInfoChangedEvent puts on the
+    // profile-events topic: userId, eventType, and a changes map holding the before and after states.
+    private Map<String, Object> contactInfoEvent(Map<String, Object> oldState, Map<String, Object> newState) {
+        Map<String, Object> changes = new HashMap<>();
+        changes.put("old", oldState);
+        changes.put("new", newState);
+
+        Map<String, Object> event = new HashMap<>();
+        event.put("userId", "42");
+        event.put("eventType", "CONTACT_INFO_CHANGE");
+        event.put("changes", changes);
+        return event;
+    }
+
+    // profile-service's captureOldContactState snapshots these three fields and no others, so the
+    // before-state genuinely has holes in it - a HashMap rather than Map.of because a null value here
+    // is the real shape of a field the user had never filled in.
+    private Map<String, Object> oldState(String phoneNumber, String addressLine1, String city) {
+        Map<String, Object> state = new HashMap<>();
+        state.put("phoneNumber", phoneNumber);
+        state.put("addressLine1", addressLine1);
+        state.put("city", city);
+        return state;
+    }
+
+    // The whole submitted form, which is what the "new" side carries (the serialized DTO).
+    private Map<String, Object> newState(String phoneNumber, String addressLine1, String city) {
+        Map<String, Object> state = new HashMap<>();
+        state.put("legalName", "Jane Doe");
+        state.put("dateOfBirth", "1990-01-01");
+        state.put("phoneNumber", phoneNumber);
+        state.put("addressLine1", addressLine1);
+        state.put("addressLine2", null);
+        state.put("city", city);
+        state.put("state", "VA");
+        state.put("zipCode", "20190");
+        return state;
+    }
+
+    private String capturedMessage() {
+        ArgumentCaptor<NotificationRecord> saved = ArgumentCaptor.forClass(NotificationRecord.class);
+        verify(notificationRecordRepository).save(saved.capture());
+        return saved.getValue().getMessage();
     }
 
     private NotificationRecord buildRecord(Long userId) {

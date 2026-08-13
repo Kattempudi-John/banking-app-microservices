@@ -81,6 +81,41 @@ describe('AuthService', () => {
     expect(service.accessToken()).toBe('refreshed-token');
   });
 
+  // A browser refresh throws away the in-memory access token, so without this the user was sent to
+  // /login despite holding a perfectly valid session in the httpOnly Refresh-Token cookie.
+  it('restores a session from the refresh-token cookie on startup', () => {
+    let completed = false;
+    service.restoreSession().subscribe({ complete: () => (completed = true) });
+
+    const req = httpMock.expectOne(`${environment.authApiUrl}/refresh`);
+    expect(req.request.method).toBe('POST');
+    expect(req.request.withCredentials).toBeTrue();
+    req.flush({ access_token: 'restored-token' });
+
+    expect(service.accessToken()).toBe('restored-token');
+    expect(service.isLoggedIn()).toBeTrue();
+    expect(completed).toBeTrue();
+  });
+
+  // This runs as an app initializer, so an error here would stop the whole application booting.
+  // A visitor who was never logged in has no cookie, and their 401 is the expected answer.
+  it('completes without error when there is no session to restore, leaving the user logged out', () => {
+    let errored = false;
+    let completed = false;
+    service.restoreSession().subscribe({
+      error: () => (errored = true),
+      complete: () => (completed = true),
+    });
+
+    httpMock
+      .expectOne(`${environment.authApiUrl}/refresh`)
+      .flush({ error: 'Refresh token missing' }, { status: 401, statusText: 'Unauthorized' });
+
+    expect(errored).toBeFalse();
+    expect(completed).toBeTrue();
+    expect(service.isLoggedIn()).toBeFalse();
+  });
+
   it('clears the access token on logout', () => {
     service.login({ username: 'jdoe', password: 'secret123' }).subscribe();
     httpMock.expectOne(`${environment.authApiUrl}/login`).flush({ status: 'SUCCESS', access_token: 'token-abc' });

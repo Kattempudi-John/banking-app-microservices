@@ -28,11 +28,20 @@ public class UserPreferenceResponseMapper {
                 .map(UserProfile::getEmail)
                 .orElse(null);
 
+        // A row written before daily_summary_hour existed reports the same 8 a brand-new user gets,
+        // never null: notification-service compares this against the current hour as an int, so a
+        // null would be an unboxing failure in the middle of the nightly sweep rather than a user
+        // who simply never picked a time.
+        Integer dailySummaryHour = entity.getDailySummaryHour() != null
+                ? entity.getDailySummaryHour()
+                : PreferenceService.DEFAULT_DAILY_SUMMARY_HOUR;
+
         return new UserPreferenceResponse(
                 entity.getUserId(),
                 entity.getAlertThresholdAmount(),
                 entity.getDailySummaryEnabled(),
                 entity.getTimezone(),
+                dailySummaryHour,
                 email);
     }
 }

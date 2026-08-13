@@ -16,6 +16,7 @@ import jakarta.servlet.DispatcherType;
 
 import java.util.List;
 
+import com.example.authservice.security.InternalTokenFilter;
 import com.example.authservice.security.JwtAuthenticationFilter;
 
 // @Configuration marks this as a class spring reads at startup to build beans from, @EnableWebSecurity
@@ -25,10 +26,14 @@ import com.example.authservice.security.JwtAuthenticationFilter;
 public class SecurityConfig {
 
     private final JwtAuthenticationFilter jwtAuthFilter;
+    private final InternalTokenFilter internalTokenFilter;
     private final AuthenticationProvider authenticationProvider;
 
-    public SecurityConfig(JwtAuthenticationFilter jwtAuthFilter, AuthenticationProvider authenticationProvider) {
+    public SecurityConfig(JwtAuthenticationFilter jwtAuthFilter,
+                          InternalTokenFilter internalTokenFilter,
+                          AuthenticationProvider authenticationProvider) {
         this.jwtAuthFilter = jwtAuthFilter;
+        this.internalTokenFilter = internalTokenFilter;
         this.authenticationProvider = authenticationProvider;
     }
 
@@ -64,6 +69,11 @@ public class SecurityConfig {
                 // recipient's display name here) - not exposed through the k8s ingress, so there is
                 // no end-user token available to authenticate it. Same rule account-service already
                 // applies to its own /api/v1/internal/** endpoints.
+                //
+                // Still permitAll at this layer, but no longer unauthenticated: InternalTokenFilter
+                // below is now the gate. Making this .authenticated() instead would demand a user
+                // JWT that a service-to-service caller has no way to produce, which would break
+                // every internal call rather than protect it.
                 .requestMatchers("/api/v1/internal/**").permitAll()
                 .requestMatchers("/api/v1/auth/logout").authenticated()
                 
@@ -82,7 +92,17 @@ public class SecurityConfig {
             .authenticationProvider(authenticationProvider)
             
             // 5. Inject our custom JWT filter BEFORE the default Spring Security filter
-            .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
+            .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class)
+
+            // 6. Shared-secret gate for /api/v1/internal/**, placed ahead of the JWT filter so an
+            // unauthorized internal call is turned away before any other work happens. Registering
+            // it relative to jwtAuthFilter (rather than to UsernamePasswordAuthenticationFilter,
+            // where the two would land on the same order value and the winner would come down to
+            // list order) makes "before the JWT filter" explicit. This must stay AFTER the line
+            // above: addFilterBefore can only anchor to a filter already registered in the chain.
+            // The filter ignores every path outside the internal prefix, so JwtAuthenticationFilter
+            // still sees customer requests exactly as it did, PRE_AUTH boundary checks included.
+            .addFilterBefore(internalTokenFilter, JwtAuthenticationFilter.class);
 
         return http.build();
     }

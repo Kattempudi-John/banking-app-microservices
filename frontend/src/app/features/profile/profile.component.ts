@@ -1,10 +1,11 @@
 import { Component, OnInit, signal } from '@angular/core';
+import { HttpErrorResponse } from '@angular/common/http';
 import { FormsModule } from '@angular/forms';
 
 import { extractApiError } from '../../core/api-error';
 import { ProfileService } from '../../core/services/profile.service';
 import { AccountService } from '../../core/services/account.service';
-import { KycStatus } from '../../core/models/profile.models';
+import { ContactInfoView, KycStatus } from '../../core/models/profile.models';
 import { AccountOverview } from '../../core/models/account.models';
 import { ButtonComponent } from '../../shared/button/button.component';
 import { AlertBannerComponent } from '../../shared/alert-banner/alert-banner.component';
@@ -72,7 +73,34 @@ export class ProfileComponent implements OnInit {
         this.kycError.set(true);
       },
     });
+    // Pre-fill from what's already on file, so nobody retypes - and mistypes - details the account
+    // was registered with. Failing silently is deliberate: not being able to read the form back is
+    // no reason to stop somebody verifying, and an empty form still submits perfectly well.
+    this.profileService.getContactInfo().subscribe({
+      next: (info) => this.applyContactInfo(info),
+      error: () => undefined,
+    });
     this.accountService.getAccounts().subscribe((accounts) => this.accounts.set(accounts));
+  }
+
+  // Every field is null until the user has submitted the form at least once, and a record can be
+  // partial - fall back to the empty string each signal already holds rather than writing a null
+  // into an <input>.
+  private applyContactInfo(info: ContactInfoView | null): void {
+    if (!info) {
+      return;
+    }
+
+    this.legalName.set(info.legalName ?? '');
+    // Already ISO yyyy-MM-dd, which is exactly what <input type="date"> wants.
+    this.dateOfBirth.set(info.dateOfBirth ?? '');
+    // Comes back in E.164 ("+15712856947"), which PHONE_PATTERN accepts, so it round-trips unedited.
+    this.phoneNumber.set(info.phoneNumber ?? '');
+    this.addressLine1.set(info.addressLine1 ?? '');
+    this.addressLine2.set(info.addressLine2 ?? '');
+    this.city.set(info.city ?? '');
+    this.state.set(info.state ?? '');
+    this.zipCode.set(info.zipCode ?? '');
   }
 
   // The Copy button is hidden when there's no value, but guard anyway - clipboard.writeText(null)
@@ -141,7 +169,16 @@ export class ProfileComponent implements OnInit {
         },
         error: (error: unknown) => {
           this.saveMessageType.set('error');
-          this.saveMessage.set(extractApiError(error));
+          // A 409 here is always a phone number already registered to another account. The server
+          // says so itself, so that wording wins; the fallback only covers a conflict that arrives
+          // without a body, where a blanket "something went wrong" would send the user hunting
+          // through fields that are actually fine.
+          const isConflict = error instanceof HttpErrorResponse && error.status === 409;
+          this.saveMessage.set(
+            isConflict
+              ? extractApiError(error, 'That phone number is already registered to another account.')
+              : extractApiError(error),
+          );
         },
       });
   }

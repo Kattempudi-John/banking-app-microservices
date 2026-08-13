@@ -13,8 +13,10 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.notificationservice.job.DailyBalanceSummaryJob;
 
 // An operator handle on DailyBalanceSummaryJob, which is otherwise only reachable by waiting for its
-// hourly cron to line up with the configured summary hour in some timezone - a slow way to find out
-// whether email delivery actually works.
+// hourly cron to line up with some user's chosen summary hour in their own timezone - a slow way to
+// find out whether email delivery actually works. Since the summary hour became a per-user setting
+// there is no configuration that can bring that moment forward, so this endpoint is the only way to
+// exercise the job on demand.
 //
 // Lives under /api/v1/internal/ for the same reason profile-service's InternalPreferenceController
 // does: it is unauthenticated, and that is the ONE prefix k8s/08-ingress-routes.yaml does not route,
@@ -40,7 +42,7 @@ public class InternalNotificationController {
         if (timezone == null || timezone.isBlank()) {
             log.info("Manual trigger: running the full daily summary sweep.");
             dailyBalanceSummaryJob.processDailySummaries();
-            return ResponseEntity.ok("Daily summary sweep triggered for all timezones at the configured hour.");
+            return ResponseEntity.ok("Daily summary sweep triggered for every user whose chosen hour is now.");
         }
 
         // Validated up front so a typo comes back as a 400 naming the bad zone, rather than surfacing

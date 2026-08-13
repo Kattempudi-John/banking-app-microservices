@@ -2,10 +2,24 @@ h2 {
   font-size: var(--text-lg);
 }
 
+/* Timezone and delivery hour only mean anything together, so they sit on one line and wrap as a
+   pair on narrow screens. */
+.select-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+
 .select-group {
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
+  flex: 1 1 12rem;
+}
+
+.field-hint {
+  font-size: var(--text-sm);
+  color: var(--muted-foreground);
 }
 
 .select-group label {

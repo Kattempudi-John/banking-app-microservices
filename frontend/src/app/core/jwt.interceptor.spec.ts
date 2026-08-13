@@ -44,6 +44,29 @@ describe('jwtInterceptor', () => {
     req.flush([]);
   });
 
+  // The refresh attempt used to be conditional on an in-memory token being present, so a 401 that
+  // arrived while it was absent - cleared by an earlier failure, or racing the startup restore -
+  // surfaced as an error even though the httpOnly cookie could still have recovered the session.
+  it('recovers from a 401 even when no access token is held in memory', () => {
+    let recovered: unknown = null;
+    expect(authService.isLoggedIn()).toBeFalse();
+
+    http.get(`${environment.accountApiUrl}`).subscribe((body) => (recovered = body));
+
+    httpMock
+      .expectOne(`${environment.accountApiUrl}`)
+      .flush({ error: 'expired' }, { status: 401, statusText: 'Unauthorized' });
+
+    httpMock.expectOne(`${environment.authApiUrl}/refresh`).flush({ access_token: 'recovered-token' });
+
+    const retried = httpMock.expectOne(`${environment.accountApiUrl}`);
+    expect(retried.request.headers.get('Authorization')).toBe('Bearer recovered-token');
+    retried.flush([{ accountId: 1 }]);
+
+    expect(recovered).toEqual([{ accountId: 1 }]);
+    expect(authService.isLoggedIn()).toBeTrue();
+  });
+
   it('on a 401, silently refreshes the token and retries the original request once', () => {
     authService.login({ username: 'jdoe', password: 'secret123' }).subscribe();
     httpMock.expectOne(`${environment.authApiUrl}/login`).flush({ status: 'SUCCESS', access_token: 'expired-token' });

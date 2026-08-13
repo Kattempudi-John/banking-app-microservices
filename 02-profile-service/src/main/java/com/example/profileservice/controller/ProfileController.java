@@ -36,7 +36,17 @@ public class ProfileController {
         this.userProfileRepository = userProfileRepository;
     }
 
+    // SCOPE_FULL_AUTH, same as the two reads below it, and for a harder reason than either of them.
+    // Without it the rule here was only "any validly-signed token", which a PRE_AUTH token from a
+    // half-finished login satisfies - the token auth-service hands out when it has checked the
+    // password and is still waiting on the 2FA code. Someone holding a stolen password alone could
+    // therefore submit this form, and this one call both approves the submitted identity for KYC and
+    // pushes the phone number into auth-service's users table. That is the number 2FA codes are sent
+    // to, so the effect of this endpoint reaches past this service: it would move the second factor
+    // onto the attacker's phone and hand them the account permanently, with the KYC approval on top.
+    // A session that has not finished proving who it is does not get to say who it is.
     @PutMapping("/profiles/me/contact-info")
+    @PreAuthorize("hasAuthority('SCOPE_FULL_AUTH')")
     public ResponseEntity<?> updateMyContactInfo(@Valid @RequestBody UpdateContactInfoRequestDto dto) {
         // Securely extract the userId from the JWT session, preventing IDOR attacks
         Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
@@ -51,6 +61,23 @@ public class ProfileController {
         return ResponseEntity.ok(Map.of(
                 "message", "Profile updated successfully",
                 "kycStatus", resolveKycStatus(currentUserId)));
+    }
+
+    // Pre-fills the identity form. Same JWT-only rule as the KYC status lookup below: no userId is
+    // accepted from the caller, so nobody can read another person's legal name or date of birth by
+    // changing an id. The phone number on this response comes from auth-service, which owns it.
+    //
+    // This exists because the form used to open completely blank, so a user filling it in retyped a
+    // phone number from memory - often a different one from the number they registered with. That is
+    // the root cause of two accounts ending up on the same number, and no amount of validation on
+    // the write path fixes a form that invites the wrong answer.
+    @GetMapping("/profiles/me/contact-info")
+    @PreAuthorize("hasAuthority('SCOPE_FULL_AUTH')")
+    public ResponseEntity<?> getMyContactInfo() {
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+        Long currentUserId = extractUserIdFromAuth(authentication);
+
+        return ResponseEntity.ok(profileManagementService.getContactInfo(currentUserId));
     }
 
     // What the frontend's Profile page calls. Takes no userId at all - it reads the caller's own id

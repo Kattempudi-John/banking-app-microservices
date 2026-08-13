@@ -1,16 +1,19 @@
-import { Component, OnInit, signal } from '@angular/core';
+import { Component, OnInit, computed, signal } from '@angular/core';
 import { Router } from '@angular/router';
 import { FormsModule } from '@angular/forms';
 
 import { extractApiError } from '../../core/api-error';
 import { AccountService } from '../../core/services/account.service';
+import { ProfileService } from '../../core/services/profile.service';
 import { AccountOverview, AccountType } from '../../core/models/account.models';
+import { KycStatus } from '../../core/models/profile.models';
 import { TableColumn, TableComponent } from '../../shared/table/table.component';
 import { ButtonComponent } from '../../shared/button/button.component';
 import { NavComponent } from '../../shared/nav/nav.component';
 import { ModalComponent } from '../../shared/modal/modal.component';
 import { InputComponent } from '../../shared/input/input.component';
 import { AlertBannerComponent } from '../../shared/alert-banner/alert-banner.component';
+import { KycNoticeComponent } from '../../shared/kyc-notice/kyc-notice.component';
 
 @Component({
   selector: 'app-dashboard',
@@ -23,6 +26,7 @@ import { AlertBannerComponent } from '../../shared/alert-banner/alert-banner.com
     FormsModule,
     InputComponent,
     AlertBannerComponent,
+    KycNoticeComponent,
   ],
   templateUrl: './dashboard.component.html',
   styleUrl: './dashboard.component.css',
@@ -49,13 +53,30 @@ export class DashboardComponent implements OnInit {
   readonly newAccountType = signal<AccountType>('SAVINGS');
   readonly openAccountError = signal<string | null>(null);
 
+  // Opening an account and adding funds are both KYC-gated in account-service. Reading the status
+  // here isn't the enforcement - the backend's 403 is - it just means an unverified user is told
+  // why up front instead of finding out by filling in a form and having it rejected.
+  readonly kycStatus = signal<KycStatus | null>(null);
+  readonly kycApproved = computed(() => this.kycStatus() === 'APPROVED');
+
   constructor(
     private readonly accountService: AccountService,
+    private readonly profileService: ProfileService,
     private readonly router: Router,
   ) {}
 
   ngOnInit(): void {
     this.loadAccounts();
+    this.loadKycStatus();
+  }
+
+  loadKycStatus(): void {
+    this.profileService.getKycStatus().subscribe({
+      next: (status) => this.kycStatus.set(status),
+      // Left null on failure, which reads as "not approved" and keeps the actions hidden. Showing
+      // buttons that the backend would refuse anyway would be the worse guess.
+      error: () => this.kycStatus.set(null),
+    });
   }
 
   loadAccounts(): void {

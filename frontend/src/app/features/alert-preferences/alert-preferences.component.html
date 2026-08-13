@@ -26,15 +26,30 @@
       />
       Enable Daily Summary
     </label>
-    <div class="select-group">
-      <label for="timezone">Timezone</label>
-      <select id="timezone" name="timezone" [value]="timezone()" (change)="timezone.set($any($event.target).value)">
-        <option value="America/New_York">America/New_York</option>
-        <option value="America/Chicago">America/Chicago</option>
-        <option value="America/Denver">America/Denver</option>
-        <option value="America/Los_Angeles">America/Los_Angeles</option>
-      </select>
+    <div class="select-row">
+      <div class="select-group">
+        <label for="timezone">Timezone</label>
+        <select id="timezone" name="timezone" [value]="timezone()" (change)="timezone.set($any($event.target).value)">
+          <option value="America/New_York">America/New_York</option>
+          <option value="America/Chicago">America/Chicago</option>
+          <option value="America/Denver">America/Denver</option>
+          <option value="America/Los_Angeles">America/Los_Angeles</option>
+        </select>
+      </div>
+      <div class="select-group">
+        <label for="dailySummaryHour">Delivery Time</label>
+        <select
+          id="dailySummaryHour"
+          name="dailySummaryHour"
+          (change)="dailySummaryHour.set(+$any($event.target).value)"
+        >
+          @for (option of hourOptions; track option.value) {
+            <option [value]="option.value" [selected]="option.value === dailySummaryHour()">{{ option.label }}</option>
+          }
+        </select>
+      </div>
     </div>
+    <p class="field-hint">Your summary arrives at this time in the timezone you picked above.</p>
     <app-alert-banner [type]="dailySummaryMessageType()" [message]="dailySummaryMessage()" />
     <app-button (clicked)="saveDailySummary()">Save Alerts</app-button>
   </section>

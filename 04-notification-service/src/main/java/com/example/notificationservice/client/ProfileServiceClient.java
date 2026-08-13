@@ -14,10 +14,16 @@ public interface ProfileServiceClient {
 
     // email is null for users who registered before the field existed - every caller checks for that
     // rather than sending to an address that can't receive anything.
+    //
+    // dailySummaryHour is the whole local hour (0-23) the user picked for their summary, and it is
+    // boxed rather than an int on purpose: profile-service defaults it to 8, but a row written before
+    // the column existed still answers with null, and an int would silently turn that into midnight -
+    // a summary at 00:00 for someone who never asked for one. Callers treat null as "unknown, skip".
     record UserPreferenceResponse(
             Long userId,
             BigDecimal alertThresholdAmount,
             Boolean dailySummaryEnabled,
+            Integer dailySummaryHour,
             String timezone,
             String email
     ) {}
@@ -31,6 +37,19 @@ public interface ProfileServiceClient {
     @Cacheable(value = "user-preferences", key = "#userId", unless = "#result == null")
     UserPreferenceResponse getUserPreferences(@PathVariable("userId") Long userId);
 
+    // Every opted-in user, whatever their timezone - profile-service treats the timezone param as
+    // optional and omitting it means "all zones". This is what the hourly sweep calls: now that the
+    // summary hour is per-user, every zone on earth is potentially due this hour, so asking zone by
+    // zone would be ~600 HTTP calls to answer a question one call answers.
+    //
+    // Declared as its own method rather than reusing the one below with a null argument: Feign does
+    // drop a null query param, but "getUsersForDailySummary(null)" at a call site reads like a bug,
+    // and a second no-arg declaration on the same path costs nothing.
+    @GetMapping("/api/v1/internal/profiles/daily-summary-users")
+    List<UserPreferenceResponse> getAllUsersForDailySummary();
+
+    // The single-zone form, still used by the manual trigger in InternalNotificationController - an
+    // operator asking for one region shouldn't pull down and filter the whole opted-in population.
     @GetMapping("/api/v1/internal/profiles/daily-summary-users")
     List<UserPreferenceResponse> getUsersForDailySummary(@RequestParam("timezone") String timezone);
 }

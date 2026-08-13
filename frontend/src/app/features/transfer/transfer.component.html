@@ -73,6 +73,12 @@
               Sending to <strong>{{ recipient.displayName ?? 'this account' }}</strong>
               — {{ recipient.accountType }} {{ recipient.maskedAccountNumber }}
             </p>
+            @if (recipientUnverified()) {
+              <app-alert-banner
+                type="warning"
+                message="This recipient can't receive transfers yet because their identity isn't verified. Ask them to complete verification on their Profile page before you send."
+              />
+            }
           }
           <app-alert-banner type="error" [message]="recipientLookupError()" />
         }
@@ -86,7 +92,7 @@
         />
         <app-alert-banner type="error" [message]="validationError()" />
         <app-alert-banner [type]="resultType()" [message]="resultMessage()" />
-        <app-button type="submit">Send</app-button>
+        <app-button type="submit" [disabled]="sendBlocked()">Send</app-button>
       </form>
     } @else {
       <form class="stack" (submit)="submitExternal(); $event.preventDefault()">

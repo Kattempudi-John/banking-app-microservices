@@ -125,6 +125,15 @@ public class AuthController {
                 return ResponseEntity.badRequest()
                         .body(Map.of("error", "Please enter a valid phone number, e.g. 571-285-6947 or +15712856947"));
             }
+            // Checked on the normalized value, and only once normalization has succeeded - the same
+            // phone typed two different ways is still one phone, and comparing the raw input would
+            // miss it. Rejected for the same reason a duplicate email is: the number receives that
+            // account's 2FA codes, so sharing one hands a second person the keys to the first
+            // person's login.
+            if (userRepository.existsByPhoneNumber(normalizedPhone)) {
+                return ResponseEntity.status(HttpStatus.CONFLICT)
+                        .body(Map.of("error", "That phone number is already registered"));
+            }
         }
 
         User newUser = new User();

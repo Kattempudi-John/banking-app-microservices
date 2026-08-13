@@ -22,6 +22,12 @@ public interface TransactionRepository extends JpaRepository<TransactionEntity, 
 
     Page<TransactionEntity> findByAccountIdAndTransactionType(Long accountId, TransactionType transactionType, Pageable pageable);
 
+    // The fast path of the idempotency check: a replay is answered without touching a balance at all.
+    // Not the whole mechanism though - this read and the insert that follows it are two steps, and two
+    // concurrent retries can both find nothing before either writes. The unique index from V8 is what
+    // actually settles that race; see InternalAccountService.recordTransaction.
+    boolean existsByIdempotencyKey(String idempotencyKey);
+
     // Powers the cross-account History view - accountIds is the caller's own (possibly
     // single-account-narrowed) set, resolved and ownership-checked in AccountService before this
     // is ever called. type/from/to are each optional; the "IS NULL OR ..." pattern lets one query

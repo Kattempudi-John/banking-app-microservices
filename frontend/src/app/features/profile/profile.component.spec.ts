@@ -1,12 +1,38 @@
 import { ComponentFixture, TestBed } from '@angular/core/testing';
+import { HttpErrorResponse } from '@angular/common/http';
 import { provideRouter } from '@angular/router';
-import { of, throwError } from 'rxjs';
+import { Observable, of, throwError } from 'rxjs';
 
 import { ProfileComponent } from './profile.component';
 import { ProfileService } from '../../core/services/profile.service';
 import { AccountService } from '../../core/services/account.service';
 import { AuthService } from '../../core/auth.service';
-import { KycStatus } from '../../core/models/profile.models';
+import { ContactInfoView, KycStatus } from '../../core/models/profile.models';
+
+// What the endpoint returns for someone who has never submitted the identity form - every field
+// null, which is the default for tests that don't care about pre-filling.
+const NO_CONTACT_INFO: ContactInfoView = {
+  legalName: null,
+  dateOfBirth: null,
+  phoneNumber: null,
+  addressLine1: null,
+  addressLine2: null,
+  city: null,
+  state: null,
+  zipCode: null,
+};
+
+const CONTACT_INFO_ON_FILE: ContactInfoView = {
+  legalName: 'Jane Q Public',
+  dateOfBirth: '1990-04-17',
+  // E.164, the way the backend stores it - this is the number the account was registered with.
+  phoneNumber: '+15712856947',
+  addressLine1: '123 Main St',
+  addressLine2: 'Apt 4',
+  city: 'Springfield',
+  state: 'IL',
+  zipCode: '62704',
+};
 
 describe('ProfileComponent', () => {
   let fixture: ComponentFixture<ProfileComponent>;
@@ -14,9 +40,17 @@ describe('ProfileComponent', () => {
   let accountServiceSpy: jasmine.SpyObj<AccountService>;
   let authServiceSpy: jasmine.SpyObj<AuthService>;
 
-  async function setup(kycStatus: KycStatus = 'PENDING_VERIFICATION'): Promise<void> {
-    profileServiceSpy = jasmine.createSpyObj('ProfileService', ['getKycStatus', 'updateContactInfo']);
+  async function setup(
+    kycStatus: KycStatus = 'PENDING_VERIFICATION',
+    contactInfo: Observable<ContactInfoView> = of(NO_CONTACT_INFO),
+  ): Promise<void> {
+    profileServiceSpy = jasmine.createSpyObj('ProfileService', [
+      'getKycStatus',
+      'getContactInfo',
+      'updateContactInfo',
+    ]);
     profileServiceSpy.getKycStatus.and.returnValue(of(kycStatus));
+    profileServiceSpy.getContactInfo.and.returnValue(contactInfo);
     accountServiceSpy = jasmine.createSpyObj('AccountService', ['getAccounts']);
     accountServiceSpy.getAccounts.and.returnValue(of([]));
     authServiceSpy = jasmine.createSpyObj('AuthService', ['logout'], { userId: () => 42 });
@@ -175,6 +209,152 @@ describe('ProfileComponent', () => {
     expect(fixture.nativeElement.textContent).toContain('Something went wrong');
   });
 
+  describe('pre-filling the identity form', () => {
+    it('fills every field from the contact info already on file', async () => {
+      await setup('APPROVED', of(CONTACT_INFO_ON_FILE));
+      fixture.detectChanges();
+      await fixture.whenStable();
+      fixture.detectChanges();
+
+      expect(profileServiceSpy.getContactInfo).toHaveBeenCalled();
+      expect(inputById('legalName').value).toBe('Jane Q Public');
+      expect(inputById('dateOfBirth').value).toBe('1990-04-17');
+      expect(inputById('phoneNumber').value).toBe('+15712856947');
+      expect(inputById('addressLine1').value).toBe('123 Main St');
+      expect(inputById('addressLine2').value).toBe('Apt 4');
+      expect(inputById('city').value).toBe('Springfield');
+      expect(inputById('state').value).toBe('IL');
+      expect(inputById('zipCode').value).toBe('62704');
+    });
+
+    // The bug this fixes: a blank form meant people retyped their phone number and ended up
+    // registering a different one from the one on the account.
+    it('submits the pre-filled phone number unchanged when nothing is edited', async () => {
+      await setup('APPROVED', of(CONTACT_INFO_ON_FILE));
+      profileServiceSpy.updateContactInfo.and.returnValue(of('APPROVED' as KycStatus));
+      await fixture.whenStable();
+
+      submitForm();
+      fixture.detectChanges();
+
+      expect(profileServiceSpy.updateContactInfo).toHaveBeenCalledWith({
+        legalName: 'Jane Q Public',
+        dateOfBirth: '1990-04-17',
+        phoneNumber: '+15712856947',
+        addressLine1: '123 Main St',
+        addressLine2: 'Apt 4',
+        city: 'Springfield',
+        state: 'IL',
+        zipCode: '62704',
+      });
+    });
+
+    it('leaves fields the record has no value for empty', async () => {
+      await setup('PENDING_VERIFICATION', of({ ...NO_CONTACT_INFO, legalName: 'Jane Q Public' }));
+      fixture.detectChanges();
+      await fixture.whenStable();
+      fixture.detectChanges();
+
+      expect(inputById('legalName').value).toBe('Jane Q Public');
+      expect(inputById('phoneNumber').value).toBe('');
+      expect(inputById('city').value).toBe('');
+    });
+
+    it('leaves the form empty and still usable when the lookup fails', async () => {
+      await setup('PENDING_VERIFICATION', throwError(() => new HttpErrorResponse({ status: 500 })));
+      fixture.detectChanges();
+
+      // A failed read must not present as a page error - it would look like verification itself is
+      // broken, when the only thing lost is the convenience of a pre-filled form.
+      expect(fixture.nativeElement.textContent).not.toContain('Something went wrong');
+      expect(inputById('phoneNumber').value).toBe('');
+
+      profileServiceSpy.updateContactInfo.and.returnValue(of('APPROVED' as KycStatus));
+      await fillValidForm();
+      submitForm();
+      fixture.detectChanges();
+
+      expect(profileServiceSpy.updateContactInfo).toHaveBeenCalled();
+      expect(fixture.nativeElement.textContent).toContain('saved');
+    });
+  });
+
+  describe('a phone number already registered to someone else', () => {
+    it('shows the reason the backend gave for a 409', async () => {
+      await setup();
+      profileServiceSpy.updateContactInfo.and.returnValue(
+        throwError(
+          () =>
+            new HttpErrorResponse({
+              status: 409,
+              error: { error: 'That phone number is already registered to another account.' },
+            }),
+        ),
+      );
+
+      await fillValidForm();
+      submitForm();
+      fixture.detectChanges();
+
+      expect(fixture.nativeElement.textContent).toContain('already registered to another account');
+      expect(fixture.nativeElement.textContent).not.toContain('Something went wrong');
+    });
+
+    it('still names the conflict when a 409 arrives without a usable body', async () => {
+      await setup();
+      profileServiceSpy.updateContactInfo.and.returnValue(
+        throwError(() => new HttpErrorResponse({ status: 409 })),
+      );
+
+      await fillValidForm();
+      submitForm();
+      fixture.detectChanges();
+
+      expect(fixture.nativeElement.textContent).toContain('already registered to another account');
+    });
+  });
+
+  // profile-service answers 503 when auth-service is unreachable: the submission was not processed
+  // at all, which is a different thing from a rejected one and has to invite a retry.
+  describe('the verification service cannot be reached', () => {
+    it('shows the reason the server gave for a 503', async () => {
+      await setup();
+      profileServiceSpy.updateContactInfo.and.returnValue(
+        throwError(
+          () =>
+            new HttpErrorResponse({
+              status: 503,
+              error: {
+                error: "We couldn't confirm your identity verification right now. Please try again in a moment.",
+                message: "We couldn't confirm your identity verification right now. Please try again in a moment.",
+              },
+            }),
+        ),
+      );
+
+      await fillValidForm();
+      submitForm();
+      fixture.detectChanges();
+
+      expect(fixture.nativeElement.textContent).toContain("couldn't confirm your identity verification");
+      expect(fixture.nativeElement.textContent).not.toContain('Something went wrong');
+    });
+
+    it('names the unreachable service when a 503 arrives without a body', async () => {
+      await setup();
+      profileServiceSpy.updateContactInfo.and.returnValue(
+        throwError(() => new HttpErrorResponse({ status: 503 })),
+      );
+
+      await fillValidForm();
+      submitForm();
+      fixture.detectChanges();
+
+      expect(fixture.nativeElement.textContent).toContain("couldn't reach the service to confirm this");
+      expect(fixture.nativeElement.textContent).not.toContain('Something went wrong');
+    });
+  });
+
   it('shows each account\'s full account number, IBAN and SWIFT code in the Receive Money section', async () => {
     accountServiceSpy = jasmine.createSpyObj('AccountService', ['getAccounts']);
     accountServiceSpy.getAccounts.and.returnValue(
@@ -192,8 +372,13 @@ describe('ProfileComponent', () => {
         },
       ]),
     );
-    profileServiceSpy = jasmine.createSpyObj('ProfileService', ['getKycStatus', 'updateContactInfo']);
+    profileServiceSpy = jasmine.createSpyObj('ProfileService', [
+      'getKycStatus',
+      'getContactInfo',
+      'updateContactInfo',
+    ]);
     profileServiceSpy.getKycStatus.and.returnValue(of('APPROVED'));
+    profileServiceSpy.getContactInfo.and.returnValue(of(NO_CONTACT_INFO));
     authServiceSpy = jasmine.createSpyObj('AuthService', ['logout'], { userId: () => 42 });
     authServiceSpy.logout.and.returnValue(of({}));
 

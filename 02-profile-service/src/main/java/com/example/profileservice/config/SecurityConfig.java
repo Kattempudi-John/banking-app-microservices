@@ -1,6 +1,7 @@
 package com.example.profileservice.config;
 
 import jakarta.servlet.DispatcherType;
+import com.example.profileservice.security.InternalTokenFilter;
 import com.example.profileservice.security.KycWebhookFilter;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
@@ -33,6 +34,7 @@ import java.util.List;
 public class SecurityConfig {
 
     private final KycWebhookFilter kycWebhookFilter;
+    private final InternalTokenFilter internalTokenFilter;
 
     // Same base64-encoded HMAC secret auth-service signs tokens with (shared via the
     // JWT_SECRET_KEY k8s secret in prod, see application-prod.yml) so this service can verify
@@ -40,8 +42,9 @@ public class SecurityConfig {
     @Value("${application.security.jwt.secret-key:404E635266556A586E3272357538782F413F4428472B4B6250645367566B5970}")
     private String secretKey;
 
-    public SecurityConfig(KycWebhookFilter kycWebhookFilter) {
+    public SecurityConfig(KycWebhookFilter kycWebhookFilter, InternalTokenFilter internalTokenFilter) {
         this.kycWebhookFilter = kycWebhookFilter;
+        this.internalTokenFilter = internalTokenFilter;
     }
 
     @Bean
@@ -65,6 +68,12 @@ public class SecurityConfig {
                 // Anything unauthenticated has to live here: the ingress matches by path prefix, so a
                 // permitAll endpoint under /api/v1/profiles (which is routed) is published to the
                 // internet - exactly what the old /api/v1/profiles/*/kyc-status rule did.
+                //
+                // Still permitAll, and it has to stay that way: InternalTokenFilter is what gates
+                // this prefix now. Tightening the rule to .authenticated() instead would demand a JWT
+                // from callers who have no end-user token to send - notification-service sweeping
+                // daily-summary opt-ins has no user in the room at all - and would break every one
+                // of these calls.
                 .requestMatchers("/api/v1/internal/**").permitAll()
                 // Swagger/OpenAPI UI - documentation, not application data
                 .requestMatchers("/swagger-ui/**", "/swagger-ui.html", "/v3/api-docs/**").permitAll()
@@ -74,6 +83,13 @@ public class SecurityConfig {
                 .sessionCreationPolicy(SessionCreationPolicy.STATELESS)
             )
             .addFilterBefore(kycWebhookFilter, UsernamePasswordAuthenticationFilter.class)
+            // Both secret-checking filters sit ahead of authentication because neither of their
+            // callers authenticates: the vendor's webhook proves itself with an HMAC, our own
+            // services with a shared token. Their order relative to each other does not matter -
+            // they guard disjoint prefixes (/api/v1/webhooks/ vs /api/v1/internal/) and each one
+            // passes straight through on any path that is not its own, so no request is ever seen
+            // by both as something to check.
+            .addFilterBefore(internalTokenFilter, UsernamePasswordAuthenticationFilter.class)
             // Validates the bearer token against the JwtDecoder bean below and populates the
             // SecurityContext with a JwtAuthenticationToken, whose authorities come from the
             // token's "scope" claim (e.g. "FULL_AUTH" -> SCOPE_FULL_AUTH) — needed for

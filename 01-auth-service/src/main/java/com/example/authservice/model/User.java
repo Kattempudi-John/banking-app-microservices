@@ -32,6 +32,11 @@ public class User implements UserDetails {
     @Column(nullable = false)
     private String password;
 
+    // Unique for the same reason as email: this is the destination for 2FA codes, so two accounts
+    // sharing a number means one person's phone can complete the other person's login. Nullable,
+    // and Postgres allows any number of nulls under a unique constraint, so rows with no number
+    // on file are unaffected.
+    @Column(unique = true)
     private String phoneNumber;
 
     // Where notification-service sends balance summaries and transaction alerts. Nullable rather

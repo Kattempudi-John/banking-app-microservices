@@ -16,6 +16,7 @@
     
     <properties>
         <java.version>17</java.version>
+        <spring-cloud.version>2023.0.3</spring-cloud.version>
     </properties>
 
     <dependencies>
@@ -55,6 +56,13 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+
+        <!-- brings in feign so AuthServiceClient can be a plain interface instead of hand
+             written resttemplate/httpclient calls, same as transaction-service's clients -->
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-openfeign</artifactId>
         </dependency>
 
         <!-- Messaging -->
@@ -98,6 +106,21 @@
             <scope>test</scope>
         </dependency>
     </dependencies>
+
+    <!-- spring cloud has its own separate release train and version number from spring boot
+         itself, this bom import is what keeps openfeign's version compatible with everything else.
+         Same version transaction-service pins, so the two modules can't drift apart. -->
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.springframework.cloud</groupId>
+                <artifactId>spring-cloud-dependencies</artifactId>
+                <version>${spring-cloud.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
 
     <build>
         <plugins>

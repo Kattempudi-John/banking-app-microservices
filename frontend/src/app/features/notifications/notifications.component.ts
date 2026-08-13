@@ -1,11 +1,21 @@
 import { Component, OnInit, computed, signal } from '@angular/core';
 
-import { NotificationService } from '../../core/services/notification.service';
+import { NotificationFilters, NotificationService } from '../../core/services/notification.service';
 import { toReadableMessage } from '../../core/notification-message';
-import { Notification } from '../../core/models/notification.models';
+import {
+  Notification,
+  NotificationChannel,
+  NotificationDeliveryStatus,
+  NotificationType,
+} from '../../core/models/notification.models';
 import { TableColumn, TableComponent } from '../../shared/table/table.component';
 import { ButtonComponent } from '../../shared/button/button.component';
 import { NavComponent } from '../../shared/nav/nav.component';
+
+// The empty string is what the "All" option carries, i.e. no constraint on that field.
+type TypeFilter = '' | NotificationType;
+type ChannelFilter = '' | NotificationChannel;
+type StatusFilter = '' | NotificationDeliveryStatus;
 
 @Component({
   selector: 'app-notifications',
@@ -41,9 +51,84 @@ export class NotificationsComponent implements OnInit {
   readonly loading = signal(false);
   readonly error = signal(false);
 
+  readonly typeFilter = signal<TypeFilter>('');
+  readonly channelFilter = signal<ChannelFilter>('');
+  readonly statusFilter = signal<StatusFilter>('');
+  readonly fromFilter = signal('');
+  readonly toFilter = signal('');
+
+  // Only the fields the user actually picked land here. An unpicked filter has to be absent rather
+  // than empty: the API reads a present-but-empty value as a constraint nothing can satisfy.
+  readonly activeFilters = computed<NotificationFilters>(() => {
+    const filters: NotificationFilters = {};
+
+    const type = this.typeFilter();
+    if (type) {
+      filters.type = type;
+    }
+    const channel = this.channelFilter();
+    if (channel) {
+      filters.channel = channel;
+    }
+    const status = this.statusFilter();
+    if (status) {
+      filters.status = status;
+    }
+    const from = this.fromFilter();
+    if (from) {
+      filters.from = `${from}T00:00:00`;
+    }
+    const to = this.toFilter();
+    if (to) {
+      // The date input yields a bare day, and the bound is inclusive, so it has to run to the end
+      // of that day - a plain midnight would hide everything that happened on the day picked.
+      filters.to = `${to}T23:59:59`;
+    }
+
+    return filters;
+  });
+
+  readonly hasActiveFilters = computed(() => Object.keys(this.activeFilters()).length > 0);
+
   constructor(private readonly notificationService: NotificationService) {}
 
   ngOnInit(): void {
+    this.loadPage(0);
+  }
+
+  // Every filter change restarts at the first page: keeping the old page number would land the user
+  // past the end of a narrower result set and read as their notifications having vanished.
+  onTypeFilterChange(value: string): void {
+    this.typeFilter.set(value as TypeFilter);
+    this.loadPage(0);
+  }
+
+  onChannelFilterChange(value: string): void {
+    this.channelFilter.set(value as ChannelFilter);
+    this.loadPage(0);
+  }
+
+  onStatusFilterChange(value: string): void {
+    this.statusFilter.set(value as StatusFilter);
+    this.loadPage(0);
+  }
+
+  onFromChange(value: string): void {
+    this.fromFilter.set(value);
+    this.loadPage(0);
+  }
+
+  onToChange(value: string): void {
+    this.toFilter.set(value);
+    this.loadPage(0);
+  }
+
+  clearFilters(): void {
+    this.typeFilter.set('');
+    this.channelFilter.set('');
+    this.statusFilter.set('');
+    this.fromFilter.set('');
+    this.toFilter.set('');
     this.loadPage(0);
   }
 
@@ -77,7 +162,13 @@ export class NotificationsComponent implements OnInit {
     this.loading.set(true);
     this.error.set(false);
 
-    this.notificationService.getNotifications(page).subscribe({
+    // Paging and retrying both come through here, so the active filters ride along with them.
+    const filters = this.activeFilters();
+    const request = this.hasActiveFilters()
+      ? this.notificationService.getNotifications(page, filters)
+      : this.notificationService.getNotifications(page);
+
+    request.subscribe({
       next: (result) => {
         this.notifications.set(result.content);
         this.currentPage.set(result.number);

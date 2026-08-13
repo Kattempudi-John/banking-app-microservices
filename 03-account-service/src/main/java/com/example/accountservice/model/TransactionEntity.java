@@ -44,6 +44,13 @@ public class TransactionEntity {
     @Column(name = "created_at", nullable = false, updatable = false)
     private LocalDateTime createdAt;
 
+    // Caller-supplied name for this ledger write, backed by a unique index (V8). Nullable because it
+    // is optional by design: a null key must behave exactly as before, so nothing that already calls
+    // credit/debit without one changes behaviour. updatable = false because rewriting the key on an
+    // existing row would let a replay be re-admitted under a key the ledger has already spent.
+    @Column(name = "idempotency_key", updatable = false)
+    private String idempotencyKey;
+
     public TransactionEntity() {}
 
     @PrePersist
@@ -67,4 +74,6 @@ public class TransactionEntity {
     public void setDescription(String description) { this.description = description; }
     public LocalDateTime getCreatedAt() { return createdAt; }
     public void setCreatedAt(LocalDateTime createdAt) { this.createdAt = createdAt; }
+    public String getIdempotencyKey() { return idempotencyKey; }
+    public void setIdempotencyKey(String idempotencyKey) { this.idempotencyKey = idempotencyKey; }
 }

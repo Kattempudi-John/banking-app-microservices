@@ -1,5 +1,6 @@
 package com.example.accountservice.service;
 
+import com.example.accountservice.annotation.RequiresKyc;
 import com.example.accountservice.dto.AccountOverviewResponseDto;
 import com.example.accountservice.mapper.AccountMapper;
 import com.example.accountservice.model.AccountEntity;
@@ -104,6 +105,9 @@ public class AccountService {
     // transfers and Kafka provisioning use.
     private static final BigDecimal MAX_DEPOSIT_AMOUNT = new BigDecimal("10000");
 
+    // Taking in funds is the moment KYC exists to govern - an unverified identity should not be
+    // able to put money into the bank any more than it can move money out of it.
+    @RequiresKyc
     @Transactional
     public AccountOverviewResponseDto depositFunds(Long userId, Long accountId, BigDecimal amount) {
         if (amount.compareTo(BigDecimal.ZERO) <= 0) {
@@ -138,6 +142,11 @@ public class AccountService {
     private static final String DEFAULT_ROUTING_NUMBER = "021000021";
     private static final int MAX_ACCOUNTS_PER_USER = 5;
 
+    // Gated for the same reason the deposit path is: opening an account is the classic
+    // know-your-customer moment. Note this is the self-service path only - the starter account a
+    // brand-new user gets at registration is built directly by UserRegisteredListener, which never
+    // calls this method, so provisioning still works while that user sits at PENDING_VERIFICATION.
+    @RequiresKyc
     @Transactional
     public AccountOverviewResponseDto openAccount(Long userId, AccountType accountType) {
         long existingCount = accountRepository.findByUserIdAndStatusNot(userId, AccountStatus.CLOSED).size();
@@ -175,6 +184,9 @@ public class AccountService {
             "Gas Station", "Restaurant", "Streaming Subscription", "Pharmacy"
     };
 
+    // Gated too, even though it's demo-only and already off in prod: the fabricated history it
+    // writes includes credits, so leaving it open would just be the deposit gate with an extra step.
+    @RequiresKyc
     @Transactional
     public AccountOverviewResponseDto seedDemoTransactions(Long userId, Long accountId) {
         AccountEntity account = accountRepository.findByIdForUpdate(accountId)

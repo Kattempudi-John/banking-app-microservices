@@ -19,6 +19,9 @@ export interface RecipientPreview {
   maskedAccountNumber: string;
   accountType: string;
   displayName: string | null;
+  // False when the recipient's own identity isn't approved. Sending to them is rejected with a 403,
+  // so the sender is told at lookup time instead of after they've committed to an amount.
+  verified: boolean;
 }
 
 export interface ExternalWireRequest {

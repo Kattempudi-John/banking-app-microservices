@@ -29,10 +29,10 @@ public class UpdateContactInfoRequestDto {
     private LocalDate dateOfBirth;
 
     // Accepts the separators a person actually types - "(571) 285-6947", "571-285-6947",
-    // "+1 571 285 6947" - because PhoneNumberNormalizer converts whatever arrives into E.164 before
-    // it's stored. This pattern only rejects input that clearly isn't a phone number at all; the
-    // normalizer makes the real call and ProfileManagementService returns a clear error if it can't
-    // resolve one unambiguous number.
+    // "+1 571 285 6947" - and is forwarded to auth-service exactly as typed, which converts it to
+    // E.164 and checks nobody else already holds it. This pattern only rejects input that clearly
+    // isn't a phone number at all; auth-service makes the real call, and ProfileManagementService
+    // passes its error back if it can't resolve one unambiguous number.
     // learned all these jakarta validation annotations only actually run when the controller
     // method parameter is also marked @Valid, the annotation alone on the dto does nothing by itself
     @NotBlank(message = "Phone number is required")

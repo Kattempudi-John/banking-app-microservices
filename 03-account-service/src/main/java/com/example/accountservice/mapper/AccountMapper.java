@@ -15,7 +15,12 @@ public class AccountMapper {
     // Format: 4-char bank code + 2-char country code (6 letters total) + 2-char location code -
     // matches transaction-service's IbanSwiftValidator/ExternalWireRequestDto validation, which
     // requires the first 6 characters to be letters only.
-    private static final String PLATFORM_SWIFT_CODE = "XBUSUS31";
+    // Public because transaction-service has to know which BIC belongs to this platform before it
+    // will accept a wire aimed at one of our IBANs, and it asks for it through the internal IBAN
+    // lookup rather than declaring a second copy of the string. A wire carries an IBAN and a BIC
+    // that are supposed to identify the same bank; a duplicated constant that drifted would make
+    // that check quietly compare against the wrong bank.
+    public static final String PLATFORM_SWIFT_CODE = "XBUSUS31";
 
     public AccountOverviewResponseDto toOverviewDto(AccountEntity entity) {
         return new AccountOverviewResponseDto(

@@ -35,6 +35,17 @@ spring:
     # V7, say - is classified "future", not "missing", and would still fail validation otherwise.
     ignore-migration-patterns: "*:missing,*:future"
 
+application:
+  security:
+    # Shared secret required on every /api/v1/internal/** request (InternalTokenFilter) and attached
+    # to every internal call this service makes out (FeignInternalTokenConfig). Identical property
+    # name, header and dev default in all five services - it is a contract between them, so changing
+    # it here alone locks this service out of the others and them out of this one.
+    # Declared in the base config rather than only in application-prod.yml so the env var is picked
+    # up under any profile; the literal fallback keeps docker-compose working with zero configuration
+    # while a real deployment sets INTERNAL_SERVICE_TOKEN from the same k8s secret everywhere.
+    internal-token: ${INTERNAL_SERVICE_TOKEN:local-dev-internal-token}
+
 server:
   port: 8083
   # Internal callers (transaction-service's AccountServiceClient) parse this message field to

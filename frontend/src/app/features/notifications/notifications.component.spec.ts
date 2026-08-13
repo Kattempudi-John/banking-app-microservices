@@ -39,6 +39,20 @@ describe('NotificationsComponent', () => {
     fixture.detectChanges();
   }
 
+  // Selects and date inputs both report through their change event, so one helper drives either.
+  function setFilter(selector: string, value: string): void {
+    const control: HTMLSelectElement | HTMLInputElement = fixture.nativeElement.querySelector(selector);
+    control.value = value;
+    control.dispatchEvent(new Event('change'));
+    fixture.detectChanges();
+  }
+
+  function clickButton(label: string): void {
+    const buttons: HTMLButtonElement[] = Array.from(fixture.nativeElement.querySelectorAll('button'));
+    buttons.find((b) => b.textContent?.includes(label))!.click();
+    fixture.detectChanges();
+  }
+
   it('loads notifications on init', () => {
     setup();
     expect(notificationServiceSpy.getNotifications).toHaveBeenCalledWith(0);
@@ -119,5 +133,108 @@ describe('NotificationsComponent', () => {
     nextButton.click();
 
     expect(notificationServiceSpy.getNotifications).toHaveBeenCalledWith(1);
+  });
+
+  it('re-fetches the first page with the chosen type when the type filter changes', () => {
+    setup();
+    notificationServiceSpy.getNotifications.calls.reset();
+
+    setFilter('#typeFilter', 'DAILY_SUMMARY');
+
+    expect(notificationServiceSpy.getNotifications).toHaveBeenCalledWith(0, { type: 'DAILY_SUMMARY' });
+  });
+
+  it('sends every selected filter together rather than only the last one touched', () => {
+    setup();
+    setFilter('#typeFilter', 'TRANSACTION_ALERT');
+    setFilter('#channelFilter', 'EMAIL');
+    notificationServiceSpy.getNotifications.calls.reset();
+
+    setFilter('#statusFilter', 'FAILED');
+
+    expect(notificationServiceSpy.getNotifications).toHaveBeenCalledWith(0, {
+      type: 'TRANSACTION_ALERT',
+      channel: 'EMAIL',
+      status: 'FAILED',
+    });
+  });
+
+  it('sends a from date from the start of that day', () => {
+    setup();
+    notificationServiceSpy.getNotifications.calls.reset();
+
+    setFilter('#fromFilter', '2026-08-01');
+
+    expect(notificationServiceSpy.getNotifications).toHaveBeenCalledWith(0, { from: '2026-08-01T00:00:00' });
+  });
+
+  it('stretches a to date to the end of that day so same-day notifications still match', () => {
+    setup();
+    notificationServiceSpy.getNotifications.calls.reset();
+
+    setFilter('#toFilter', '2026-08-05');
+
+    const [, filters] = notificationServiceSpy.getNotifications.calls.mostRecent().args;
+    expect(filters?.to).toBe('2026-08-05T23:59:59');
+    // A bound of midnight would exclude everything that happened during the day the user picked.
+    const lateThatDay = new Date('2026-08-05T18:30:00').getTime();
+    expect(new Date(filters!.to!).getTime()).toBeGreaterThan(lateThatDay);
+  });
+
+  it('goes back to the first page when a filter changes on a later page', () => {
+    setup({ ...onePage, totalPages: 4, number: 0 });
+    notificationServiceSpy.getNotifications.and.returnValue(of({ ...onePage, totalPages: 4, number: 1 }));
+    clickButton('Next');
+    notificationServiceSpy.getNotifications.calls.reset();
+
+    setFilter('#statusFilter', 'SENT');
+
+    // Page 1 could easily be past the end of a narrower result set, which reads as data loss.
+    expect(notificationServiceSpy.getNotifications).toHaveBeenCalledWith(0, { status: 'SENT' });
+  });
+
+  it('keeps the active filters when paging', () => {
+    setup({ ...onePage, totalPages: 4, number: 0 });
+    setFilter('#typeFilter', 'SMS_2FA');
+    notificationServiceSpy.getNotifications.and.returnValue(of({ ...onePage, totalPages: 4, number: 1 }));
+    notificationServiceSpy.getNotifications.calls.reset();
+
+    clickButton('Next');
+
+    expect(notificationServiceSpy.getNotifications).toHaveBeenCalledWith(1, { type: 'SMS_2FA' });
+  });
+
+  it('restores the unfiltered request when the filters are cleared', () => {
+    setup();
+    setFilter('#typeFilter', 'SMS_2FA');
+    setFilter('#channelFilter', 'SMS');
+    notificationServiceSpy.getNotifications.calls.reset();
+
+    clickButton('Clear filters');
+
+    expect(notificationServiceSpy.getNotifications).toHaveBeenCalledWith(0);
+    const typeSelect: HTMLSelectElement = fixture.nativeElement.querySelector('#typeFilter');
+    const channelSelect: HTMLSelectElement = fixture.nativeElement.querySelector('#channelFilter');
+    expect(typeSelect.value).toBe('');
+    expect(channelSelect.value).toBe('');
+  });
+
+  it('sends no filter params at all when nothing is selected', () => {
+    setup();
+    expect(notificationServiceSpy.getNotifications).toHaveBeenCalledWith(0);
+    expect(notificationServiceSpy.getNotifications.calls.mostRecent().args.length).toBe(1);
+  });
+
+  it('reads a filter combination that matches nothing as an empty result, not an error', () => {
+    setup();
+    notificationServiceSpy.getNotifications.and.returnValue(
+      of({ content: [], totalPages: 0, totalElements: 0, number: 0, size: 50 }),
+    );
+
+    setFilter('#typeFilter', 'PROFILE_SECURITY');
+
+    const text = fixture.nativeElement.textContent;
+    expect(text).toContain('No notifications match these filters');
+    expect(text).not.toContain('Unable to load your notifications');
   });
 });

@@ -12,7 +12,10 @@ import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
 import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
+import org.springframework.security.oauth2.server.resource.web.authentication.BearerTokenAuthenticationFilter;
 import org.springframework.security.web.SecurityFilterChain;
+
+import com.example.accountservice.security.InternalTokenFilter;
 import org.springframework.web.cors.CorsConfiguration;
 import org.springframework.web.cors.CorsConfigurationSource;
 import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
@@ -33,6 +36,11 @@ public class SecurityConfig {
     // a token's signature on its own, without ever calling back to auth-service.
     @Value("${application.security.jwt.secret-key:404E635266556A586E3272357538782F413F4428472B4B6250645367566B5970}")
     private String secretKey;
+
+    // Shared secret every service in this project presents on its /api/v1/internal/** calls, same
+    // property name and same dev default in all five so docker-compose still starts with no config.
+    @Value("${application.security.internal-token:local-dev-internal-token}")
+    private String internalToken;
 
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
@@ -55,6 +63,9 @@ public class SecurityConfig {
                 // Everything permitted here MUST live under this one prefix: the ingress routes by
                 // path prefix, so an unauthenticated endpoint anywhere else (balances/batch used to be
                 // under /api/v1/accounts) is an endpoint published straight to the internet.
+                // Still permitAll, on purpose: InternalTokenFilter below is what gates these, and
+                // requiring authentication here instead would reject every caller outright, since
+                // the services calling in hold no user token to present.
                 .requestMatchers("/api/v1/internal/**").permitAll()
                 // Swagger/OpenAPI UI - documentation, not application data
                 .requestMatchers("/swagger-ui/**", "/swagger-ui.html", "/v3/api-docs/**").permitAll()
@@ -69,7 +80,13 @@ public class SecurityConfig {
             // SecurityContext with a JwtAuthenticationToken, whose authorities come from the
             // token's "scope" claim (e.g. "FULL_AUTH" -> SCOPE_FULL_AUTH) — this is what
             // @PreAuthorize("hasAuthority('SCOPE_FULL_AUTH')") on AccountController checks against.
-            .oauth2ResourceServer(oauth2 -> oauth2.jwt(Customizer.withDefaults()));
+            .oauth2ResourceServer(oauth2 -> oauth2.jwt(Customizer.withDefaults()))
+            // Placed before the JWT authentication filter so an internal request is rejected on its
+            // shared secret before any token parsing happens - internal callers have no bearer token
+            // to parse anyway. Constructed by hand rather than registered as a @Component: any Filter
+            // that is also a bean gets auto-registered by Boot across the WHOLE servlet chain, so it
+            // would then run twice per request, once inside this chain and once outside it.
+            .addFilterBefore(new InternalTokenFilter(internalToken), BearerTokenAuthenticationFilter.class);
 
         return http.build();
     }

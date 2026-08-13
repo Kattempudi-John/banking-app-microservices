@@ -4,7 +4,7 @@ import { provideHttpClientTesting, HttpTestingController } from '@angular/common
 
 import { ProfileService } from './profile.service';
 import { environment } from '../../../environments/environment';
-import { KycStatus, UserPreference } from '../models/profile.models';
+import { ContactInfoView, KycStatus, UserPreference } from '../models/profile.models';
 
 describe('ProfileService', () => {
   let service: ProfileService;
@@ -58,12 +58,55 @@ describe('ProfileService', () => {
     expect(result).toBe('APPROVED');
   });
 
+  it('fetches the contact info on file for the logged-in user', () => {
+    const onFile: ContactInfoView = {
+      legalName: 'Jane Q Public',
+      dateOfBirth: '1990-04-17',
+      phoneNumber: '+15712856947',
+      addressLine1: '123 Main St',
+      addressLine2: null,
+      city: 'Springfield',
+      state: 'IL',
+      zipCode: '62704',
+    };
+    let result: ContactInfoView | undefined;
+
+    service.getContactInfo().subscribe((info) => (result = info));
+
+    // Same path as the PUT above, and no userId - the backend takes the user from the JWT.
+    const req = httpMock.expectOne(`${environment.profileApiUrl}/profiles/me/contact-info`);
+    expect(req.request.method).toBe('GET');
+    req.flush(onFile);
+
+    expect(result).toEqual(onFile);
+  });
+
+  it('passes through a record whose fields are all null, for a user who never submitted the form', () => {
+    let result: ContactInfoView | undefined;
+
+    service.getContactInfo().subscribe((info) => (result = info));
+
+    httpMock.expectOne(`${environment.profileApiUrl}/profiles/me/contact-info`).flush({
+      legalName: null,
+      dateOfBirth: null,
+      phoneNumber: null,
+      addressLine1: null,
+      addressLine2: null,
+      city: null,
+      state: null,
+      zipCode: null,
+    });
+
+    expect(result?.phoneNumber).toBeNull();
+  });
+
   it('fetches alert preferences for a given user id', () => {
     const mockPreference: UserPreference = {
       userId: 42,
       alertThresholdAmount: 500,
       dailySummaryEnabled: true,
       timezone: 'America/New_York',
+      dailySummaryHour: 8,
     };
     let result: UserPreference | undefined;
 
@@ -87,11 +130,15 @@ describe('ProfileService', () => {
   });
 
   it('sends a PUT request to update daily summary settings, expecting a plain-text response (backend returns text/plain, not JSON)', () => {
-    service.updateDailySummary(true, 'America/New_York').subscribe();
+    service.updateDailySummary(true, 'America/New_York', 18).subscribe();
 
     const req = httpMock.expectOne(`${environment.profileApiUrl}/profile/alerts/daily-summary`);
     expect(req.request.method).toBe('PUT');
-    expect(req.request.body).toEqual({ dailySummaryEnabled: true, timezone: 'America/New_York' });
+    expect(req.request.body).toEqual({
+      dailySummaryEnabled: true,
+      timezone: 'America/New_York',
+      dailySummaryHour: 18,
+    });
     expect(req.request.responseType).toBe('text');
     req.flush('Daily summary preferences successfully updated.');
   });

@@ -37,8 +37,14 @@ public class InternalPreferenceController {
         return ResponseEntity.ok(responseMapper.toResponse(preferenceService.getPreferences(userId)));
     }
 
+    // timezone is optional: omitted, this answers with every opted-in user regardless of zone. The
+    // hourly job needs that because the send hour is now per-user, so it can no longer narrow the
+    // sweep to "the zones where it is currently 08:00" - it takes the whole opt-in list once and
+    // matches each user's own hour itself. Supplying the param still filters to that single zone,
+    // which is what notification-service's manual trigger endpoint does.
     @GetMapping("/api/v1/internal/profiles/daily-summary-users")
-    public ResponseEntity<List<UserPreferenceResponse>> getUsersForDailySummary(@RequestParam String timezone) {
+    public ResponseEntity<List<UserPreferenceResponse>> getUsersForDailySummary(
+            @RequestParam(required = false) String timezone) {
         List<UserPreferenceResponse> users = preferenceService.getUsersForDailySummary(timezone).stream()
                 .map(responseMapper::toResponse)
                 .toList();

@@ -49,6 +49,7 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
 @SpringBootTest
@@ -59,9 +60,16 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
     "spring.datasource.username=sa",
     "spring.datasource.password=",
     "spring.jpa.hibernate.ddl-auto=create-drop",
-    "spring.autoconfigure.exclude=org.springframework.boot.autoconfigure.kafka.KafkaAutoConfiguration"
+    "spring.autoconfigure.exclude=org.springframework.boot.autoconfigure.kafka.KafkaAutoConfiguration",
+    // pinned here rather than relying on the filter's built-in dev default, so these tests keep
+    // asserting the same thing if that default is ever changed or overridden in a real environment
+    "application.security.internal-token=test-internal-token"
 })
 class AuthManagementTestSuite {
+
+    // the shared secret internal service-to-service callers present, see InternalTokenFilter
+    private static final String INTERNAL_TOKEN_HEADER = "X-Internal-Token";
+    private static final String INTERNAL_TOKEN = "test-internal-token";
 
     @Autowired
     private MockMvc mockMvc;
@@ -529,6 +537,279 @@ class AuthManagementTestSuite {
                 .andExpect(jsonPath("$.error").value("That email is already registered"));
 
         verify(kafkaTemplate, never()).send(eq("user-events"), any(String.class));
+    }
+
+    // the number is where that account's 2FA codes get sent, so a second account on the same phone
+    // would let whoever holds it complete either login
+    @Test
+    @DisplayName("Register: Duplicate Phone Number Rejected With Conflict - [MEANT TO FAIL]")
+    void testRegister_DuplicatePhoneNumber_Rejected() throws Exception {
+        given(userRepository.existsByUsername("newuser")).willReturn(false);
+        given(userRepository.existsByEmail("newuser@example.com")).willReturn(false);
+        given(userRepository.existsByPhoneNumber("+15712856947")).willReturn(true);
+
+        mockMvc.perform(post("/api/v1/auth/register")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"username\":\"newuser\",\"password\":\"SecurePass123!\",\"phoneNumber\":\"+15712856947\","
+                        + "\"email\":\"newuser@example.com\"}"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.error").value("That phone number is already registered"));
+
+        verify(userRepository, never()).save(any(User.class));
+        verify(kafkaTemplate, never()).send(eq("user-events"), any(String.class));
+    }
+
+    // the duplicate check runs on the normalized number, so the same phone typed in a different
+    // shape is still caught - checking the raw string would let this one through
+    @Test
+    @DisplayName("Register: Duplicate Phone In A Different Format Still Rejected - [MEANT TO FAIL]")
+    void testRegister_DuplicatePhoneDifferentFormat_Rejected() throws Exception {
+        given(userRepository.existsByUsername("newuser")).willReturn(false);
+        given(userRepository.existsByEmail("newuser@example.com")).willReturn(false);
+        given(userRepository.existsByPhoneNumber("+15712856947")).willReturn(true);
+
+        mockMvc.perform(post("/api/v1/auth/register")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"username\":\"newuser\",\"password\":\"SecurePass123!\",\"phoneNumber\":\"(571) 285-6947\","
+                        + "\"email\":\"newuser@example.com\"}"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.error").value("That phone number is already registered"));
+
+        verify(userRepository, never()).save(any(User.class));
+        verify(kafkaTemplate, never()).send(eq("user-events"), any(String.class));
+    }
+
+    // ==========================================
+    // Internal Phone Number API (profile-service)
+    // ==========================================
+
+    // profile-service used to own its own copy of the number, which meant the KYC identity form
+    // could change it while 2FA codes kept going to the value stored here. These tests pin the
+    // contract it now calls instead.
+
+    // the number is the destination for 2FA codes, so letting a second account claim one already in
+    // use would hand whoever holds the phone a way into the first account's login - exactly what the
+    // register endpoint already refuses, now refused on the update path too
+    @Test
+    @DisplayName("Internal Phone: Update To A Number Held By Another User Rejected With Conflict - [MEANT TO FAIL]")
+    void testInternalPhone_NumberHeldByAnotherUser_Rejected() throws Exception {
+        User otherUser = mock(User.class);
+        given(otherUser.getId()).willReturn(2L);
+        given(userRepository.findById(1L)).willReturn(Optional.of(mockUser));
+        given(userRepository.findByPhoneNumber("+15712856947")).willReturn(Optional.of(otherUser));
+
+        mockMvc.perform(put("/api/v1/internal/users/1/phone-number")
+                .header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"phoneNumber\":\"+15712856947\"}"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.error").value("That phone number is already registered"));
+
+        verify(userRepository, never()).save(any(User.class));
+    }
+
+    // the identity form re-submits every field on every save, so the user's own unchanged number
+    // arrives here constantly - a plain "is this number taken" check would answer yes and make the
+    // form impossible to save without also editing the phone field
+    @Test
+    @DisplayName("Internal Phone: Re-submitting The User's Own Current Number Succeeds - [MEANT TO PASS]")
+    void testInternalPhone_OwnUnchangedNumber_Accepted() throws Exception {
+        given(userRepository.findById(1L)).willReturn(Optional.of(mockUser));
+        given(userRepository.findByPhoneNumber("+15551234567")).willReturn(Optional.of(mockUser));
+
+        mockMvc.perform(put("/api/v1/internal/users/1/phone-number")
+                .header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"phoneNumber\":\"+15551234567\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.phoneNumber").value("+15551234567"));
+
+        verify(userRepository).save(mockUser);
+    }
+
+    // same rule registration applies: the SMS provider only accepts E.164, so what the user typed
+    // into the KYC form is converted before it is stored rather than saved as-is
+    @Test
+    @DisplayName("Internal Phone: Update Stores E.164 Regardless Of Typed Format - [MEANT TO PASS]")
+    void testInternalPhone_NormalizesBeforeStoring() throws Exception {
+        given(userRepository.findById(1L)).willReturn(Optional.of(mockUser));
+        given(userRepository.findByPhoneNumber("+15712856947")).willReturn(Optional.empty());
+
+        mockMvc.perform(put("/api/v1/internal/users/1/phone-number")
+                .header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"phoneNumber\":\"(571) 285-6947\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.phoneNumber").value("+15712856947"));
+
+        verify(mockUser).setPhoneNumber("+15712856947");
+        verify(userRepository).save(mockUser);
+    }
+
+    // refused rather than stored: overwriting a working number with one that can't be resolved
+    // would leave the account unable to complete a 2FA login, with nothing to indicate why
+    @Test
+    @DisplayName("Internal Phone: Unresolvable Number Rejected And Nothing Saved - [MEANT TO FAIL]")
+    void testInternalPhone_UnresolvableNumber_Rejected() throws Exception {
+        given(userRepository.findById(1L)).willReturn(Optional.of(mockUser));
+
+        mockMvc.perform(put("/api/v1/internal/users/1/phone-number")
+                .header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"phoneNumber\":\"285-6947\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error")
+                        .value("Please enter a valid phone number, e.g. 571-285-6947 or +15712856947"));
+
+        verify(userRepository, never()).save(any(User.class));
+    }
+
+    // profile-service reads the number back from here rather than from its own row, so this is the
+    // single value the KYC form displays and the one 2FA actually sends to
+    @Test
+    @DisplayName("Internal Phone: Lookup Returns The Number On File - [MEANT TO PASS]")
+    void testInternalPhone_LookupReturnsStoredNumber() throws Exception {
+        given(userRepository.findById(1L)).willReturn(Optional.of(mockUser));
+
+        mockMvc.perform(get("/api/v1/internal/users/1/phone-number")
+                .header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.phoneNumber").value("+15551234567"));
+    }
+
+    @Test
+    @DisplayName("Internal Phone: Lookup For Unknown User Returns Not Found - [MEANT TO FAIL]")
+    void testInternalPhone_LookupUnknownUser_NotFound() throws Exception {
+        given(userRepository.findById(404L)).willReturn(Optional.empty());
+
+        mockMvc.perform(get("/api/v1/internal/users/404/phone-number")
+                .header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN))
+                .andExpect(status().isNotFound());
+    }
+
+    // ==========================================
+    // Internal Endpoint Shared-Secret Gate (InternalTokenFilter)
+    // ==========================================
+
+    // The whole /api/v1/internal/ prefix used to be reachable by anyone who could send it a packet -
+    // the k8s ingress not routing the prefix was the only thing in the way. These pin the second
+    // layer: the caller has to present the shared secret as well.
+
+    // the PUT behind this prefix rewrites the number 2FA codes are delivered to, so an unauthorized
+    // caller reaching the controller at all is an account takeover - the request has to be turned
+    // away in the filter, before anything reads or writes the user row
+    @Test
+    @DisplayName("Internal Auth: Update Without Internal Token Rejected Before Reaching Repository - [MEANT TO FAIL]")
+    void testInternalAuth_MissingToken_RejectedAndRepositoryUntouched() throws Exception {
+        mockMvc.perform(put("/api/v1/internal/users/1/phone-number")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"phoneNumber\":\"+15712856947\"}"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error").exists())
+                .andExpect(jsonPath("$.message").exists());
+
+        verify(userRepository, never()).findById(any());
+        verify(userRepository, never()).findByPhoneNumber(any(String.class));
+        verify(userRepository, never()).save(any(User.class));
+    }
+
+    // the read is gated on the same terms as the write - the number itself is worth protecting,
+    // since knowing where a victim's 2FA codes land is the first half of intercepting them
+    @Test
+    @DisplayName("Internal Auth: Lookup Without Internal Token Rejected - [MEANT TO FAIL]")
+    void testInternalAuth_MissingTokenOnLookup_Rejected() throws Exception {
+        mockMvc.perform(get("/api/v1/internal/users/1/phone-number"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error").exists())
+                .andExpect(jsonPath("$.message").exists());
+
+        verify(userRepository, never()).findById(any());
+    }
+
+    // a wrong secret is answered exactly like a missing one, and the body names neither the header
+    // nor the property - a caller guessing at the scheme should learn nothing from the rejection
+    @Test
+    @DisplayName("Internal Auth: Wrong Internal Token Rejected Without Revealing The Scheme - [MEANT TO FAIL]")
+    void testInternalAuth_WrongToken_Rejected() throws Exception {
+        String body = mockMvc.perform(put("/api/v1/internal/users/1/phone-number")
+                .header(INTERNAL_TOKEN_HEADER, "not-the-real-token")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"phoneNumber\":\"+15712856947\"}"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error").exists())
+                .andExpect(jsonPath("$.message").exists())
+                .andReturn().getResponse().getContentAsString();
+
+        assertThat(body).doesNotContain(INTERNAL_TOKEN_HEADER);
+        assertThat(body).doesNotContain("internal-token");
+
+        verify(userRepository, never()).save(any(User.class));
+    }
+
+    // the gate is only a gate if the legitimate caller still gets through unchanged - profile-service
+    // presents the secret and gets the same 200 and the same body it did before any of this existed
+    @Test
+    @DisplayName("Internal Auth: Lookup With Correct Internal Token Returns The Number As Before - [MEANT TO PASS]")
+    void testInternalAuth_ValidToken_LookupSucceeds() throws Exception {
+        given(userRepository.findById(1L)).willReturn(Optional.of(mockUser));
+
+        mockMvc.perform(get("/api/v1/internal/users/1/phone-number")
+                .header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.phoneNumber").value("+15551234567"));
+    }
+
+    @Test
+    @DisplayName("Internal Auth: Update With Correct Internal Token Still Saves The Number - [MEANT TO PASS]")
+    void testInternalAuth_ValidToken_UpdateSucceeds() throws Exception {
+        given(userRepository.findById(1L)).willReturn(Optional.of(mockUser));
+        given(userRepository.findByPhoneNumber("+15712856947")).willReturn(Optional.empty());
+
+        mockMvc.perform(put("/api/v1/internal/users/1/phone-number")
+                .header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"phoneNumber\":\"+15712856947\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.phoneNumber").value("+15712856947"));
+
+        verify(userRepository).save(mockUser);
+    }
+
+    // the filter has to be scoped to the internal prefix and nothing else - real customers never send
+    // this header, so demanding it anywhere else would lock every one of them out of the app. Covers
+    // both a public endpoint and a JWT-authenticated one, since they take different paths through
+    // the chain.
+    @Test
+    @DisplayName("Internal Auth: Customer Endpoints Still Work With No Internal Token Header - [MEANT TO PASS]")
+    void testInternalAuth_CustomerEndpointsUnaffected() throws Exception {
+        given(userRepository.existsByUsername("newuser")).willReturn(false);
+
+        mockMvc.perform(post("/api/v1/auth/register")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"username\":\"newuser\",\"password\":\"SecurePass123!\",\"phoneNumber\":\"+15551234567\","
+                        + "\"email\":\"newuser@example.com\"}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.status").value("SUCCESS"));
+
+        String fullAuthToken = jwtService.generateToken(mockUser, TokenType.FULL_AUTH);
+
+        mockMvc.perform(post("/api/v1/auth/logout")
+                .header("Authorization", "Bearer " + fullAuthToken))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.message").value("Logged out successfully"));
+    }
+
+    // and the PRE_AUTH boundary the JWT filter enforces is untouched by the new filter sitting in
+    // front of it - a half-authenticated token is still refused everything except 2FA verification
+    @Test
+    @DisplayName("Internal Auth: PRE_AUTH Boundary Still Enforced With The Internal Filter In The Chain - [MEANT TO FAIL]")
+    void testInternalAuth_PreAuthBoundaryStillEnforced() throws Exception {
+        String preAuthToken = jwtService.generateToken(mockUser, TokenType.PRE_AUTH);
+
+        mockMvc.perform(post("/api/v1/auth/logout")
+                .header("Authorization", "Bearer " + preAuthToken))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.error").value("Partial authentication. 2FA verification required."));
     }
 
     private String hashString(String input) {

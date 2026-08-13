@@ -87,12 +87,23 @@ email:
     # Has to be an address verified as a sender in SendGrid, or every send is rejected.
     from-email: ${SENDGRID_FROM_EMAIL:}
 
-# DailyBalanceSummaryJob's hourly cron sweeps for timezones whose local time is currently this hour
-# and mails the opted-in users there. Configurable purely so it can be pointed at the current hour
-# to watch the scheduled path run for real, instead of waiting until 8am somewhere relevant.
-notification:
-  daily-summary:
-    hour: ${DAILY_SUMMARY_HOUR:8}
+# notification.daily-summary.hour used to live here, one global hour the whole bank's summaries fired
+# at. Each user now picks their own hour and it arrives on their preferences record, so a global
+# override could only do harm: it would either be ignored or force every customer back onto one hour,
+# which is the exact thing the per-user setting exists to end. The way to watch the job run without
+# waiting for someone's morning is the manual trigger,
+# POST /api/v1/internal/notifications/daily-summary/run, which skips the hour check entirely.
 
 server:
   port: 8085
+
+application:
+  security:
+    # Shared secret required on every /api/v1/internal/** request (InternalTokenFilter) and attached
+    # to every internal call this service makes out (FeignInternalTokenConfig). The property name,
+    # header and dev default are identical in all five services - it is a contract between them, so
+    # changing it here alone locks this service out of the others and them out of this one.
+    # Declared in the base config rather than only in the prod profile so the env var is picked up
+    # under any profile; the literal fallback keeps docker-compose working with zero configuration
+    # while a real deployment sets INTERNAL_SERVICE_TOKEN from the same k8s secret everywhere.
+    internal-token: ${INTERNAL_SERVICE_TOKEN:local-dev-internal-token}

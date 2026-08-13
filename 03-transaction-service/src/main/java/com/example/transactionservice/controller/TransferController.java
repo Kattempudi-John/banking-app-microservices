@@ -94,20 +94,28 @@ public class TransferController {
             @NotNull @Positive BigDecimal amount
     ) {}
 
-    public record RecipientPreviewDto(String maskedAccountNumber, String accountType, String displayName) {}
+    // verified says whether a transfer to this recipient would actually be accepted - assembled here
+    // from transaction-service's own KYC check, so account-service keeps knowing nothing about KYC.
+    // A bare boolean rather than the real status: the UI only needs "can they be paid", and the
+    // sender has no business seeing someone else's verification standing.
+    public record RecipientPreviewDto(String maskedAccountNumber, String accountType, String displayName,
+                                      boolean verified) {}
 
     // Read-only lookup the Transfer page calls as soon as a recipient account number is entered, so the
     // sender can confirm who they're paying before any money moves. Intentionally does NOT carry
     // @RequiresKyc - looking up a name moves no funds, and failing this with a KYC error would be
     // confusing. It leaks nothing beyond a name and a masked number, both of which the sender needs
     // to have been told by the recipient already.
+    // For the same reason an unverified recipient answers 200 with verified=false instead of the 403
+    // the send itself would give: this is where the frontend warns, not where it blocks.
     @GetMapping("/recipients/{accountNumber}")
     public ResponseEntity<RecipientPreviewDto> previewRecipient(@PathVariable String accountNumber) {
         var recipient = transferService.resolveRecipient(accountNumber);
         String displayName = transferService.resolveRecipientName(recipient.ownerUserId());
+        boolean verified = transferService.isRecipientVerified(recipient.ownerUserId());
 
         return ResponseEntity.ok(new RecipientPreviewDto(
-                recipient.maskedAccountNumber(), recipient.accountType(), displayName));
+                recipient.maskedAccountNumber(), recipient.accountType(), displayName, verified));
     }
 
     @PostMapping("/to-recipient")

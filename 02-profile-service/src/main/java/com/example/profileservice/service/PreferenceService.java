@@ -21,6 +21,12 @@ public class PreferenceService {
     private static final BigDecimal DEFAULT_ALERT_THRESHOLD = new BigDecimal("100.00");
     private static final boolean DEFAULT_DAILY_SUMMARY_ENABLED = false;
     private static final String DEFAULT_TIMEZONE = "UTC";
+    // 8 is what notification.daily-summary.hour shipped as when the send hour was one global config
+    // value, so a user who never picks an hour keeps being emailed at exactly the time they are now.
+    // Same number as V6__Add_Daily_Summary_Hour.sql's column default, for the same reason as above.
+    // Public because UserPreferenceResponseMapper answers with the same value for a row that predates
+    // the column, so the two cannot disagree about what "never chose an hour" means.
+    public static final int DEFAULT_DAILY_SUMMARY_HOUR = 8;
 
     private final PreferenceRepository preferenceRepository;
 
@@ -40,7 +46,8 @@ public class PreferenceService {
 
     @Transactional
     @CacheEvict(value = "user-preferences", key = "#userId")
-    public void updateDailySummarySettings(Long userId, Boolean dailySummaryEnabled, String timezone) {
+    public void updateDailySummarySettings(Long userId, Boolean dailySummaryEnabled, String timezone,
+                                           Integer dailySummaryHour) {
         // Strict Domain Validation: Ensure the timezone is a valid IANA identifier.
         try {
             ZoneId.of(timezone);
@@ -51,6 +58,12 @@ public class PreferenceService {
         UserPreferenceEntity entity = findOrCreateDefault(userId);
         entity.setDailySummaryEnabled(dailySummaryEnabled);
         entity.setTimezone(timezone);
+        // A null hour is "the caller did not mention the hour", so whatever the user already chose
+        // stands - overwriting it with the default here would quietly move the send time of anyone
+        // whose client only knows how to send the toggle and the timezone.
+        if (dailySummaryHour != null) {
+            entity.setDailySummaryHour(dailySummaryHour);
+        }
         preferenceRepository.save(entity);
     }
 
@@ -65,8 +78,17 @@ public class PreferenceService {
         return preferenceRepository.findByUserId(userId).orElseGet(() -> buildDefault(userId));
     }
 
+    // A null/blank timezone means "every opted-in user, whatever their zone". Now that each user
+    // picks their own hour, the caller can no longer work out which timezones are currently at the
+    // send hour and ask for just those - every zone is a potential match on every sweep, so the job
+    // fetches the opt-ins once and compares each user's own hour locally instead of issuing one
+    // request per zone. Passing a timezone still filters exactly as it always did, because
+    // notification-service's manual trigger endpoint still asks for a single zone.
     @Transactional(readOnly = true)
     public List<UserPreferenceEntity> getUsersForDailySummary(String timezone) {
+        if (timezone == null || timezone.isBlank()) {
+            return preferenceRepository.findByDailySummaryEnabledTrue();
+        }
         return preferenceRepository.findByDailySummaryEnabledTrueAndTimezone(timezone);
     }
 
@@ -76,6 +98,7 @@ public class PreferenceService {
         newEntity.setAlertThresholdAmount(DEFAULT_ALERT_THRESHOLD);
         newEntity.setDailySummaryEnabled(DEFAULT_DAILY_SUMMARY_ENABLED);
         newEntity.setTimezone(DEFAULT_TIMEZONE);
+        newEntity.setDailySummaryHour(DEFAULT_DAILY_SUMMARY_HOUR);
         return newEntity;
     }
 }

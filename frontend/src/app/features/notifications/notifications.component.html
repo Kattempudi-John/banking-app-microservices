@@ -5,6 +5,46 @@
     <h1>Notifications</h1>
   </div>
 
+  <div class="filters">
+    <div class="select-group">
+      <label for="typeFilter">Type</label>
+      <select id="typeFilter" [value]="typeFilter()" (change)="onTypeFilterChange($any($event.target).value)">
+        <option value="">All</option>
+        <option value="SMS_2FA">SMS 2FA</option>
+        <option value="TRANSACTION_ALERT">Transaction Alert</option>
+        <option value="PROFILE_SECURITY">Profile Security</option>
+        <option value="DAILY_SUMMARY">Daily Summary</option>
+      </select>
+    </div>
+    <div class="select-group">
+      <label for="channelFilter">Channel</label>
+      <select id="channelFilter" [value]="channelFilter()" (change)="onChannelFilterChange($any($event.target).value)">
+        <option value="">All</option>
+        <option value="SMS">SMS</option>
+        <option value="EMAIL">Email</option>
+      </select>
+    </div>
+    <div class="select-group">
+      <label for="statusFilter">Status</label>
+      <select id="statusFilter" [value]="statusFilter()" (change)="onStatusFilterChange($any($event.target).value)">
+        <option value="">All</option>
+        <option value="SENT">Sent</option>
+        <option value="FAILED">Failed</option>
+      </select>
+    </div>
+    <div class="select-group">
+      <label for="fromFilter">From</label>
+      <input id="fromFilter" type="date" [value]="fromFilter()" (change)="onFromChange($any($event.target).value)" />
+    </div>
+    <div class="select-group">
+      <label for="toFilter">To</label>
+      <input id="toFilter" type="date" [value]="toFilter()" (change)="onToChange($any($event.target).value)" />
+    </div>
+    <div class="filter-actions">
+      <app-button variant="secondary" [disabled]="!hasActiveFilters()" (clicked)="clearFilters()">Clear filters</app-button>
+    </div>
+  </div>
+
   @if (error()) {
     <div class="card stack">
       <p class="text-muted">Unable to load your notifications.</p>
@@ -12,7 +52,11 @@
     </div>
   } @else if (notifications().length === 0) {
     <div class="card">
-      <p class="text-muted">No notifications yet.</p>
+      @if (hasActiveFilters()) {
+        <p class="text-muted">No notifications match these filters.</p>
+      } @else {
+        <p class="text-muted">No notifications yet.</p>
+      }
     </div>
   } @else {
     <div class="card table-card">

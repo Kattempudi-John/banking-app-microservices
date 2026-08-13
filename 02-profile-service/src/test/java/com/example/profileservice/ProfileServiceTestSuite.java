@@ -1,5 +1,6 @@
 package com.example.profileservice;
 
+import com.example.profileservice.client.AuthServiceClient;
 import com.example.profileservice.dto.UpdateAlertThresholdRequestDto;
 import com.example.profileservice.dto.UpdateContactInfoRequestDto;
 import com.example.profileservice.dto.UpdateDailySummaryRequestDto;
@@ -15,6 +16,8 @@ import com.example.profileservice.service.ProfileManagementService.KycStatusUpda
 import com.example.profileservice.service.ProfileManagementService.ProfileUpdatedEvent;
 import com.example.profileservice.service.UserRegisteredListener;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import feign.RequestInterceptor;
+import feign.RequestTemplate;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -23,12 +26,17 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.security.core.GrantedAuthority;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.test.context.support.WithMockUser;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.web.server.ResponseStatusException;
+
+import org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.JwtRequestPostProcessor;
 
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.jwt;
 
@@ -48,6 +56,11 @@ import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.BDDMockito.given;
+// willX(...).given(mock).method(...) rather than given(mock.method(...)).willX(...) wherever the
+// setUp stub is being replaced: the given(mock.method(...)) form actually calls the mock, which
+// would run setUp's answer with null arguments before the new stub is even installed.
+import static org.mockito.BDDMockito.willReturn;
+import static org.mockito.BDDMockito.willThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.times;
@@ -63,9 +76,18 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
     "spring.datasource.password=",
     "spring.jpa.hibernate.ddl-auto=create-drop",
     "spring.autoconfigure.exclude=org.springframework.boot.autoconfigure.kafka.KafkaAutoConfiguration,org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration,org.springframework.boot.autoconfigure.data.redis.RedisRepositoriesAutoConfiguration",
-    "kyc.vendor.webhook.secret=SuperSecretVendorKey123!"
+    "kyc.vendor.webhook.secret=SuperSecretVendorKey123!",
+    // Deliberately NOT the dev default baked into InternalTokenFilter/FeignInternalTokenConfig. If
+    // the tests used the default value they would still pass against a filter that ignored the
+    // property entirely and compared against a hardcoded constant - which is exactly the bug that
+    // would leave prod running on the dev token.
+    "application.security.internal-token=test-internal-token"
 })
 class ProfileServiceTestSuite {
+
+    // What the five services agree on: the header name, and that it carries this property's value.
+    private static final String INTERNAL_TOKEN_HEADER = "X-Internal-Token";
+    private static final String INTERNAL_TOKEN = "test-internal-token";
 
     @Autowired
     private MockMvc mockMvc;
@@ -79,6 +101,12 @@ class ProfileServiceTestSuite {
     @Autowired
     private UserRegisteredListener userRegisteredListener;
 
+    // The outbound half of the internal-token change. Feign applies this to every request it sends,
+    // so it is testable on its own against a bare RequestTemplate - no mock HTTP server, and no
+    // relying on the @MockBean AuthServiceClient below, which never reaches Feign's machinery at all.
+    @Autowired
+    private RequestInterceptor internalTokenRequestInterceptor;
+
     @MockBean
     private UserProfileRepository userProfileRepository;
 
@@ -90,6 +118,11 @@ class ProfileServiceTestSuite {
 
     @MockBean
     private KafkaTemplate<String, Object> kafkaTemplate;
+
+    // auth-service owns the phone number now, so every contact-info test goes through this.
+    // Mocked, not called for real - these tests never need a live auth-service on 8081.
+    @MockBean
+    private AuthServiceClient authServiceClient;
 
     private UserProfile mockUser;
 
@@ -107,6 +140,17 @@ class ProfileServiceTestSuite {
         mockUser.setState("NY");
         mockUser.setZipCode("10001");
         mockUser.setKycStatus(KycStatus.PENDING_VERIFICATION);
+
+        // Default stand-in for a healthy auth-service accepting the number: it echoes back what was
+        // submitted, which is what really happens when the submitted value is already E.164 and
+        // belongs to nobody else. Individual tests override this to make it conflict, reject, or
+        // return a differently-formatted number.
+        given(authServiceClient.updatePhoneNumber(any(), any())).willAnswer(invocation -> {
+            AuthServiceClient.UpdatePhoneNumberRequest request = invocation.getArgument(1);
+            return new AuthServiceClient.PhoneNumberResponse(request.phoneNumber());
+        });
+        given(authServiceClient.getPhoneNumber(any()))
+                .willReturn(new AuthServiceClient.PhoneNumberResponse("+14155552671"));
     }
 
     // a user can hold valid credentials in auth-service and still have no profile row here, if the
@@ -122,7 +166,8 @@ class ProfileServiceTestSuite {
         given(userProfileRepository.findById(999L)).willReturn(Optional.empty());
         given(userProfileRepository.save(any(UserProfile.class))).willAnswer(invocation -> invocation.getArgument(0));
 
-        mockMvc.perform(get("/api/v1/internal/profiles/999/kyc-status"))
+        mockMvc.perform(get("/api/v1/internal/profiles/999/kyc-status")
+                .header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("PENDING_VERIFICATION"));
 
@@ -143,7 +188,8 @@ class ProfileServiceTestSuite {
     void testFinalAC_GetKycStatus_ReturnsCurrentPendingState() throws Exception {
         given(userProfileRepository.findById(100L)).willReturn(Optional.of(mockUser));
 
-        mockMvc.perform(get("/api/v1/internal/profiles/100/kyc-status"))
+        mockMvc.perform(get("/api/v1/internal/profiles/100/kyc-status")
+                .header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("PENDING_VERIFICATION"));
     }
@@ -351,7 +397,7 @@ class ProfileServiceTestSuite {
         dto.setZipCode("95110");
 
         mockMvc.perform(put("/api/v1/profiles/me/contact-info")
-                .with(jwt().jwt(j -> j.claim("userId", 100L)))
+                .with(fullAuthToken(100L))
                 .contentType(MediaType.APPLICATION_JSON)
                 .content(objectMapper.writeValueAsString(dto)))
                 .andExpect(status().isOk())
@@ -390,7 +436,7 @@ class ProfileServiceTestSuite {
         dto.setZipCode("95110");
 
         mockMvc.perform(put("/api/v1/profiles/me/contact-info")
-                .with(jwt().jwt(j -> j.claim("userId", 100L)))
+                .with(fullAuthToken(100L))
                 .contentType(MediaType.APPLICATION_JSON)
                 .content(objectMapper.writeValueAsString(dto)))
                 .andExpect(status().isOk())
@@ -417,7 +463,7 @@ class ProfileServiceTestSuite {
         dto.setZipCode("95110");
 
         mockMvc.perform(put("/api/v1/profiles/me/contact-info")
-                .with(jwt().jwt(j -> j.claim("userId", 100L)))
+                .with(fullAuthToken(100L))
                 .contentType(MediaType.APPLICATION_JSON)
                 .content(objectMapper.writeValueAsString(dto)))
                 .andExpect(status().isBadRequest());
@@ -438,10 +484,290 @@ class ProfileServiceTestSuite {
         dto.setZipCode("95110");
 
         mockMvc.perform(put("/api/v1/profiles/me/contact-info")
-                .with(jwt().jwt(j -> j.claim("userId", 100L)))
+                .with(fullAuthToken(100L))
                 .contentType(MediaType.APPLICATION_JSON)
                 .content(objectMapper.writeValueAsString(dto)))
                 .andExpect(status().isBadRequest());
+    }
+
+    // ==========================================
+    // Half-authenticated sessions (a correct password, no 2FA code yet)
+    // ==========================================
+
+    // The account-takeover this endpoint's @PreAuthorize exists to stop, reproduced end to end: log in
+    // with a stolen password from an unrecognised device, take the PRE_AUTH token auth-service answers
+    // with instead of finishing 2FA, and put a new phone number on the identity form. It used to
+    // answer 200 APPROVED and write the attacker's number through to auth-service's users table -
+    // which is where 2FA codes are delivered from, so the second factor moved to the attacker and the
+    // password alone became the whole account.
+    @Test
+    @DisplayName("Block: PUT contact-info Is Forbidden To A PRE_AUTH Token And Never Moves The 2FA Phone Number - [MEANT TO FAIL]")
+    void testUpdateContactInfo_PreAuthTokenBeforeTwoFactor_IsForbiddenAndChangesNothing() throws Exception {
+        given(userProfileRepository.findById(100L)).willReturn(Optional.of(mockUser));
+
+        UpdateContactInfoRequestDto dto = identityDtoWithPhone("+15550009999");
+
+        mockMvc.perform(put("/api/v1/profiles/me/contact-info")
+                .with(preAuthToken(100L))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(dto)))
+                .andExpect(status().isForbidden());
+
+        // The call auth-service is on the other end of is the one that matters most here: it must not
+        // have happened at all, because that is the write that redirects the victim's login codes. A
+        // 403 with the phone number already moved would be no fix.
+        verify(authServiceClient, never()).updatePhoneNumber(any(), any());
+        verify(authServiceClient, never()).getPhoneNumber(any());
+
+        // and nothing local either - not saved, not broadcast, and above all not approved
+        verify(userProfileRepository, never()).save(any(UserProfile.class));
+        verify(kafkaTemplate, never()).send(any(), any(), any());
+        assertThat(mockUser.getKycStatus()).isEqualTo(KycStatus.PENDING_VERIFICATION);
+        assertThat(mockUser.getPhoneNumber()).isEqualTo("+14155552671");
+        assertThat(mockUser.getLegalName()).isNull();
+    }
+
+    // the other half of that rule: the fix is a check on the session, not on the endpoint. A user who
+    // did finish 2FA still submits this form exactly as before.
+    @Test
+    @DisplayName("Block: PUT contact-info Still Succeeds Once 2FA Is Complete (FULL_AUTH Token) - [MEANT TO PASS]")
+    void testUpdateContactInfo_FullAuthTokenAfterTwoFactor_StillSucceeds() throws Exception {
+        given(userProfileRepository.findById(100L)).willReturn(Optional.of(mockUser));
+
+        UpdateContactInfoRequestDto dto = identityDtoWithPhone("+12025550143");
+
+        mockMvc.perform(put("/api/v1/profiles/me/contact-info")
+                .with(fullAuthToken(100L))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(dto)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.kycStatus").value("APPROVED"));
+
+        verify(authServiceClient).updatePhoneNumber(eq(100L), any());
+        assertThat(mockUser.getPhoneNumber()).isEqualTo("+12025550143");
+    }
+
+    // The rest of the customer-facing surface, pinned so the gap that opened on contact-info cannot
+    // quietly reopen on a neighbour. Each of these already required SCOPE_FULL_AUTH; these tests are
+    // what makes that a rule the suite enforces rather than a detail someone has to notice.
+    @Test
+    @DisplayName("Block: GET contact-info Is Forbidden To A PRE_AUTH Token - [MEANT TO FAIL]")
+    void testGetMyContactInfo_PreAuthToken_IsForbidden() throws Exception {
+        mockMvc.perform(get("/api/v1/profiles/me/contact-info")
+                .with(preAuthToken(100L)))
+                .andExpect(status().isForbidden());
+
+        verify(authServiceClient, never()).getPhoneNumber(any());
+    }
+
+    @Test
+    @DisplayName("Block: GET /profiles/me/kyc-status Is Forbidden To A PRE_AUTH Token - [MEANT TO FAIL]")
+    void testGetMyKycStatus_PreAuthToken_IsForbidden() throws Exception {
+        mockMvc.perform(get("/api/v1/profiles/me/kyc-status")
+                .with(preAuthToken(100L)))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    @DisplayName("Block: Alert preference writes are forbidden to a PRE_AUTH token - [MEANT TO FAIL]")
+    void testUpdateAlertThreshold_PreAuthToken_IsForbidden() throws Exception {
+        UpdateAlertThresholdRequestDto dto = new UpdateAlertThresholdRequestDto(new BigDecimal("250.00"));
+
+        mockMvc.perform(put("/api/v1/profile/alerts/threshold")
+                .with(preAuthToken(100L))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(dto)))
+                .andExpect(status().isForbidden());
+
+        verify(preferenceRepository, never()).save(any());
+    }
+
+    // this response carries the user's email address, so a session that has not finished proving who
+    // it is does not get to read it
+    @Test
+    @DisplayName("Block: GET alerts/me Is Forbidden To A PRE_AUTH Token - [MEANT TO FAIL]")
+    void testGetMyPreferences_PreAuthToken_IsForbidden() throws Exception {
+        mockMvc.perform(get("/api/v1/profile/alerts/me")
+                .with(preAuthToken(100L)))
+                .andExpect(status().isForbidden());
+    }
+
+    // ==========================================
+    // Phone number ownership (auth-service is the owner, this service mirrors)
+    // ==========================================
+
+    // the bug this whole change exists for: signup already answers 409 for a number someone else
+    // holds, but this form used to write the number straight into the local table with no check at
+    // all, so it was a way around that rule - and it handed out a KYC approval on the way past
+    @Test
+    @DisplayName("Block: Contact Info Update Is Rejected When The Phone Number Belongs To Another User - [MEANT TO FAIL]")
+    void testUpdateContactInfo_PhoneNumberHeldByAnotherUser_ReturnsConflictAndPersistsNothing() throws Exception {
+        given(userProfileRepository.findById(100L)).willReturn(Optional.of(mockUser));
+        willThrow(new ResponseStatusException(HttpStatus.CONFLICT, "That phone number is already registered"))
+                .given(authServiceClient).updatePhoneNumber(eq(100L), any());
+
+        UpdateContactInfoRequestDto dto = identityDtoWithPhone("+15550001111");
+
+        mockMvc.perform(put("/api/v1/profiles/me/contact-info")
+                .with(fullAuthToken(100L))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(dto)))
+                .andExpect(status().isConflict());
+
+        // nothing saved, nothing broadcast, and above all not approved - an identity claimed on
+        // someone else's phone number is the exact submission that must not clear KYC
+        verify(userProfileRepository, never()).save(any(UserProfile.class));
+        verify(kafkaTemplate, never()).send(any(), any(), any());
+        assertThat(mockUser.getKycStatus()).isEqualTo(KycStatus.PENDING_VERIFICATION);
+        assertThat(mockUser.getPhoneNumber()).isEqualTo("+14155552671");
+        assertThat(mockUser.getLegalName()).isNull();
+    }
+
+    // the other half of that rule: your own unchanged number is not a conflict, otherwise nobody
+    // could ever correct their address without also being forced to change their phone number
+    @Test
+    @DisplayName("Block: Re-Submitting Your Own Unchanged Phone Number Succeeds - [MEANT TO PASS]")
+    void testUpdateContactInfo_ResubmittingOwnPhoneNumber_Succeeds() throws Exception {
+        given(userProfileRepository.findById(100L)).willReturn(Optional.of(mockUser));
+
+        UpdateContactInfoRequestDto dto = identityDtoWithPhone("+14155552671");
+
+        mockMvc.perform(put("/api/v1/profiles/me/contact-info")
+                .with(fullAuthToken(100L))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(dto)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.kycStatus").value("APPROVED"));
+
+        assertThat(mockUser.getPhoneNumber()).isEqualTo("+14155552671");
+    }
+
+    // the stored value is whatever auth-service answered with, not the result of normalizing the
+    // input a second time here - one owner of the format, so the two copies cannot drift
+    @Test
+    @DisplayName("Block: Stored Phone Number Is The E.164 Value auth-service Returned - [MEANT TO PASS]")
+    void testUpdateContactInfo_StoresTheNormalizedNumberAuthServiceReturned() throws Exception {
+        given(userProfileRepository.findById(100L)).willReturn(Optional.of(mockUser));
+        willReturn(new AuthServiceClient.PhoneNumberResponse("+15712856947"))
+                .given(authServiceClient).updatePhoneNumber(eq(100L), any());
+
+        UpdateContactInfoRequestDto dto = identityDtoWithPhone("571-285-6947");
+
+        mockMvc.perform(put("/api/v1/profiles/me/contact-info")
+                .with(fullAuthToken(100L))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(dto)))
+                .andExpect(status().isOk());
+
+        // the raw string the user typed is what goes out to auth-service, since it is the one doing
+        // the normalizing and the uniqueness check
+        verify(authServiceClient).updatePhoneNumber(eq(100L),
+                argThat(request -> "571-285-6947".equals(request.phoneNumber())));
+        assertThat(mockUser.getPhoneNumber()).isEqualTo("+15712856947");
+    }
+
+    // auth-service's own wording for an unusable number is passed straight through, so the user is
+    // told the same thing here as they would be told at signup
+    @Test
+    @DisplayName("Block: Contact Info Update Surfaces auth-service's 400 For An Unresolvable Number - [MEANT TO FAIL]")
+    void testUpdateContactInfo_AuthServiceRejectsNumber_ReturnsBadRequest() throws Exception {
+        given(userProfileRepository.findById(100L)).willReturn(Optional.of(mockUser));
+        willThrow(new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                "Please enter a valid phone number, e.g. 571-285-6947 or +15712856947"))
+                .given(authServiceClient).updatePhoneNumber(eq(100L), any());
+
+        // passes the DTO's loose "looks like a phone number" pattern, so it reaches auth-service and
+        // is refused there - which is the branch under test
+        UpdateContactInfoRequestDto dto = identityDtoWithPhone("+1 234 5");
+
+        mockMvc.perform(put("/api/v1/profiles/me/contact-info")
+                .with(fullAuthToken(100L))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(dto)))
+                .andExpect(status().isBadRequest());
+
+        verify(userProfileRepository, never()).save(any(UserProfile.class));
+        assertThat(mockUser.getKycStatus()).isEqualTo(KycStatus.PENDING_VERIFICATION);
+    }
+
+    // a connection failure reaches feign as a RetryableException, never touching the error decoder -
+    // the point of this test is that "auth-service is down" fails the submission rather than falling
+    // back to saving locally, which would approve a user on a number nobody ever verified
+    @Test
+    @DisplayName("Block: auth-service Being Unreachable Does Not Save Or Approve Anything - [MEANT TO FAIL]")
+    void testUpdateContactInfo_AuthServiceUnreachable_DoesNotApprove() throws Exception {
+        given(userProfileRepository.findById(100L)).willReturn(Optional.of(mockUser));
+        willThrow(new RuntimeException("Connection refused: localhost/127.0.0.1:8081"))
+                .given(authServiceClient).updatePhoneNumber(eq(100L), any());
+
+        UpdateContactInfoRequestDto dto = identityDtoWithPhone("+12025550143");
+
+        mockMvc.perform(put("/api/v1/profiles/me/contact-info")
+                .with(fullAuthToken(100L))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(dto)))
+                .andExpect(status().isServiceUnavailable());
+
+        verify(userProfileRepository, never()).save(any(UserProfile.class));
+        verify(kafkaTemplate, never()).send(any(), any(), any());
+        assertThat(mockUser.getKycStatus()).isEqualTo(KycStatus.PENDING_VERIFICATION);
+        assertThat(mockUser.getPhoneNumber()).isEqualTo("+14155552671");
+    }
+
+    // ==========================================
+    // GET /profiles/me/contact-info (pre-fills the identity form)
+    // ==========================================
+
+    // takes no userId at all, same as the kyc-status endpoint next to it - the fields returned are
+    // always the token's own user's, and the phone number is auth-service's copy, not the mirror
+    @Test
+    @DisplayName("Block: GET contact-info Returns The Caller's Own Fields - [MEANT TO PASS]")
+    void testGetMyContactInfo_ReturnsCallersFields() throws Exception {
+        mockUser.setLegalName("Jane Q Public");
+        mockUser.setDateOfBirth(LocalDate.of(1990, 4, 17));
+        mockUser.setAddressLine2("Apt 4B");
+        given(userProfileRepository.findById(100L)).willReturn(Optional.of(mockUser));
+        willReturn(new AuthServiceClient.PhoneNumberResponse("+15712856947"))
+                .given(authServiceClient).getPhoneNumber(100L);
+
+        mockMvc.perform(get("/api/v1/profiles/me/contact-info")
+                .with(jwt().jwt(builder -> builder.claim("userId", 100L))
+                        .authorities(new SimpleGrantedAuthority("SCOPE_FULL_AUTH"))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.legalName").value("Jane Q Public"))
+                // ISO yyyy-MM-dd, which is what <input type="date"> expects back
+                .andExpect(jsonPath("$.dateOfBirth").value("1990-04-17"))
+                .andExpect(jsonPath("$.phoneNumber").value("+15712856947"))
+                .andExpect(jsonPath("$.addressLine1").value("123 Financial Way"))
+                .andExpect(jsonPath("$.addressLine2").value("Apt 4B"))
+                .andExpect(jsonPath("$.city").value("New York"))
+                .andExpect(jsonPath("$.state").value("NY"))
+                .andExpect(jsonPath("$.zipCode").value("10001"));
+    }
+
+    // an auth-service outage must not blank the form out - a blank form is what gets retyped wrong,
+    // which is the behaviour that created the duplicate numbers in the first place
+    @Test
+    @DisplayName("Block: GET contact-info Falls Back To The Local Phone Copy When auth-service Is Down - [MEANT TO PASS]")
+    void testGetMyContactInfo_AuthServiceUnreachable_FallsBackToLocalCopy() throws Exception {
+        given(userProfileRepository.findById(100L)).willReturn(Optional.of(mockUser));
+        willThrow(new RuntimeException("Connection refused: localhost/127.0.0.1:8081"))
+                .given(authServiceClient).getPhoneNumber(100L);
+
+        mockMvc.perform(get("/api/v1/profiles/me/contact-info")
+                .with(jwt().jwt(builder -> builder.claim("userId", 100L))
+                        .authorities(new SimpleGrantedAuthority("SCOPE_FULL_AUTH"))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.phoneNumber").value("+14155552671"));
+    }
+
+    // same reasoning as the kyc-status endpoint: this response carries a legal name and date of
+    // birth, so an unauthenticated caller gets nothing
+    @Test
+    @DisplayName("Block: GET contact-info Rejects An Unauthenticated Caller - [MEANT TO FAIL]")
+    void testGetMyContactInfo_RequiresAuthentication() throws Exception {
+        mockMvc.perform(get("/api/v1/profiles/me/contact-info"))
+                .andExpect(status().isUnauthorized());
     }
 
     // this one calls the service layer directly instead of going through mockmvc
@@ -665,9 +991,10 @@ class ProfileServiceTestSuite {
     }
 
     // happy path: notification-service asks for a user's preferences and gets back exactly
-    // what's stored, no authentication required since this is an internal service-to-service call
+    // what's stored - no end-user JWT, since this is a service-to-service call, just the shared
+    // internal token that replaced "the ingress doesn't route this prefix" as the only protection
     @Test
-    @DisplayName("Block: GET internal preferences returns the stored values unauthenticated - [MEANT TO PASS]")
+    @DisplayName("Block: GET internal preferences returns the stored values without an end-user JWT - [MEANT TO PASS]")
     void testBlock_GetPreferences_ExistingRow_ReturnsStoredValues() throws Exception {
         UserPreferenceEntity existing = new UserPreferenceEntity();
         existing.setUserId(100L);
@@ -676,7 +1003,8 @@ class ProfileServiceTestSuite {
         existing.setTimezone("Europe/London");
         given(preferenceRepository.findByUserId(100L)).willReturn(Optional.of(existing));
 
-        mockMvc.perform(get("/api/v1/internal/profiles/100/preferences"))
+        mockMvc.perform(get("/api/v1/internal/profiles/100/preferences")
+                .header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.userId").value(100))
                 .andExpect(jsonPath("$.alertThresholdAmount").value(250.00))
@@ -691,7 +1019,8 @@ class ProfileServiceTestSuite {
     void testBlock_GetPreferences_NoRow_ReturnsDefaultsWithoutPersisting() throws Exception {
         given(preferenceRepository.findByUserId(999L)).willReturn(Optional.empty());
 
-        mockMvc.perform(get("/api/v1/internal/profiles/999/preferences"))
+        mockMvc.perform(get("/api/v1/internal/profiles/999/preferences")
+                .header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.alertThresholdAmount").value(100.00))
                 .andExpect(jsonPath("$.dailySummaryEnabled").value(false))
@@ -700,8 +1029,9 @@ class ProfileServiceTestSuite {
         verify(preferenceRepository, never()).save(any());
     }
 
-    // the daily-summary batch job asks for every user opted in for one specific timezone -
-    // confirm the response shape and that it's also reachable with no authentication
+    // the daily-summary batch job asks for every user opted in for one specific timezone - confirm
+    // the response shape, and that it's reachable on the internal token alone (there is no user in
+    // the room on this sweep at all, so there is no JWT it could ever send)
     @Test
     @DisplayName("Block: GET daily-summary-users filters by timezone and opt-in flag - [MEANT TO PASS]")
     void testBlock_GetUsersForDailySummary_ReturnsOptedInUsersForTimezone() throws Exception {
@@ -713,10 +1043,281 @@ class ProfileServiceTestSuite {
         given(preferenceRepository.findByDailySummaryEnabledTrueAndTimezone("America/New_York"))
                 .willReturn(List.of(optedIn));
 
-        mockMvc.perform(get("/api/v1/internal/profiles/daily-summary-users").param("timezone", "America/New_York"))
+        mockMvc.perform(get("/api/v1/internal/profiles/daily-summary-users")
+                .param("timezone", "America/New_York")
+                .header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.length()").value(1))
                 .andExpect(jsonPath("$[0].userId").value(200));
+    }
+
+    // ==========================================
+    // Per-user daily summary hour (dailySummaryHour)
+    // ==========================================
+    //
+    // The send hour used to be a single notification.daily-summary.hour in notification-service, so
+    // 8am meant 8am for every customer on the platform or for nobody. The timezone and the on/off
+    // toggle were already per-user on this table; the hour was the one part of that same schedule
+    // still living outside the user's own preferences.
+
+    @Test
+    @DisplayName("Block: A chosen daily-summary hour persists and reads back on both the customer and internal responses - [MEANT TO PASS]")
+    void testUpdateDailySummary_ChosenHour_PersistsAndReadsBackOnBothResponses() throws Exception {
+        UserPreferenceEntity existing = optedInPreference(100L, "Europe/London", 8);
+        given(preferenceRepository.findByUserId(100L)).willReturn(Optional.of(existing));
+
+        mockMvc.perform(put("/api/v1/profile/alerts/daily-summary")
+                .with(fullAuthToken(100L))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(new UpdateDailySummaryRequestDto(true, "Europe/London", 17))))
+                .andExpect(status().isOk());
+
+        verify(preferenceRepository).save(argThat(entity -> Integer.valueOf(17).equals(entity.getDailySummaryHour())));
+
+        // read back through BOTH shapes off the same row: the Alert Preferences page pre-fills its
+        // hour picker from the first and notification-service schedules the send from the second, so
+        // a field that appears on only one of them is a preference that works in one direction only
+        mockMvc.perform(get("/api/v1/profile/alerts/me")
+                .with(fullAuthToken(100L)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.dailySummaryHour").value(17));
+
+        mockMvc.perform(get("/api/v1/internal/profiles/100/preferences")
+                .header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.dailySummaryHour").value(17));
+    }
+
+    // both ends of the range, because an off-by-one in the bounds silently deletes an hour a user can
+    // actually pick - either midnight or 11pm, depending on which end got it wrong
+    @Test
+    @DisplayName("Block: Hour 0 and hour 23 are both accepted - [MEANT TO PASS]")
+    void testUpdateDailySummary_BoundaryHours_AreBothAccepted() throws Exception {
+        // no existing row, so each request builds its own entity - reusing one would mean both
+        // captured saves point at the same object, and the first assertion would really be reading
+        // the value the second request left behind
+        given(preferenceRepository.findByUserId(100L)).willReturn(Optional.empty());
+
+        mockMvc.perform(put("/api/v1/profile/alerts/daily-summary")
+                .with(fullAuthToken(100L))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(new UpdateDailySummaryRequestDto(true, "UTC", 0))))
+                .andExpect(status().isOk());
+
+        mockMvc.perform(put("/api/v1/profile/alerts/daily-summary")
+                .with(fullAuthToken(100L))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(new UpdateDailySummaryRequestDto(true, "UTC", 23))))
+                .andExpect(status().isOk());
+
+        verify(preferenceRepository).save(argThat(entity -> Integer.valueOf(0).equals(entity.getDailySummaryHour())));
+        verify(preferenceRepository).save(argThat(entity -> Integer.valueOf(23).equals(entity.getDailySummaryHour())));
+    }
+
+    // 24 is the plausible typo for midnight and -1 for "an hour earlier". Neither may be quietly
+    // clamped to 23 or 0 and stored: the user would be told their choice was saved and then be
+    // emailed at a different time than the one showing on their own preferences page.
+    @Test
+    @DisplayName("Block: An hour outside 0-23 is rejected with a readable 400 and nothing is saved - [MEANT TO FAIL]")
+    void testUpdateDailySummary_OutOfRangeHour_ReturnsBadRequestAndSavesNothing() throws Exception {
+        given(preferenceRepository.findByUserId(100L)).willReturn(Optional.empty());
+
+        mockMvc.perform(put("/api/v1/profile/alerts/daily-summary")
+                .with(fullAuthToken(100L))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(new UpdateDailySummaryRequestDto(true, "UTC", 24))))
+                .andExpect(status().isBadRequest())
+                // the constraint's own wording, under both keys - the frontend's extractApiError
+                // reads "error" first and "message" second, and before GlobalExceptionHandler
+                // learned about validation failures this arrived as the bare words "Bad Request"
+                .andExpect(jsonPath("$.error").value("Daily summary hour must be between 0 and 23"))
+                .andExpect(jsonPath("$.message").value("Daily summary hour must be between 0 and 23"));
+
+        mockMvc.perform(put("/api/v1/profile/alerts/daily-summary")
+                .with(fullAuthToken(100L))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(new UpdateDailySummaryRequestDto(true, "UTC", -1))))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("Daily summary hour must be between 0 and 23"));
+
+        verify(preferenceRepository, never()).save(any());
+    }
+
+    // a payload that never mentions the hour is not a request to reset it - a client that only knows
+    // how to flip the toggle must not silently drag every user it touches back to 8am
+    @Test
+    @DisplayName("Block: A daily-summary payload with no hour leaves the user's existing hour alone - [MEANT TO PASS]")
+    void testUpdateDailySummary_HourOmitted_LeavesExistingHourUntouched() throws Exception {
+        UserPreferenceEntity existing = optedInPreference(100L, "Europe/London", 17);
+        given(preferenceRepository.findByUserId(100L)).willReturn(Optional.of(existing));
+
+        mockMvc.perform(put("/api/v1/profile/alerts/daily-summary")
+                .with(fullAuthToken(100L))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"dailySummaryEnabled\": false, \"timezone\": \"Europe/London\"}"))
+                .andExpect(status().isOk());
+
+        verify(preferenceRepository).save(argThat(entity -> Boolean.FALSE.equals(entity.getDailySummaryEnabled())));
+        verify(preferenceRepository).save(argThat(entity -> Integer.valueOf(17).equals(entity.getDailySummaryHour())));
+    }
+
+    // the read every new user starts from: no row of their own yet, so the answer is the documented
+    // default rather than null, and it is 8 - the hour the old global config sent at - so nobody's
+    // delivery time moves on the day this column appears
+    @Test
+    @DisplayName("Block: A user who never chose an hour reads back the default 8 - [MEANT TO PASS]")
+    void testGetPreferences_HourNeverChosen_ReadsBackEight() throws Exception {
+        given(preferenceRepository.findByUserId(999L)).willReturn(Optional.empty());
+
+        mockMvc.perform(get("/api/v1/internal/profiles/999/preferences")
+                .header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.dailySummaryHour").value(8));
+
+        // and the same for a row written before the column existed: still 8, never null, because
+        // notification-service compares this against the current hour as an int - a null there is an
+        // unboxing failure in the middle of the sweep, not a user who simply never picked a time
+        UserPreferenceEntity preMigrationRow = optedInPreference(100L, "UTC", 8);
+        preMigrationRow.setDailySummaryHour(null);
+        given(preferenceRepository.findByUserId(100L)).willReturn(Optional.of(preMigrationRow));
+
+        mockMvc.perform(get("/api/v1/profile/alerts/me")
+                .with(fullAuthToken(100L)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.dailySummaryHour").value(8));
+
+        verify(preferenceRepository, never()).save(any());
+    }
+
+    // The sweep the hourly job now runs. It can no longer work out which timezones are currently at
+    // the send hour, because there is no single send hour any more - every zone is a potential match
+    // on every pass. So it takes the whole opt-in list in one call and compares each user's own hour
+    // itself, instead of asking this service once per zone (~600 requests an hour).
+    @Test
+    @DisplayName("Block: GET daily-summary-users with no timezone returns every opted-in user - [MEANT TO PASS]")
+    void testGetUsersForDailySummary_TimezoneOmitted_ReturnsAllOptedInUsers() throws Exception {
+        given(preferenceRepository.findByDailySummaryEnabledTrue()).willReturn(List.of(
+                optedInPreference(200L, "America/New_York", 8),
+                optedInPreference(300L, "Asia/Tokyo", 23)));
+
+        mockMvc.perform(get("/api/v1/internal/profiles/daily-summary-users")
+                .header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(2))
+                .andExpect(jsonPath("$[0].userId").value(200))
+                .andExpect(jsonPath("$[0].dailySummaryHour").value(8))
+                .andExpect(jsonPath("$[1].userId").value(300))
+                .andExpect(jsonPath("$[1].timezone").value("Asia/Tokyo"))
+                .andExpect(jsonPath("$[1].dailySummaryHour").value(23));
+
+        // genuinely unfiltered - any() rather than anyString() precisely because the failure mode
+        // worth catching is the timezone query being run with a null argument, which anyString()
+        // does not match and would therefore let through
+        verify(preferenceRepository, never()).findByDailySummaryEnabledTrueAndTimezone(any());
+    }
+
+    // the other half of that rule: making the parameter optional must not change what it does when
+    // it IS supplied, because notification-service's manual trigger endpoint still sends one zone
+    @Test
+    @DisplayName("Block: GET daily-summary-users still filters to a single zone when a timezone is supplied - [MEANT TO PASS]")
+    void testGetUsersForDailySummary_TimezoneSupplied_StillFiltersToThatZone() throws Exception {
+        given(preferenceRepository.findByDailySummaryEnabledTrueAndTimezone("America/New_York"))
+                .willReturn(List.of(optedInPreference(200L, "America/New_York", 8)));
+
+        mockMvc.perform(get("/api/v1/internal/profiles/daily-summary-users")
+                .param("timezone", "America/New_York")
+                .header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(1))
+                .andExpect(jsonPath("$[0].userId").value(200))
+                .andExpect(jsonPath("$[0].dailySummaryHour").value(8));
+
+        // the filtered query, not "fetch everyone and hope the caller narrows it down"
+        verify(preferenceRepository, never()).findByDailySummaryEnabledTrue();
+    }
+
+    // ==========================================
+    // Internal endpoint shared secret (X-Internal-Token)
+    // ==========================================
+    //
+    // Every endpoint under /api/v1/internal/ used to be reachable by anyone who could route a packet
+    // to this service. The k8s ingress declining to route that prefix was the whole defence, which
+    // holds right up until an ingress rule is edited wrongly, an SSRF forwards a request, or anything
+    // at all is running inside the network. These tests pin the second layer that now stands there.
+
+    // no header at all - the case an attacker who has not read the contract actually sends
+    @Test
+    @DisplayName("Block: Internal endpoint rejects a request with no X-Internal-Token - [MEANT TO FAIL]")
+    void testInternalEndpoint_NoToken_ReturnsUnauthorized() throws Exception {
+        mockMvc.perform(get("/api/v1/internal/profiles/100/kyc-status"))
+                .andExpect(status().isUnauthorized())
+                // both keys, same text: the frontend's extractApiError reads "error" first and
+                // "message" second, and the services in this project disagree about which one they
+                // send (see GlobalExceptionHandler), so populating both reads correctly either way
+                .andExpect(jsonPath("$.error").value("Unauthorized internal request"))
+                .andExpect(jsonPath("$.message").value("Unauthorized internal request"));
+
+        // rejected before the controller, so the lookup never even happened
+        verify(userProfileRepository, never()).findById(100L);
+    }
+
+    // a present-but-wrong token is refused exactly like a missing one, and with the identical body -
+    // an attacker who could tell "wrong secret" apart from "no secret" would know the header name is
+    // right and only the value is left to guess
+    @Test
+    @DisplayName("Block: Internal endpoint rejects a request carrying the wrong X-Internal-Token - [MEANT TO FAIL]")
+    void testInternalEndpoint_WrongToken_ReturnsUnauthorized() throws Exception {
+        mockMvc.perform(get("/api/v1/internal/profiles/100/preferences")
+                .header(INTERNAL_TOKEN_HEADER, "not-the-internal-token"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error").value("Unauthorized internal request"))
+                .andExpect(jsonPath("$.message").value("Unauthorized internal request"));
+
+        verify(preferenceRepository, never()).findByUserId(100L);
+    }
+
+    // the other half of the rule: a correctly configured caller is unaffected. The token gates the
+    // prefix, it does not change what the endpoints underneath it answer.
+    @Test
+    @DisplayName("Block: Internal endpoint serves the request normally with the correct X-Internal-Token - [MEANT TO PASS]")
+    void testInternalEndpoint_CorrectToken_ServesRequestAsBefore() throws Exception {
+        given(userProfileRepository.findById(100L)).willReturn(Optional.of(mockUser));
+
+        mockMvc.perform(get("/api/v1/internal/profiles/100/kyc-status")
+                .header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("PENDING_VERIFICATION"));
+    }
+
+    // scoping, from the other direction: the browser never sends this header and never should, so a
+    // filter that gated more than /api/v1/internal/ would take the whole customer-facing API down.
+    // (The KYC webhook proves the same point for its own prefix - every webhook test above posts
+    // without an X-Internal-Token and still expects to be judged purely on its HMAC signature.)
+    @Test
+    @DisplayName("Block: A customer-facing JWT endpoint still works with no X-Internal-Token header - [MEANT TO PASS]")
+    void testCustomerFacingEndpoint_WithoutInternalToken_IsUnaffected() throws Exception {
+        given(userProfileRepository.findById(100L)).willReturn(Optional.of(mockUser));
+
+        mockMvc.perform(get("/api/v1/profiles/me/kyc-status")
+                .with(fullAuthToken(100L)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("PENDING_VERIFICATION"));
+    }
+
+    // OUTBOUND. This service calls auth-service's /api/v1/internal/users/{userId}/phone-number on
+    // every identity-form submission, and auth-service is adding the same gate. A header missing here
+    // fails nothing in this module's own tests - it surfaces as a 401 from someone else's service the
+    // day they switch enforcement on, which is why it is asserted directly.
+    @Test
+    @DisplayName("Block: Feign interceptor attaches X-Internal-Token to outbound internal calls - [MEANT TO PASS]")
+    void testFeignInterceptor_AttachesInternalTokenHeader() {
+        RequestTemplate template = new RequestTemplate();
+
+        internalTokenRequestInterceptor.apply(template);
+
+        // the configured value, not the dev default - same property that gates the inbound side, so
+        // rotating the secret moves both directions at once
+        assertThat(template.headers().get(INTERNAL_TOKEN_HEADER)).containsExactly(INTERNAL_TOKEN);
     }
 
     // ==========================================
@@ -755,6 +1356,55 @@ class ProfileServiceTestSuite {
         userRegisteredListener.consumeUserRegistered(event);
 
         verify(userProfileRepository, never()).save(any(UserProfile.class));
+    }
+
+    // The two tokens auth-service actually issues, built the way it builds them (see its JwtService):
+    // a completed login carries scope=FULL_AUTH, which the resource server's default converter turns
+    // into the SCOPE_FULL_AUTH authority every customer-facing endpoint here checks for. Both forms
+    // exist as helpers so a test's intent - "a finished session" vs "a password-only session" - is
+    // readable at the call site rather than inferred from which claims were set.
+    private static JwtRequestPostProcessor fullAuthToken(long userId) {
+        return jwt().jwt(builder -> builder
+                .claim("userId", userId)
+                .claim("token_type", "FULL_AUTH")
+                .claim("scope", "FULL_AUTH"));
+    }
+
+    // The token handed out after a correct password but BEFORE the 2FA code is submitted. auth-service
+    // deliberately puts no scope claim on it, so it arrives here carrying no authorities at all - the
+    // authorities are emptied explicitly rather than left to the test default, which would otherwise
+    // grant a SCOPE_read this token never actually has.
+    private static JwtRequestPostProcessor preAuthToken(long userId) {
+        return jwt().jwt(builder -> builder
+                        .claim("userId", userId)
+                        .claim("token_type", "PRE_AUTH"))
+                .authorities(List.<GrantedAuthority>of());
+    }
+
+    // a complete, otherwise-valid identity submission - only the phone number varies, since that is
+    // the field every test in the ownership block is actually about
+    private UpdateContactInfoRequestDto identityDtoWithPhone(String phoneNumber) {
+        UpdateContactInfoRequestDto dto = new UpdateContactInfoRequestDto();
+        dto.setLegalName("Jane Q Public");
+        dto.setDateOfBirth(LocalDate.of(1990, 4, 17));
+        dto.setPhoneNumber(phoneNumber);
+        dto.setAddressLine1("456 Innovation Blvd");
+        dto.setCity("San Jose");
+        dto.setState("CA");
+        dto.setZipCode("95110");
+        return dto;
+    }
+
+    // an opted-in preference row: the daily-summary tests differ only in whose it is, which zone they
+    // are in and which hour they picked, so everything else is filled in with the documented defaults
+    private UserPreferenceEntity optedInPreference(long userId, String timezone, int dailySummaryHour) {
+        UserPreferenceEntity entity = new UserPreferenceEntity();
+        entity.setUserId(userId);
+        entity.setAlertThresholdAmount(new BigDecimal("100.00"));
+        entity.setDailySummaryEnabled(true);
+        entity.setTimezone(timezone);
+        entity.setDailySummaryHour(dailySummaryHour);
+        return entity;
     }
 
     private String calculateHmac(String data, String key) {

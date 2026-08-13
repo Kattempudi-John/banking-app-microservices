@@ -33,8 +33,10 @@ graph TD
     Ingress --> Account
     Ingress --> Txn
 
-    Txn -- "internal REST: transfer/debit/credit" --> Account
-    Txn -- "internal REST: KYC status" --> Profile
+    Txn -- "internal REST: transfer/debit/credit, account owner" --> Account
+    Txn -- "internal REST: KYC status (sender and recipient)" --> Profile
+    Account -- "internal REST: KYC status" --> Profile
+    Profile -- "internal REST: phone number" --> Auth
     Notif -- "internal REST: preferences, balances-batch" --> Profile
     Notif -- "internal REST: balances-batch" --> Account
 
@@ -80,9 +82,9 @@ This system was implemented against 10 functional-requirement documents (FR1–F
 
 | Service | Port | Responsibility |
 |---|---|---|
-| `01-auth-service` | 8081 | Login, registration, device fingerprinting, TOTP/SMS 2FA, refresh/logout, JWT issuance |
+| `01-auth-service` | 8081 | Login, registration, device fingerprinting, TOTP/SMS 2FA, refresh/logout, JWT issuance — sole owner of the phone number 2FA codes are sent to |
 | `02-profile-service` | 8082 | KYC verification/webhook/admin override, identity & contact info, alert & daily-summary preferences; provisions a profile on registration |
-| `03-account-service` | 8083 | Account dashboard, paginated transaction history — sole owner of the accounts ledger; provisions a starter account on registration |
+| `03-account-service` | 8083 | Account dashboard, paginated transaction history, self-service open-account/add-funds — sole owner of the accounts ledger; provisions a starter account on registration |
 | `03-transaction-service` | 8084 | Internal transfers, external wires, fraud-threshold review |
 | `04-notification-service` | 8085 | Kafka-driven real-time alerts + scheduled daily balance summary; real SMS/email delivery via Twilio/SendGrid; exposes `/api/v1/notifications` |
 | `05-audit-service` | 8086 | Immutable, insert-only audit log of profile/KYC changes (no REST API) |
@@ -92,9 +94,11 @@ This system was implemented against 10 functional-requirement documents (FR1–F
 
 `frontend/` is an Angular 22 single-page app that talks to `auth-service`, `profile-service`, `account-service`, `transaction-service`, and `notification-service` directly over REST (`audit-service` has no REST API, so the frontend never calls it). Each of those services has a `CorsConfigurationSource` bean scoped to `http://localhost:4200` with credentials enabled, since the frontend and backend run on different ports locally.
 
-**Pages:** `/signup` (self-service registration) → `/login` (credentials + SMS 2FA) → `/dashboard` (account list) → `/accounts/:id/transactions` (paginated history) → `/transfer` (own-account transfers, paying another user by account number, and external wire — all KYC-gated) → `/history` (ledger entries and wires merged, filterable) → `/notifications` (delivered alert log) → `/profile` (identity verification, KYC status, account number/IBAN/SWIFT to receive money) → `/profile/alerts` (threshold + daily summary).
+**Pages:** `/signup` (self-service registration) → `/login` (credentials + SMS 2FA) → `/dashboard` (account list, plus opening a further account and adding funds — both KYC-gated) → `/accounts/:id/transactions` (paginated history) → `/transfer` (own-account transfers, paying another user by account number, and external wire — all KYC-gated) → `/history` (ledger entries and wires merged, filterable) → `/notifications` (delivered alert log) → `/profile` (identity verification, KYC status, account number/IBAN/SWIFT to receive money) → `/profile/alerts` (threshold + daily summary).
 
-**Registration provisioning:** `POST /api/v1/auth/register` (or the `/signup` page) creates the auth-service credentials, then publishes a `user-events` Kafka event that `profile-service` and `account-service` each consume independently to provision their own initial row — a `PENDING_VERIFICATION` profile and a `$0` `CHECKING` account — so a freshly-registered user has a usable (if empty) dashboard and KYC status immediately, no manual seeding required. See [Identity verification (KYC)](#identity-verification-kyc) below for how a user gets verified so transfers are enabled.
+**Registration provisioning:** `POST /api/v1/auth/register` (or the `/signup` page) creates the auth-service credentials, then publishes a `user-events` Kafka event that `profile-service` and `account-service` each consume independently to provision their own initial row — a `PENDING_VERIFICATION` profile and a `$0` `CHECKING` account — so a freshly-registered user has a usable (if empty) dashboard and KYC status immediately, no manual seeding required. That starter account comes from the Kafka listener, not the self-service open-account path, so it is deliberately outside the KYC gate — otherwise a brand-new user would be verified-gated out of the very account they need in order to get verified. See [Identity verification (KYC)](#identity-verification-kyc) below for how a user gets verified so the rest unlocks.
+
+Registration also rejects a phone number that is already registered to somebody else with a `409`, alongside the existing duplicate-username and duplicate-email checks. The number is what receives that account's 2FA codes, so letting two users share one hands the second of them the keys to the first one's login.
 
 ## Running this project
 
@@ -129,7 +133,7 @@ docker-compose up -d
 ./mvnw test                    # run from inside any one service's directory
 ```
 
-**5. Create a test user** — register via `POST /api/v1/auth/register` (or the frontend's `/signup` page) with `{"username", "password", "phoneNumber", "email"}`. This is the preferred path: it also publishes the `user-events` Kafka event that provisions a `PENDING_VERIFICATION` profile and a `$0` checking account (with its own IBAN) automatically (see [Frontend](#frontend) above) — `auth-service`, `profile-service`, and `account-service` all need to be running for that to happen.
+**5. Create a test user** — register via `POST /api/v1/auth/register` (or the frontend's `/signup` page) with `{"username", "password", "phoneNumber", "email"}`. This is the preferred path: it also publishes the `user-events` Kafka event that provisions a `PENDING_VERIFICATION` profile and a `$0` checking account (with its own IBAN) automatically (see [Frontend](#frontend) above) — `auth-service`, `profile-service`, and `account-service` all need to be running for that to happen. Give each test user a distinct phone number: usernames, emails and phone numbers are all unique, so reusing a number from an earlier test user comes back as a `409` rather than creating the account.
 
 If you'd rather skip the API and insert a user directly into Postgres (bcrypt hash below is for password `Password123!`), note that this bypasses the `user-events` publish entirely — you'll need to seed `user_profiles`/`accounts` rows yourself too:
 
@@ -140,7 +144,7 @@ VALUES ('e2etest', '\$2b\$10\$FQ/4MWYZrC9XB.zJl1TFuemdJY2lMP7hFzpdHAkweAHHhZP2UB
 "
 ```
 
-Either way, if you want to test transfers, KYC starts out `PENDING_VERIFICATION` (they're KYC-gated) — fill in the verification form on `/profile` to get approved (see [Identity verification (KYC)](#identity-verification-kyc)), or update `user_profiles` directly. First login from a new browser is a 2FA challenge — the SMS code is only published to Kafka (`notification-service` just logs it, since email/SMS providers are placeholders) — so for local testing without running `notification-service`, insert a `recognized_devices` row for that user (`device_hash` = base64(SHA-256(raw-device-id))) and send that raw value as a `Device-ID` cookie on login to skip 2FA entirely.
+Either way, KYC starts out `PENDING_VERIFICATION`, and transfers, opening a further account and adding funds are all gated on it — fill in the verification form on `/profile` to get approved (see [Identity verification (KYC)](#identity-verification-kyc)), or update `user_profiles` directly. The starter account itself arrives regardless, so an unverified user still has something to look at. To test paying another user you need **two** verified users: the recipient's own verification is checked as well as the sender's. First login from a new browser is a 2FA challenge — the SMS code is only published to Kafka (`notification-service` just logs it, since email/SMS providers are placeholders) — so for local testing without running `notification-service`, insert a `recognized_devices` row for that user (`device_hash` = base64(SHA-256(raw-device-id))) and send that raw value as a `Device-ID` cookie on login to skip 2FA entirely.
 
 **6. Start the frontend** from `frontend/`:
 
@@ -168,13 +172,24 @@ docker-compose down
 
 ### Identity verification (KYC)
 
-Transfers are KYC-gated: `transaction-service`'s `KycEnforcementAspect` checks a user's status before
-any money moves, and a new registration starts at `PENDING_VERIFICATION`.
+Money movement is KYC-gated: `transaction-service`'s `KycEnforcementAspect` checks a user's status
+before any money moves, and a new registration starts at `PENDING_VERIFICATION`.
+
+`account-service` now applies the same gate, through its own `@RequiresKyc` aspect, to **opening an
+account and adding funds**. Taking money in is as much a know-your-customer moment as sending it out,
+and gating one without the other just meant an unverified identity could still put money into the
+bank and then wait. The one deliberate exception is the starter account a brand-new user is given at
+registration: that is built directly by `account-service`'s `user-events` Kafka listener, which never
+goes through the self-service path, so a `PENDING_VERIFICATION` user still gets their `$0` checking
+account and a dashboard to log into. Gating that would have been circular.
 
 A user verifies themselves by submitting the identity form on `/profile` — full legal name, date of
-birth, phone and address. On a valid submission `profile-service` promotes them straight to
-`APPROVED` and returns the new status on the same response, so the page reflects it immediately and
-transfers unlock without a reload.
+birth, phone and address. The form **pre-fills from the contact information already on file**, which
+is the fix for a specific failure: an empty phone field got retyped from memory, in a different
+format or as a different number entirely, by a user who thought they were confirming what the bank
+already had. On a valid submission `profile-service` promotes them straight to `APPROVED` and returns
+the new status on the same response, so the page reflects it immediately and transfers unlock without
+a reload.
 
 This stands in for the identity vendor's callback (`POST /api/v1/webhooks/kyc-update`, HMAC-signed),
 which is what would approve a user in a real deployment. It is therefore gated on `app.demo.enabled`
@@ -187,6 +202,32 @@ hear from the vendor. Two rules hold regardless of that flag:
 
 An earlier "Simulate KYC Approval (Demo)" button approved a user on a click with no information
 collected at all; it has been removed in favour of the form above.
+
+**The phone number belongs to `auth-service`, not to the identity form.** `users.phone_number` is the
+address 2FA codes are actually delivered to, so it is the only copy that can be authoritative. The
+identity form no longer keeps an independently editable copy: `profile-service` writes the submitted
+number through to `auth-service`'s internal phone-number endpoint first, stores whatever E.164 value
+comes back, and reads that same endpoint when pre-filling. If `auth-service` rejects the number the
+submission throws before anything is saved — no profile write, no Kafka event, and no KYC approval.
+A unique index backs the rule on both sides (`uk_users_phone_number`, `uq_user_profiles_phone_number`),
+so a code path that ever wrote the column directly would be refused by the database rather than
+quietly recreating a duplicate. Before this, the identity form could claim a number already
+registered to another user, and "changing" a number here left login codes still going to the old one
+with nothing to indicate the two had drifted apart. Re-submitting your own unchanged number is a
+success, not a conflict — otherwise nobody could edit their address without also changing their phone.
+
+**The recipient has to be verified too.** A sender passing their own KYC check is only half of it:
+`transaction-service`'s `RecipientKycValidator` also refuses a transfer whose destination belongs to a
+user whose verification is not `APPROVED` — both for a payment by account number and for a wire whose
+IBAN resolves to an account on this platform. The check runs before the sender is debited, so a
+refused transfer reserves nothing. A wire to a genuinely external IBAN is untouched by this: the
+lookup 404s, there is no local user behind it, and another bank's customer is not ours to verify. The
+read-only recipient-confirmation lookup answers `verified: false` rather than a `403`, so the transfer
+page can say why the button is disabled instead of failing at submit. A wire held for fraud review
+re-checks the recipient at the moment a reviewer approves it, not just at submission: if they can no
+longer receive funds the wire is reversed and refunded to the sender rather than credited or left
+sitting in `PENDING_APPROVAL`, and the audit trail records the reviewer's actual `APPROVED` verdict
+separately from the receiving-side reason the money went back.
 
 ### Notification providers
 
@@ -259,10 +300,20 @@ being mailed at a fabricated address.
 
 ### Daily balance summary
 
-`DailyBalanceSummaryJob` runs hourly, finds every IANA timezone whose local time is currently the
-configured hour, and emails the users there who opted in on `/profile/alerts`. The target hour is
-`notification.daily-summary.hour` (env `DAILY_SUMMARY_HOUR`, default `8`) — point it at the current
-hour to watch the scheduled path run without waiting for morning.
+`DailyBalanceSummaryJob` runs hourly, fetches everyone who opted in on `/profile/alerts`, and emails
+each user whose own local time has reached the hour **they** chose. Both halves of "8am my time" are
+per-user: the timezone and the delivery hour are picked on that page and stored on the user's
+preferences (`daily_summary_hour`, whole hours, defaulting to `8`). The comparison is done with
+`ZonedDateTime` against the user's zone, so an hour stays put across a daylight-saving switch.
+
+There is deliberately no global hour setting any more. One existed (`notification.daily-summary.hour`
+/ `DAILY_SUMMARY_HOUR`) back when every customer was mailed at the same hour, and keeping it would
+have meant two mechanisms competing to answer the same question — an override that forced everyone
+onto one hour would defeat the point of letting them choose. To watch the scheduled path run without
+waiting for morning, use the manual trigger below, which skips the hour check entirely.
+
+Whole hours only: the job is driven by an hourly cron, so a half-hour zone such as India cannot be
+served a `:30` slot no matter what is stored.
 
 For an immediate check, trigger it directly:
 
@@ -296,7 +347,9 @@ Being upfront about what's intentionally not production-complete:
 - **Twilio Email sends are fire-and-forget.** The API is asynchronous: a `202 Accepted` means queued, not delivered, and returns an `operationId` the client logs. Polling `operationLocation` for the final per-message outcome isn't implemented, so a message accepted by Twilio and then bounced is recorded `SENT` here.
 - **The daily summary has no distributed lock.** `k8s/07-notification-service.yaml` pins `replicas: 1` precisely because a second replica would run the same hourly sweep and double-send. Scaling that deployment out needs ShedLock or equivalent first.
 - **No role-based authorization system yet.** Profile-service's admin KYC-override endpoint requires `ADMIN`/`COMPLIANCE_OFFICER` roles, but nothing in the system currently grants roles to a user — that endpoint is reachable in code but not yet in a real deployment.
-- **Kafka-provisioned profiles/accounts are minimal.** The `user-events` consumer in `profile-service`/`account-service` (see [Frontend](#frontend) above) only sets the bare minimum — a `PENDING_VERIFICATION` profile with no address, and a single `$0` checking account. If Kafka is down when a user registers, they end up with credentials but no profile/account until manually backfilled (no dead-letter/retry queue yet, just a logged error).
+- **Kafka-provisioned profiles/accounts are minimal.** The `user-events` consumer in `profile-service`/`account-service` (see [Frontend](#frontend) above) only sets the bare minimum — a `PENDING_VERIFICATION` profile with no address, and a single `$0` checking account. If Kafka is down when a user registers, they end up with credentials but no profile/account until manually backfilled (no dead-letter/retry queue yet, just a logged error). They aren't stranded — the KYC status lookup provisions a profile row on read, and once verified they can open an account through the self-service path — but the starter account they should have had never arrives on its own.
+- **The phone-number write-through isn't a distributed transaction.** `profile-service` updates `auth-service` first and then saves its own mirror row, precisely so a rejected number never reaches KYC approval. The cost is the opposite ordering risk: if the local save or the Kafka publish fails afterwards, `profile-service` rolls back while `auth-service` has already accepted the new number, so the mirror is briefly stale against the real 2FA destination. Re-submitting the form reconciles it, and the pre-fill reads the authoritative copy so the user is shown the number that actually matters — but there's no outbox or compensating write behind it yet.
+- **Recipient KYC only reaches this platform's users.** A wire to an IBAN that doesn't resolve to a local account is sent without any check on who receives it, which is correct — there is no user to look up and no basis to verify another bank's customer — but it does mean the recipient gate is a same-platform guarantee, not a general one.
 - **IaC is validated, not deployed** (see [Infrastructure](#infrastructure) above).
 
 **On endpoint exposure:** every unauthenticated endpoint lives under `/api/v1/internal/`, which is

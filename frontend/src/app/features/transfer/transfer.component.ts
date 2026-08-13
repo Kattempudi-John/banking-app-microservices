@@ -1,5 +1,4 @@
 import { Component, OnInit, computed, signal } from '@angular/core';
-import { HttpErrorResponse } from '@angular/common/http';
 import { FormsModule } from '@angular/forms';
 
 import { extractApiError } from '../../core/api-error';
@@ -19,6 +18,12 @@ type ResultType = 'success' | 'error' | 'info';
 type InternalMode = 'own' | 'recipient';
 
 const IBAN_PATTERN = /^[A-Z]{2}[0-9]{2}[A-Z0-9]{11,30}$/;
+
+// Only reached when a refusal arrives with no readable body at all. Deliberately vague about WHOSE
+// verification is missing: with no message to go on, naming the sender would be the same wrong guess
+// this page used to make for every 403.
+const TRANSFER_BLOCKED_FALLBACK =
+  'That transfer was refused. Check your verification status on your Profile page, and confirm the recipient can receive transfers.';
 
 @Component({
   selector: 'app-transfer',
@@ -51,6 +56,15 @@ export class TransferComponent implements OnInit {
   readonly recipientPreview = signal<RecipientPreview | null>(null);
   readonly recipientLookupError = signal<string | null>(null);
   readonly recipientLoading = signal(false);
+
+  // Derived from the preview rather than tracked alongside it, so a cleared or replaced lookup can
+  // never leave a stale verdict behind. Strict === false: a recipient nobody has looked up yet is
+  // already handled by the "look up first" check in submitToRecipient.
+  readonly recipientUnverified = computed(() => this.recipientPreview()?.verified === false);
+
+  // Both internal modes share one Send button, so the block only bites while an unverified
+  // recipient is actually the destination - moving money between your own accounts is unaffected.
+  readonly sendBlocked = computed(() => this.internalMode() === 'recipient' && this.recipientUnverified());
 
   readonly extFromAccountId = signal<number | null>(null);
   readonly iban = signal('');
@@ -115,6 +129,11 @@ export class TransferComponent implements OnInit {
       next: (preview) => {
         this.recipientLoading.set(false);
         this.recipientPreview.set(preview);
+        // Clearing this is the point: pressing Send before looking anyone up leaves "Look up the
+        // recipient account number first" on screen, and it was only ever reset when the NEXT send
+        // began - so a successful lookup left the confirmed recipient sitting directly above a
+        // complaint that they hadn't been looked up.
+        this.validationError.set(null);
       },
       error: (error: unknown) => {
         this.recipientLoading.set(false);
@@ -254,14 +273,12 @@ export class TransferComponent implements OnInit {
 
   private handleError(error: unknown): void {
     this.resultType.set('error');
-    // A 403 is always the KYC gate, and KycEnforcementAspect's message names the actual status
-    // ("KYC verification is PENDING_VERIFICATION..."), which is more than the old hardcoded line
-    // said - but it reads like an internal error code, so keep the friendlier wording there.
-    // Everything else now surfaces the real reason instead of a blanket "something went wrong".
-    if (error instanceof HttpErrorResponse && error.status === 403) {
-      this.resultMessage.set('Please verify your identity to enable transfers.');
-      return;
-    }
-    this.resultMessage.set(extractApiError(error));
+    // A 403 no longer means one thing. A transfer is refused both when the SENDER isn't verified
+    // and when the RECIPIENT isn't - and the old code replaced every 403 with a single line telling
+    // the sender to verify themselves, so paying an unverified recipient blamed the sender for a
+    // problem that wasn't theirs and pointed them at a page that would tell them they were fine.
+    // The server distinguishes the two and both messages are written to be read, so show the one
+    // that actually arrived rather than guessing from the status code.
+    this.resultMessage.set(extractApiError(error, TRANSFER_BLOCKED_FALLBACK));
   }
 }

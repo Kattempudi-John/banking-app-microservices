@@ -14,13 +14,19 @@ const CODE_MESSAGES: Record<string, string> = {
   SAME_ACCOUNT: "You can't transfer to the same account you're sending from. Pick a different destination.",
 };
 
+// A 503 means the service refused to proceed because it couldn't reach a dependency - nothing was
+// approved and no money moved. The backends say so in the body, but a proxy or gateway can hand
+// back a 503 with no body at all, and the caller's own fallback describes the request rather than
+// an unreachable dependency, so it would be misleading here. Answer for the status instead.
+const SERVICE_UNAVAILABLE_MESSAGE = "We couldn't reach the service to confirm this. Please try again in a moment.";
+
 function readServerMessage(error: unknown): string | null {
   if (!(error instanceof HttpErrorResponse)) {
     return null;
   }
 
   // A non-JSON body (a proxy error page, a network failure) leaves error.error as a string or an
-  // ErrorEvent, neither of which has our keys - fall through to the caller's fallback in that case.
+  // ErrorEvent, neither of which has our keys - fall through to a fallback in that case.
   const payload = error.error;
   if (!payload || typeof payload !== 'object') {
     return null;
@@ -40,6 +46,9 @@ export function extractApiError(error: unknown, fallback = 'Something went wrong
   const serverMessage = readServerMessage(error);
 
   if (serverMessage === null) {
+    if (error instanceof HttpErrorResponse && error.status === 503) {
+      return SERVICE_UNAVAILABLE_MESSAGE;
+    }
     return fallback;
   }
 

@@ -3,7 +3,7 @@ import { HttpClient } from '@angular/common/http';
 import { Observable, map } from 'rxjs';
 
 import { environment } from '../../../environments/environment';
-import { ContactInfo, KycStatus, UserPreference } from '../models/profile.models';
+import { ContactInfo, ContactInfoView, KycStatus, UserPreference } from '../models/profile.models';
 
 @Injectable({ providedIn: 'root' })
 export class ProfileService {
@@ -28,6 +28,13 @@ export class ProfileService {
       .pipe(map((response) => response.status));
   }
 
+  // Same JWT-derived user as getKycStatus above, no userId in the path. Reads back what was last
+  // submitted so the form can be pre-filled - people were re-typing a different phone number than
+  // the one their account was registered with, because the form always started blank.
+  getContactInfo(): Observable<ContactInfoView> {
+    return this.http.get<ContactInfoView>(`${this.baseUrl}/profiles/me/contact-info`);
+  }
+
   // simulateKycApproval() is gone along with the endpoint behind it. Verification now happens by
   // submitting the identity form - see updateContactInfo above, which returns the resulting status.
 
@@ -45,10 +52,10 @@ export class ProfileService {
     );
   }
 
-  updateDailySummary(enabled: boolean, timezone: string): Observable<unknown> {
+  updateDailySummary(enabled: boolean, timezone: string, hour: number): Observable<unknown> {
     return this.http.put(
       `${this.baseUrl}/profile/alerts/daily-summary`,
-      { dailySummaryEnabled: enabled, timezone },
+      { dailySummaryEnabled: enabled, timezone, dailySummaryHour: hour },
       { responseType: 'text' },
     );
   }

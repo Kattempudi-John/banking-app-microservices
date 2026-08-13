@@ -1,6 +1,6 @@
 import { Injectable, computed, signal } from '@angular/core';
 import { HttpClient, HttpHeaders } from '@angular/common/http';
-import { Observable, tap, catchError, throwError } from 'rxjs';
+import { Observable, of, tap, catchError, throwError } from 'rxjs';
 
 import { environment } from '../../environments/environment';
 import {
@@ -59,6 +59,22 @@ export class AuthService {
     return this.http
       .post<RefreshResponse>(`${this.baseUrl}/refresh`, null, { withCredentials: true })
       .pipe(tap((response) => this.accessTokenSignal.set(response.access_token)));
+  }
+
+  // Run once at startup, before the router resolves any route. The access token lives in memory
+  // only, so a browser refresh threw it away and authGuard bounced the user to /login even though
+  // their session was still perfectly valid - the Refresh-Token cookie is httpOnly and survives a
+  // reload untouched. This trades that cookie back for an access token so the reload lands on the
+  // page the user was already looking at.
+  //
+  // Storing the access token in localStorage would also survive a reload and is the more obvious
+  // fix, but it hands the token to any script that manages to run on the page. The cookie is
+  // httpOnly precisely so JavaScript cannot read it; re-deriving from it keeps that property.
+  //
+  // Never fails: someone who is genuinely logged out has no cookie, and their 401 here is the
+  // expected answer, not an error. Letting it through would block the app from starting at all.
+  restoreSession(): Observable<RefreshResponse | null> {
+    return this.refresh().pipe(catchError(() => of(null)));
   }
 
   logout(): Observable<unknown> {

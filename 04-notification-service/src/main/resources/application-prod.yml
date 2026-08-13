@@ -24,6 +24,11 @@ profile-service:
   url: ${PROFILE_SERVICE_URL:http://profile-service:8080}
 account-service:
   url: ${ACCOUNT_SERVICE_URL:http://account-service:8080}
+# Only used to put a name on a transaction alert's counterparty (AuthServiceClient). A wrong or
+# unreachable value here degrades the alert to a masked account number rather than failing it, so
+# this is the one client whose misconfiguration is invisible in the logs of a working system.
+auth-service:
+  url: ${AUTH_SERVICE_URL:http://auth-service:8080}
 
 # Prod defaults to the real providers, unlike the dev profile which defaults to logging. Every
 # credential comes from the environment - none of these have an inline fallback, so a missing secret

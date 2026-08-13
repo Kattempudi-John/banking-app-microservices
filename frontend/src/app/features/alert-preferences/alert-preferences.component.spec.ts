@@ -1,4 +1,5 @@
 import { ComponentFixture, TestBed } from '@angular/core/testing';
+import { HttpErrorResponse } from '@angular/common/http';
 import { provideRouter } from '@angular/router';
 import { of, throwError } from 'rxjs';
 
@@ -16,6 +17,7 @@ describe('AlertPreferencesComponent', () => {
     alertThresholdAmount: 500,
     dailySummaryEnabled: true,
     timezone: 'America/New_York',
+    dailySummaryHour: 17,
   };
 
   async function setup(pref: UserPreference = mockPreference): Promise<void> {
@@ -55,6 +57,10 @@ describe('AlertPreferencesComponent', () => {
     return fixture.nativeElement.querySelector('select[name="timezone"]');
   }
 
+  function hourSelect(): HTMLSelectElement {
+    return fixture.nativeElement.querySelector('select[name="dailySummaryHour"]');
+  }
+
   function clickButtonContaining(text: string): void {
     const buttons: HTMLButtonElement[] = Array.from(fixture.nativeElement.querySelectorAll('button'));
     buttons.find((b) => b.textContent?.includes(text))!.click();
@@ -66,6 +72,7 @@ describe('AlertPreferencesComponent', () => {
     expect(thresholdInput().value).toBe('500');
     expect(dailySummaryToggle().checked).toBeTrue();
     expect(timezoneSelect().value).toBe('America/New_York');
+    expect(hourSelect().value).toBe('17');
   });
 
   it('saves a valid threshold and shows a confirmation', async () => {
@@ -103,7 +110,7 @@ describe('AlertPreferencesComponent', () => {
     clickButtonContaining('Save Alerts');
     fixture.detectChanges();
 
-    expect(profileServiceSpy.updateDailySummary).toHaveBeenCalledWith(true, 'America/Chicago');
+    expect(profileServiceSpy.updateDailySummary).toHaveBeenCalledWith(true, 'America/Chicago', 17);
     expect(fixture.nativeElement.textContent).toContain('saved');
   });
 
@@ -114,7 +121,47 @@ describe('AlertPreferencesComponent', () => {
     clickButtonContaining('Save Alerts');
     fixture.detectChanges();
 
-    expect(profileServiceSpy.updateDailySummary).toHaveBeenCalledWith(false, '');
+    expect(profileServiceSpy.updateDailySummary).toHaveBeenCalledWith(false, '', 17);
+  });
+
+  it('sends the chosen hour as a number when the summary time is changed', async () => {
+    await setup();
+    profileServiceSpy.updateDailySummary.and.returnValue(of({}));
+
+    hourSelect().value = '6';
+    hourSelect().dispatchEvent(new Event('change'));
+    clickButtonContaining('Save Alerts');
+    fixture.detectChanges();
+
+    expect(profileServiceSpy.updateDailySummary).toHaveBeenCalledWith(true, 'America/New_York', 6);
+  });
+
+  // Midnight and noon are where a naive 12-hour conversion goes wrong: hour 0 reads "0:00 AM" and
+  // hour 12 flips to "12:00 AM" if the meridiem is taken from the wrong side of the comparison.
+  it('labels midnight and noon as 12:00 AM and 12:00 PM', async () => {
+    await setup();
+    const labels = Array.from(hourSelect().options).map((option) => option.textContent?.trim());
+
+    expect(labels.length).toBe(24);
+    expect(labels[0]).toBe('12:00 AM');
+    expect(labels[12]).toBe('12:00 PM');
+    expect(labels[8]).toBe('8:00 AM');
+    expect(labels[13]).toBe('1:00 PM');
+  });
+
+  it('shows the reason the server gave when it rejects the summary hour', async () => {
+    await setup();
+    profileServiceSpy.updateDailySummary.and.returnValue(
+      throwError(() => new HttpErrorResponse({
+        status: 400,
+        error: { message: 'Daily summary hour must be between 0 and 23.' },
+      })),
+    );
+
+    clickButtonContaining('Save Alerts');
+    fixture.detectChanges();
+
+    expect(fixture.nativeElement.textContent).toContain('must be between 0 and 23');
   });
 
   it('shows an error message when saving the threshold fails', async () => {

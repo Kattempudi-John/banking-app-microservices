@@ -65,13 +65,19 @@ class NotificationAlertsTestSuite {
     private Clock clock;
 
     // 2024-01-15T13:00:00Z is 08:00 local time in America/New_York (EST, UTC-5, no DST in
-    // January) - a fixed instant so DailyBalanceSummaryJob's "which timezones are at 8 AM"
-    // scan is deterministic across test runs, instead of depending on the real wall clock.
+    // January) - a fixed instant so DailyBalanceSummaryJob's per-user local-hour matching is
+    // deterministic across test runs, instead of depending on the real wall clock.
     private static final Instant EIGHT_AM_NEW_YORK = Instant.parse("2024-01-15T13:00:00Z");
+    // The same wall clock one hour on, 09:00 in New York. Used to prove a user whose chosen hour is 8
+    // is passed over on the very next run of an hourly cron.
+    private static final Instant NINE_AM_NEW_YORK = Instant.parse("2024-01-15T14:00:00Z");
+    // July, when New York is on EDT (UTC-4), so 08:00 local is a different instant than it is in
+    // January. A job matching on a stored offset instead of a ZonedDateTime gets this one wrong.
+    private static final Instant EIGHT_AM_NEW_YORK_SUMMER = Instant.parse("2024-07-15T12:00:00Z");
     private static final String NEW_YORK_ZONE = "America/New_York";
 
     // runs before every test, pins the mocked clock to a fixed instant, 8am new york time in january
-    // this makes dailybalancesummaryjob's timezone scan deterministic instead of depending on
+    // this makes dailybalancesummaryjob's local-hour matching deterministic instead of depending on
     // whatever the real wall clock happens to be when the test suite runs
     @BeforeEach
     void setUpClock() {
@@ -92,7 +98,7 @@ class NotificationAlertsTestSuite {
         // test cannot pass by accident if the listener regresses to using an account ID again.
         FundsTransferredEvent event = new FundsTransferredEvent(42L, 501L, 502L, new BigDecimal("150.00"), UUID.randomUUID());
         given(profileServiceClient.getUserPreferences(42L))
-                .willReturn(new UserPreferenceResponse(42L, new BigDecimal("100.00"), true, "America/New_York", "alerts@example.com"));
+                .willReturn(new UserPreferenceResponse(42L, new BigDecimal("100.00"), true, 8, "America/New_York", "alerts@example.com"));
 
         transactionAlertListener.consumeTransferEvent(event);
 
@@ -109,7 +115,7 @@ class NotificationAlertsTestSuite {
     void testBlock2_transferBelowThreshold_noAlert() {
         FundsTransferredEvent event = new FundsTransferredEvent(42L, 501L, 502L, new BigDecimal("50.00"), UUID.randomUUID());
         given(profileServiceClient.getUserPreferences(42L))
-                .willReturn(new UserPreferenceResponse(42L, new BigDecimal("100.00"), true, "America/New_York", "alerts@example.com"));
+                .willReturn(new UserPreferenceResponse(42L, new BigDecimal("100.00"), true, 8, "America/New_York", "alerts@example.com"));
 
         transactionAlertListener.consumeTransferEvent(event);
 
@@ -158,7 +164,7 @@ class NotificationAlertsTestSuite {
     void testBlock5_listenerUsesUserIdNotAccountId() {
         FundsTransferredEvent event = new FundsTransferredEvent(777L, 111L, 222L, new BigDecimal("200.00"), UUID.randomUUID());
         given(profileServiceClient.getUserPreferences(777L))
-                .willReturn(new UserPreferenceResponse(777L, new BigDecimal("100.00"), true, "UTC", "alerts@example.com"));
+                .willReturn(new UserPreferenceResponse(777L, new BigDecimal("100.00"), true, 8, "UTC", "alerts@example.com"));
 
         transactionAlertListener.consumeTransferEvent(event);
 
@@ -175,39 +181,150 @@ class NotificationAlertsTestSuite {
 
     // checking the scheduled daily summary job actually emails users who are opted in and have a balance
     // thanks to the clock stub in setUpClock this always looks like 8am in america/new_york,
-    // so we know exactly which timezone string the job is going to query for, no guessing needed
-    // stub the profile service to return one opted in user for that timezone
+    // so a user whose chosen hour is 8 and whose timezone is new york is due right now
+    // stub the profile service to return that one opted in user, no timezone filter involved
     // stub the account service to return an aggregate balance for that same user
     // call processdailysummaries directly, the same way the scheduler would trigger it
-    // verify the timezone lookup happened exactly once, and that one summary email actually went out
+    // verify the opted-in fetch happened exactly once, and that one summary email actually went out
     @Test
     @DisplayName("Block 7: Opted-in users with a matching balance receive a summary email - [MEANT TO PASS]")
     void testBlock7_optedInUsersWithBalance_receiveSummaryEmail() {
-        // DailyBalanceSummaryJob now reads Instant.now(clock) instead of the real wall clock, so
-        // with the fixed 8 AM America/New_York instant stubbed in @BeforeEach, exactly which
-        // timezone string the job queries is deterministic - this stubs and verifies that one
-        // zone specifically, rather than answering (and counting calls) for every zone at once.
-        given(profileServiceClient.getUsersForDailySummary(eq(NEW_YORK_ZONE)))
-                .willReturn(List.of(new UserPreferenceResponse(100L, new BigDecimal("100.00"), true, NEW_YORK_ZONE, "summary@example.com")));
+        // DailyBalanceSummaryJob reads Instant.now(clock) instead of the real wall clock, so with the
+        // fixed 08:00 America/New_York instant stubbed in @BeforeEach this user's chosen hour of 8 is
+        // the hour it currently is where they live.
+        given(profileServiceClient.getAllUsersForDailySummary())
+                .willReturn(List.of(new UserPreferenceResponse(100L, new BigDecimal("100.00"), true, 8, NEW_YORK_ZONE, "summary@example.com")));
         given(accountServiceClient.getAggregateBalancesBatch(eq(List.of(100L))))
                 .willReturn(List.of(new UserAggregateBalanceResponse(100L, new BigDecimal("5432.10"))));
 
         dailyBalanceSummaryJob.processDailySummaries();
 
-        verify(profileServiceClient, times(1)).getUsersForDailySummary(eq(NEW_YORK_ZONE));
+        // Exactly one fetch for the whole sweep, and no per-zone fetch at all - asking zone by zone is
+        // the ~600-calls-an-hour shape this job deliberately does not have any more.
+        verify(profileServiceClient, times(1)).getAllUsersForDailySummary();
+        verify(profileServiceClient, never()).getUsersForDailySummary(anyString());
         verify(notificationProviderService, times(1))
                 .dispatchEmail(eq("summary@example.com"), anyString(), anyString());
     }
 
+    // The other half of Block 7. The cron fires every hour, so a user whose chosen hour has passed has
+    // to be left alone - otherwise they would receive the same summary on all 24 runs of the day.
+    @Test
+    @DisplayName("Block 7b: The same user one hour past their chosen hour is not mailed - [MEANT TO PASS]")
+    void testBlock7b_userPastTheirChosenHour_isNotMailed() {
+        given(clock.instant()).willReturn(NINE_AM_NEW_YORK);
+        given(profileServiceClient.getAllUsersForDailySummary())
+                .willReturn(List.of(new UserPreferenceResponse(100L, new BigDecimal("100.00"), true, 8, NEW_YORK_ZONE, "summary@example.com")));
+
+        dailyBalanceSummaryJob.processDailySummaries();
+
+        verify(notificationProviderService, never()).dispatchEmail(any(), any(), any());
+        // Nobody was due, so the batch balance call must not have happened either.
+        verify(accountServiceClient, never()).getAggregateBalancesBatch(any());
+    }
+
+    // THE test for this feature. Two users in the SAME timezone with DIFFERENT chosen hours: at 08:00
+    // New York only the 8 o'clock user is mailed, and at 09:00 only the 9 o'clock user is. One global
+    // summary hour could not express this at all - whichever hour was configured, one of these two was
+    // always mailed at the wrong time.
+    @Test
+    @DisplayName("Block 7c: Two users in one timezone are each mailed at their own chosen hour - [MEANT TO PASS]")
+    void testBlock7c_sameTimezoneDifferentHours_eachMailedAtTheirOwn() {
+        UserPreferenceResponse eightOClockUser =
+                new UserPreferenceResponse(300L, new BigDecimal("100.00"), true, 8, NEW_YORK_ZONE, "eight@example.com");
+        UserPreferenceResponse nineOClockUser =
+                new UserPreferenceResponse(301L, new BigDecimal("100.00"), true, 9, NEW_YORK_ZONE, "nine@example.com");
+
+        given(profileServiceClient.getAllUsersForDailySummary())
+                .willReturn(List.of(eightOClockUser, nineOClockUser));
+        given(accountServiceClient.getAggregateBalancesBatch(eq(List.of(300L))))
+                .willReturn(List.of(new UserAggregateBalanceResponse(300L, new BigDecimal("11.00"))));
+        given(accountServiceClient.getAggregateBalancesBatch(eq(List.of(301L))))
+                .willReturn(List.of(new UserAggregateBalanceResponse(301L, new BigDecimal("22.00"))));
+
+        // 08:00 in New York: the 8 o'clock user only.
+        dailyBalanceSummaryJob.processDailySummaries();
+
+        verify(notificationProviderService, times(1))
+                .dispatchEmail(eq("eight@example.com"), anyString(), anyString());
+        verify(notificationProviderService, never()).dispatchEmail(eq("nine@example.com"), anyString(), anyString());
+
+        // 09:00 in New York, the next run of the same hourly cron: now the 9 o'clock user, and the
+        // 8 o'clock user is not mailed a second time.
+        given(clock.instant()).willReturn(NINE_AM_NEW_YORK);
+        dailyBalanceSummaryJob.processDailySummaries();
+
+        verify(notificationProviderService, times(1))
+                .dispatchEmail(eq("nine@example.com"), anyString(), anyString());
+        verify(notificationProviderService, times(1))
+                .dispatchEmail(eq("eight@example.com"), anyString(), anyString());
+    }
+
+    // A user who turned summaries off is never mailed, even when their stored hour is the hour it is.
+    // profile-service already filters these out, so this asserts the job's own belt-and-braces check -
+    // mailing someone who explicitly opted out is the one failure here a customer would complain about.
+    @Test
+    @DisplayName("Block 7d: A user with dailySummaryEnabled false is never mailed - [MEANT TO PASS]")
+    void testBlock7d_optedOutUser_isNeverMailed() {
+        given(profileServiceClient.getAllUsersForDailySummary())
+                .willReturn(List.of(new UserPreferenceResponse(400L, new BigDecimal("100.00"), false, 8, NEW_YORK_ZONE, "optedout@example.com")));
+
+        dailyBalanceSummaryJob.processDailySummaries();
+
+        verify(notificationProviderService, never()).dispatchEmail(any(), any(), any());
+        verify(accountServiceClient, never()).getAggregateBalancesBatch(any());
+    }
+
+    // "08:00 local" has to still mean 08:00 local in July. New York is UTC-5 in winter and UTC-4 in
+    // summer, so matching the hour against a fixed offset instead of resolving it through the zone's
+    // rules would deliver this one an hour out - twice a year, for half the world.
+    @Test
+    @DisplayName("Block 7e: A chosen hour still matches local time across a DST switch - [MEANT TO PASS]")
+    void testBlock7e_chosenHourSurvivesDaylightSaving() {
+        given(clock.instant()).willReturn(EIGHT_AM_NEW_YORK_SUMMER);
+        given(profileServiceClient.getAllUsersForDailySummary())
+                .willReturn(List.of(new UserPreferenceResponse(500L, new BigDecimal("100.00"), true, 8, NEW_YORK_ZONE, "summer@example.com")));
+        given(accountServiceClient.getAggregateBalancesBatch(eq(List.of(500L))))
+                .willReturn(List.of(new UserAggregateBalanceResponse(500L, new BigDecimal("33.00"))));
+
+        dailyBalanceSummaryJob.processDailySummaries();
+
+        verify(notificationProviderService, times(1))
+                .dispatchEmail(eq("summer@example.com"), anyString(), anyString());
+    }
+
+    // One unusable row cannot cost everyone else their summary. A null timezone, a string that isn't a
+    // zone id, and a null hour are all skippable data problems for one user; the sweep has to carry on
+    // to the perfectly good user sitting behind them in the same list.
+    @Test
+    @DisplayName("Block 7f: Users with a null or garbage timezone are skipped and the sweep completes - [MEANT TO PASS]")
+    void testBlock7f_badTimezoneRows_areSkippedAndTheSweepContinues() {
+        given(profileServiceClient.getAllUsersForDailySummary()).willReturn(List.of(
+                new UserPreferenceResponse(600L, new BigDecimal("100.00"), true, 8, null, "nozone@example.com"),
+                new UserPreferenceResponse(601L, new BigDecimal("100.00"), true, 8, "Mars/Olympus_Mons", "badzone@example.com"),
+                // A null hour is the third bad shape: a row written before profile-service had the column.
+                new UserPreferenceResponse(602L, new BigDecimal("100.00"), true, null, NEW_YORK_ZONE, "nohour@example.com"),
+                new UserPreferenceResponse(603L, new BigDecimal("100.00"), true, 8, NEW_YORK_ZONE, "good@example.com")));
+        given(accountServiceClient.getAggregateBalancesBatch(eq(List.of(603L))))
+                .willReturn(List.of(new UserAggregateBalanceResponse(603L, new BigDecimal("44.00"))));
+
+        assertThatCode(() -> dailyBalanceSummaryJob.processDailySummaries()).doesNotThrowAnyException();
+
+        verify(notificationProviderService, times(1))
+                .dispatchEmail(eq("good@example.com"), anyString(), anyString());
+        // and nobody else - the three bad rows produced no send at all, not a send to a wrong address
+        verify(notificationProviderService, times(1)).dispatchEmail(any(), any(), any());
+    }
+
     // making sure an empty opted in list short circuits instead of doing pointless downstream work
-    // stub the profile service to return an empty list no matter what timezone gets asked for
+    // stub the profile service to return an empty list of opted in users
     // call processdailysummaries
     // verify the account service balance lookup never got called at all
     // and verify no email attempt was made either, since there was nobody to send one to
     @Test
     @DisplayName("Block 8: No opted-in users means no downstream balance lookup or email - [MEANT TO PASS]")
     void testBlock8_noOptedInUsers_noDownstreamCalls() {
-        given(profileServiceClient.getUsersForDailySummary(anyString())).willReturn(List.of());
+        given(profileServiceClient.getAllUsersForDailySummary()).willReturn(List.of());
 
         dailyBalanceSummaryJob.processDailySummaries();
 
@@ -216,15 +333,15 @@ class NotificationAlertsTestSuite {
     }
 
     // edge case where the profile service knows about a user but the account service has no balance for them
-    // stub the profile service to return one opted in user
+    // stub the profile service to return one opted in user who is due right now
     // stub the account service's batch balance lookup to come back completely empty for that user
     // call processdailysummaries and expect no exception, this is an in memory join that has to handle gaps
     // then verify no email attempt was made for a user with no balance data to actually report
     @Test
     @DisplayName("Block 9: A user with no matching balance entry is skipped, not errored - [MEANT TO PASS]")
     void testBlock9_userWithoutMatchingBalance_isSkipped() {
-        given(profileServiceClient.getUsersForDailySummary(anyString()))
-                .willReturn(List.of(new UserPreferenceResponse(200L, new BigDecimal("100.00"), true, "any", "summary@example.com")));
+        given(profileServiceClient.getAllUsersForDailySummary())
+                .willReturn(List.of(new UserPreferenceResponse(200L, new BigDecimal("100.00"), true, 8, NEW_YORK_ZONE, "summary@example.com")));
         given(accountServiceClient.getAggregateBalancesBatch(eq(List.of(200L))))
                 .willReturn(List.of()); // Account Service returned nothing for this user
 
@@ -233,15 +350,15 @@ class NotificationAlertsTestSuite {
         verify(notificationProviderService, never()).dispatchEmail(any(), any(), any());
     }
 
-    // making sure one timezone's outage cannot take down the entire daily summary sweep for every region
-    // stub the profile service so looking up users for any timezone string just throws
-    // call processdailysummaries and expect it to not throw anything back out to the scheduler
+    // making sure a profile-service outage cannot escape into the scheduler thread, where the only
+    // symptom would be a cron that stopped firing
+    // stub the opted-in fetch so it just throws
+    // call processdailysummaries and expect it to not throw anything back out
     // then verify no email attempt was made, since nothing could be looked up in this failure scenario
-    // the real job wraps each timezone in its own try/catch so one region's problem stays contained
     @Test
-    @DisplayName("Final Block: A failure looking up one timezone's users does not abort the sweep - [MEANT TO PASS]")
-    void testFinalAC_timezoneFailure_isolatedAndDoesNotPropagate() {
-        given(profileServiceClient.getUsersForDailySummary(anyString()))
+    @DisplayName("Final Block: A failure fetching the opted-in users does not abort the sweep - [MEANT TO PASS]")
+    void testFinalAC_userFetchFailure_isolatedAndDoesNotPropagate() {
+        given(profileServiceClient.getAllUsersForDailySummary())
                 .willThrow(new RuntimeException("Profile Service unavailable"));
 
         assertThatCode(() -> dailyBalanceSummaryJob.processDailySummaries()).doesNotThrowAnyException();
@@ -256,8 +373,8 @@ class NotificationAlertsTestSuite {
     @Test
     @DisplayName("Block 10: A dispatched daily summary is recorded as a SENT DAILY_SUMMARY notification - [MEANT TO PASS]")
     void testBlock10_dispatchedSummary_isRecordedAsSent() {
-        given(profileServiceClient.getUsersForDailySummary(eq(NEW_YORK_ZONE)))
-                .willReturn(List.of(new UserPreferenceResponse(100L, new BigDecimal("100.00"), true, NEW_YORK_ZONE, "summary@example.com")));
+        given(profileServiceClient.getAllUsersForDailySummary())
+                .willReturn(List.of(new UserPreferenceResponse(100L, new BigDecimal("100.00"), true, 8, NEW_YORK_ZONE, "summary@example.com")));
         given(accountServiceClient.getAggregateBalancesBatch(eq(List.of(100L))))
                 .willReturn(List.of(new UserAggregateBalanceResponse(100L, new BigDecimal("5432.10"))));
         given(notificationProviderService.dispatchEmail(anyString(), anyString(), anyString())).willReturn(true);
@@ -281,8 +398,8 @@ class NotificationAlertsTestSuite {
     @Test
     @DisplayName("Block 11: A failed summary dispatch is recorded as FAILED, not SENT - [MEANT TO PASS]")
     void testBlock11_failedSummaryDispatch_isRecordedAsFailed() {
-        given(profileServiceClient.getUsersForDailySummary(eq(NEW_YORK_ZONE)))
-                .willReturn(List.of(new UserPreferenceResponse(101L, new BigDecimal("100.00"), true, NEW_YORK_ZONE, "summary@example.com")));
+        given(profileServiceClient.getAllUsersForDailySummary())
+                .willReturn(List.of(new UserPreferenceResponse(101L, new BigDecimal("100.00"), true, 8, NEW_YORK_ZONE, "summary@example.com")));
         given(accountServiceClient.getAggregateBalancesBatch(eq(List.of(101L))))
                 .willReturn(List.of(new UserAggregateBalanceResponse(101L, new BigDecimal("10.00"))));
         given(notificationProviderService.dispatchEmail(anyString(), anyString(), anyString())).willReturn(false);
@@ -300,8 +417,8 @@ class NotificationAlertsTestSuite {
     @Test
     @DisplayName("Block 12: A user with no email on file is recorded as FAILED and never dispatched - [MEANT TO PASS]")
     void testBlock12_userWithoutEmail_isRecordedFailedAndNotDispatched() {
-        given(profileServiceClient.getUsersForDailySummary(eq(NEW_YORK_ZONE)))
-                .willReturn(List.of(new UserPreferenceResponse(102L, new BigDecimal("100.00"), true, NEW_YORK_ZONE, null)));
+        given(profileServiceClient.getAllUsersForDailySummary())
+                .willReturn(List.of(new UserPreferenceResponse(102L, new BigDecimal("100.00"), true, 8, NEW_YORK_ZONE, null)));
         given(accountServiceClient.getAggregateBalancesBatch(eq(List.of(102L))))
                 .willReturn(List.of(new UserAggregateBalanceResponse(102L, new BigDecimal("77.00"))));
 
@@ -316,24 +433,28 @@ class NotificationAlertsTestSuite {
     }
 
     // the manual trigger path InternalNotificationController uses, running one zone directly without
-    // consulting the clock at all - this is what makes an end-to-end email check possible at any hour
-    // rather than only when the configured summary hour comes round somewhere
+    // consulting the clock at all - this is what makes an end-to-end email check possible at any hour,
+    // and with the global summary hour retired it is the ONLY thing that can bring that moment forward
     @Test
     @DisplayName("Block 13: Running a single timezone directly bypasses the hour check - [MEANT TO PASS]")
     void testBlock13_processUsersForTimezone_runsRegardlessOfHour() {
         String offHourZone = "Asia/Tokyo";
+        // Chosen hour 3, and it is 22:00 in Tokyo - this user is not due by any reading of the clock.
         given(profileServiceClient.getUsersForDailySummary(eq(offHourZone)))
-                .willReturn(List.of(new UserPreferenceResponse(103L, new BigDecimal("100.00"), true, offHourZone, "tokyo@example.com")));
+                .willReturn(List.of(new UserPreferenceResponse(103L, new BigDecimal("100.00"), true, 3, offHourZone, "tokyo@example.com")));
         given(accountServiceClient.getAggregateBalancesBatch(eq(List.of(103L))))
                 .willReturn(List.of(new UserAggregateBalanceResponse(103L, new BigDecimal("900.00"))));
         given(notificationProviderService.dispatchEmail(anyString(), anyString(), anyString())).willReturn(true);
 
         // The stubbed clock is 08:00 in New York, which is 22:00 in Tokyo - so the scheduled sweep
-        // would skip this zone entirely. Calling it directly still sends.
+        // would pass this user over twice, on the zone and on the hour. Calling it directly still sends.
         dailyBalanceSummaryJob.processUsersForTimezone(offHourZone);
 
         verify(notificationProviderService, times(1))
                 .dispatchEmail(eq("tokyo@example.com"), anyString(), anyString());
         verify(notificationRecordRepository, times(1)).save(any(NotificationRecord.class));
+        // and it did NOT fall back to the all-users fetch - the single-zone form is still a single
+        // zone's worth of work
+        verify(profileServiceClient, never()).getAllUsersForDailySummary();
     }
 }

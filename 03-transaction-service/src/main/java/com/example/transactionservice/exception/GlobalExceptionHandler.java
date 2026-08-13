@@ -25,6 +25,15 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(HttpStatus.FORBIDDEN).body(body(ex.getMessage()));
     }
 
+    // 503 rather than the 403 above: the caller isn't forbidden, we just couldn't reach the service
+    // that knows. Nothing moved either way - the KYC gate stays fail-closed - but a retryable
+    // outage answered as a 500 looks like a crash and as a 403 looks like a verdict on the user,
+    // and it's neither.
+    @ExceptionHandler(KycEnforcementAspect.KycStatusUnavailableException.class)
+    public ResponseEntity<Map<String, String>> handleKycStatusUnavailable(KycEnforcementAspect.KycStatusUnavailableException ex) {
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(body(ex.getMessage()));
+    }
+
     // Covers everything thrown by TransferService/ExternalWireService directly ("Invalid IBAN or
     // SWIFT code format.") as well as failures relayed from account-service, which FeignErrorConfig's
     // ErrorDecoder has already re-thrown locally as this same exception type carrying the original

@@ -1,5 +1,6 @@
 package com.example.accountservice;
 
+import com.example.accountservice.client.ProfileServiceClient;
 import com.example.accountservice.dto.AccountOverviewResponseDto;
 import com.example.accountservice.mapper.AccountMapper;
 import com.example.accountservice.model.AccountEntity;
@@ -20,6 +21,7 @@ import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMock
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.data.domain.PageImpl;
+import org.springframework.http.MediaType;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
 import org.springframework.test.web.servlet.MockMvc;
@@ -27,6 +29,8 @@ import org.springframework.test.web.servlet.request.RequestPostProcessor;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.net.ConnectException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -39,13 +43,20 @@ import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.jwt;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
 @SpringBootTest
 @AutoConfigureMockMvc
 class AccountServiceTestSuite {
+
+    // The shared secret guarding /api/v1/internal/**, identical in all five services. The literal is
+    // the dev default from application.yml, which is what this context resolves the property to.
+    private static final String INTERNAL_TOKEN_HEADER = "X-Internal-Token";
+    private static final String INTERNAL_TOKEN = "local-dev-internal-token";
 
     @Autowired
     private MockMvc mockMvc;
@@ -67,6 +78,11 @@ class AccountServiceTestSuite {
 
     @MockBean
     private TransactionRepository transactionRepository;
+
+    // KycEnforcementAspect calls out to profile-service before any deposit or account opening.
+    // Mocked so these tests decide the caller's KYC status instead of needing that service running.
+    @MockBean
+    private ProfileServiceClient profileServiceClient;
 
     private AccountEntity activeChecking;
 
@@ -393,10 +409,15 @@ class AccountServiceTestSuite {
         activeChecking.setIban("XB00021000021123456789012");
         given(accountRepository.findByIban("XB00021000021123456789012")).willReturn(Optional.of(activeChecking));
 
-        mockMvc.perform(get("/api/v1/internal/accounts/lookup").param("iban", "XB00021000021123456789012"))
+        mockMvc.perform(get("/api/v1/internal/accounts/lookup").param("iban", "XB00021000021123456789012")
+                .header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.accountId").value(1))
-                .andExpect(jsonPath("$.userId").value(42));
+                .andExpect(jsonPath("$.userId").value(42))
+                // transaction-service refuses a wire whose BIC doesn't match this, so the field has
+                // to actually be populated - a null here would silently fail that check closed and
+                // start rejecting every legitimate on-us wire.
+                .andExpect(jsonPath("$.swiftCode").value("XBUSUS31"));
     }
 
     @Test
@@ -404,7 +425,8 @@ class AccountServiceTestSuite {
     void testInternalLookupByIban_NoMatch() throws Exception {
         given(accountRepository.findByIban("XB00000000000000000000000")).willReturn(Optional.empty());
 
-        mockMvc.perform(get("/api/v1/internal/accounts/lookup").param("iban", "XB00000000000000000000000"))
+        mockMvc.perform(get("/api/v1/internal/accounts/lookup").param("iban", "XB00000000000000000000000")
+                .header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN))
                 .andExpect(status().isNotFound());
     }
 
@@ -418,7 +440,7 @@ class AccountServiceTestSuite {
     void testInternalLookupByAccountNumber_NeverExposesRawNumber() throws Exception {
         given(accountRepository.findByAccountNumber("9876543210")).willReturn(Optional.of(activeChecking));
 
-        mockMvc.perform(get("/api/v1/internal/accounts/by-number/9876543210"))
+        mockMvc.perform(get("/api/v1/internal/accounts/by-number/9876543210").header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.maskedAccountNumber").value("......3210"))
                 .andExpect(jsonPath("$.accountNumber").doesNotExist());
@@ -469,11 +491,451 @@ class AccountServiceTestSuite {
         given(accountRepository.findByUserIdAndStatusNot(42L, AccountStatus.CLOSED))
                 .willReturn(List.of(activeChecking, secondAccount));
 
-        mockMvc.perform(get("/api/v1/internal/accounts/by-user/42"))
+        mockMvc.perform(get("/api/v1/internal/accounts/by-user/42").header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.length()").value(2))
                 .andExpect(jsonPath("$[0]").value(1))
                 .andExpect(jsonPath("$[1]").value(2));
+    }
+
+    // ==========================================
+    // KYC gate on funding and account opening (POST /api/v1/accounts, POST /{id}/deposit)
+    // ==========================================
+
+    // An unverified identity putting money into the bank is the exact thing know-your-customer
+    // rules exist to stop, so this is refused the same way a transfer already is.
+    @Test
+    @DisplayName("KYC gate: Deposit is refused with 403 while KYC is PENDING_VERIFICATION - [MEANT TO FAIL]")
+    void testDeposit_PendingKyc_Rejected() throws Exception {
+        given(profileServiceClient.getKycStatus(42L)).willReturn(Map.of("status", "PENDING_VERIFICATION"));
+
+        mockMvc.perform(post("/api/v1/accounts/1/deposit")
+                .with(fullAuthUser(42L))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"amount\":100.00}"))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.error").value(org.hamcrest.Matchers.containsString("PENDING_VERIFICATION")));
+
+        // The balance must be untouched - a rejected deposit that still wrote the credit would be
+        // worse than no gate at all.
+        verify(accountRepository, never()).save(any(AccountEntity.class));
+        verify(transactionRepository, never()).save(any(TransactionEntity.class));
+    }
+
+    @Test
+    @DisplayName("KYC gate: Deposit succeeds once KYC is APPROVED - [MEANT TO PASS]")
+    void testDeposit_ApprovedKyc_Succeeds() throws Exception {
+        given(profileServiceClient.getKycStatus(42L)).willReturn(Map.of("status", "APPROVED"));
+        given(accountRepository.findByIdForUpdate(1L)).willReturn(Optional.of(activeChecking));
+
+        mockMvc.perform(post("/api/v1/accounts/1/deposit")
+                .with(fullAuthUser(42L))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"amount\":100.00}"))
+                .andExpect(status().isOk());
+
+        assertThat(activeChecking.getAvailableBalance()).isEqualByComparingTo(new BigDecimal("1600.00"));
+        verify(transactionRepository).save(any(TransactionEntity.class));
+    }
+
+    // Same gate on the other direction: opening an account is the classic KYC moment.
+    @Test
+    @DisplayName("KYC gate: Opening an account is refused with 403 while KYC is REJECTED - [MEANT TO FAIL]")
+    void testOpenAccount_RejectedKyc_Rejected() throws Exception {
+        given(profileServiceClient.getKycStatus(42L)).willReturn(Map.of("status", "REJECTED"));
+
+        mockMvc.perform(post("/api/v1/accounts")
+                .with(fullAuthUser(42L))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"accountType\":\"SAVINGS\"}"))
+                .andExpect(status().isForbidden());
+
+        verify(accountRepository, never()).save(any(AccountEntity.class));
+    }
+
+    @Test
+    @DisplayName("KYC gate: Opening an account succeeds once KYC is APPROVED - [MEANT TO PASS]")
+    void testOpenAccount_ApprovedKyc_Succeeds() throws Exception {
+        given(profileServiceClient.getKycStatus(42L)).willReturn(Map.of("status", "APPROVED"));
+        given(accountRepository.findByUserIdAndStatusNot(42L, AccountStatus.CLOSED)).willReturn(List.of());
+
+        mockMvc.perform(post("/api/v1/accounts")
+                .with(fullAuthUser(42L))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"accountType\":\"SAVINGS\"}"))
+                .andExpect(status().isOk());
+
+        verify(accountRepository).save(any(AccountEntity.class));
+    }
+
+    // The starter account a brand-new user receives comes from the Kafka listener, not this
+    // service method, so provisioning has to keep working for a user who is still PENDING - if this
+    // ever regresses, registration silently stops giving new users an account at all.
+    @Test
+    @DisplayName("KYC gate: Registration provisioning still works for a PENDING user - [MEANT TO PASS]")
+    void testUserRegisteredProvisioning_UnaffectedByKycGate() {
+        given(profileServiceClient.getKycStatus(any())).willReturn(Map.of("status", "PENDING_VERIFICATION"));
+        given(accountRepository.findByUserIdAndStatusNot(99L, AccountStatus.CLOSED)).willReturn(List.of());
+
+        userRegisteredListener.consumeUserRegistered(Map.of("userId", 99, "username", "newuser"));
+
+        verify(accountRepository).save(any(AccountEntity.class));
+    }
+
+    // ==========================================
+    // Owner lookup (GET /api/v1/internal/accounts/{accountId}/owner)
+    // ==========================================
+
+    @Test
+    @DisplayName("Owner lookup resolves an account id to the user who owns it - [MEANT TO PASS]")
+    void testInternalOwnerLookup_KnownAccount_ReturnsOwnerId() throws Exception {
+        given(accountRepository.findById(1L)).willReturn(Optional.of(activeChecking));
+
+        mockMvc.perform(get("/api/v1/internal/accounts/1/owner").header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.ownerUserId").value(42));
+    }
+
+    @Test
+    @DisplayName("Owner lookup returns 404 for an account id that does not exist - [MEANT TO FAIL]")
+    void testInternalOwnerLookup_UnknownAccount_Returns404() throws Exception {
+        given(accountRepository.findById(999L)).willReturn(Optional.empty());
+
+        mockMvc.perform(get("/api/v1/internal/accounts/999/owner").header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN))
+                .andExpect(status().isNotFound());
+    }
+
+    // The whole point of a dedicated single-field response instead of reusing one of the richer
+    // lookup records: the caller asked who owns the account, so that is all it gets. This endpoint
+    // sits under the unauthenticated /api/v1/internal prefix, so anything that leaks here leaks
+    // to whatever can reach the pod, not just to a logged-in owner.
+    @Test
+    @DisplayName("Owner lookup exposes only the owner id, never the number, balance or IBAN - [MEANT TO PASS]")
+    void testInternalOwnerLookup_DoesNotLeakAccountDetails() throws Exception {
+        activeChecking.setIban("XB00021000021123456789012");
+        given(accountRepository.findById(1L)).willReturn(Optional.of(activeChecking));
+
+        mockMvc.perform(get("/api/v1/internal/accounts/1/owner").header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.ownerUserId").value(42))
+                .andExpect(jsonPath("$.accountNumber").doesNotExist())
+                .andExpect(jsonPath("$.maskedAccountNumber").doesNotExist())
+                .andExpect(jsonPath("$.availableBalance").doesNotExist())
+                .andExpect(jsonPath("$.iban").doesNotExist())
+                .andExpect(jsonPath("$.routingNumber").doesNotExist());
+    }
+
+    // ==========================================
+    // KYC gate when profile-service cannot answer (503, still fail-closed)
+    // ==========================================
+
+    // profile-service being unreachable surfaces as the Feign client throwing rather than
+    // returning an empty body, which used to escape unmapped and reach the user as a 500 - reading
+    // as "account-service is broken" when the gate had in fact worked exactly as intended.
+    @Test
+    @DisplayName("KYC gate: Deposit answers 503 (not 500) when profile-service is unreachable - [MEANT TO FAIL]")
+    void testDeposit_ProfileServiceUnreachable_Returns503() throws Exception {
+        given(profileServiceClient.getKycStatus(42L))
+                .willThrow(new RuntimeException("connect timed out", new ConnectException("Connection refused")));
+
+        mockMvc.perform(post("/api/v1/accounts/1/deposit")
+                .with(fullAuthUser(42L))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"amount\":100.00}"))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(jsonPath("$.error").exists())
+                // Both keys carry the same text because the frontend reads either one.
+                .andExpect(jsonPath("$.message").exists());
+
+        // The status change must not have loosened the gate: an unconfirmable identity still
+        // deposits nothing. A 503 that credited the account anyway would be far worse than the 500.
+        verify(accountRepository, never()).save(any(AccountEntity.class));
+        verify(transactionRepository, never()).save(any(TransactionEntity.class));
+    }
+
+    // The other half of the same failure: profile-service answers, but with nothing usable in it.
+    // Treated identically - an absent status is not an approval.
+    @Test
+    @DisplayName("KYC gate: Deposit answers 503 when profile-service returns a body with no status - [MEANT TO FAIL]")
+    void testDeposit_ProfileServiceReturnsNoStatus_Returns503() throws Exception {
+        given(profileServiceClient.getKycStatus(42L)).willReturn(Map.of("userId", "42"));
+
+        mockMvc.perform(post("/api/v1/accounts/1/deposit")
+                .with(fullAuthUser(42L))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"amount\":100.00}"))
+                .andExpect(status().isServiceUnavailable());
+
+        verify(accountRepository, never()).save(any(AccountEntity.class));
+        verify(transactionRepository, never()).save(any(TransactionEntity.class));
+    }
+
+    // Opening an account goes through the same aspect, so it must report the same status rather
+    // than falling back to the old 500 on whichever path happened not to be covered.
+    @Test
+    @DisplayName("KYC gate: Opening an account answers 503 when profile-service is unreachable - [MEANT TO FAIL]")
+    void testOpenAccount_ProfileServiceUnreachable_Returns503() throws Exception {
+        given(profileServiceClient.getKycStatus(42L))
+                .willThrow(new RuntimeException("connect timed out", new ConnectException("Connection refused")));
+
+        mockMvc.perform(post("/api/v1/accounts")
+                .with(fullAuthUser(42L))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"accountType\":\"SAVINGS\"}"))
+                .andExpect(status().isServiceUnavailable());
+
+        verify(accountRepository, never()).save(any(AccountEntity.class));
+    }
+
+    // Guards the distinction the 503 introduces: "we could not check" must not have swallowed
+    // "we checked and you are not approved". A known-bad status is still a 403 naming that status,
+    // and an approved one still goes through - see testDeposit_PendingKyc_Rejected and
+    // testDeposit_ApprovedKyc_Succeeds above for the deposit side of the same pair.
+    @Test
+    @DisplayName("KYC gate: An unapproved status is still 403, not the new 503 - [MEANT TO FAIL]")
+    void testDeposit_UnapprovedKyc_StillReturns403NotUnavailable() throws Exception {
+        given(profileServiceClient.getKycStatus(42L)).willReturn(Map.of("status", "PENDING_VERIFICATION"));
+
+        mockMvc.perform(post("/api/v1/accounts/1/deposit")
+                .with(fullAuthUser(42L))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"amount\":100.00}"))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.error").value(org.hamcrest.Matchers.containsString("PENDING_VERIFICATION")));
+
+        verify(accountRepository, never()).save(any(AccountEntity.class));
+        verify(transactionRepository, never()).save(any(TransactionEntity.class));
+    }
+
+    @Test
+    @DisplayName("KYC gate: An APPROVED status still completes the deposit - [MEANT TO PASS]")
+    void testDeposit_ApprovedKyc_StillSucceedsAfterUnavailableHandling() throws Exception {
+        given(profileServiceClient.getKycStatus(42L)).willReturn(Map.of("status", "APPROVED"));
+        given(accountRepository.findByIdForUpdate(1L)).willReturn(Optional.of(activeChecking));
+
+        mockMvc.perform(post("/api/v1/accounts/1/deposit")
+                .with(fullAuthUser(42L))
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"amount\":100.00}"))
+                .andExpect(status().isOk());
+
+        assertThat(activeChecking.getAvailableBalance()).isEqualByComparingTo(new BigDecimal("1600.00"));
+        verify(transactionRepository).save(any(TransactionEntity.class));
+    }
+
+    // ==========================================
+    // Shared secret on the internal surface (InternalTokenFilter, X-Internal-Token)
+    // ==========================================
+
+    // The endpoint this whole layer exists for. Before the filter, anything that could open a socket
+    // to this service's port could add any amount to any account with no credential whatsoever.
+    @Test
+    @DisplayName("Internal token: credit with no X-Internal-Token is refused 401 and touches nothing - [MEANT TO FAIL]")
+    void testInternalCredit_MissingToken_Rejected() throws Exception {
+        mockMvc.perform(post("/api/v1/internal/accounts/1/credit")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"amount\":100.00,\"description\":\"Incoming wire\"}"))
+                .andExpect(status().isUnauthorized())
+                // Both keys carry the same text, matching every other error body in this project.
+                .andExpect(jsonPath("$.error").exists())
+                .andExpect(jsonPath("$.message").exists());
+
+        // Stronger than "the balance did not change": the rejection must happen in the filter, before
+        // the controller is ever reached, so an unauthenticated caller cannot even probe which account
+        // ids exist by timing or by the shape of the error it gets back.
+        verifyNoInteractions(accountRepository);
+        verifyNoInteractions(transactionRepository);
+    }
+
+    @Test
+    @DisplayName("Internal token: credit with the wrong X-Internal-Token is refused 401 - [MEANT TO FAIL]")
+    void testInternalCredit_WrongToken_Rejected() throws Exception {
+        mockMvc.perform(post("/api/v1/internal/accounts/1/credit")
+                .header(INTERNAL_TOKEN_HEADER, "not-the-real-token")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"amount\":100.00,\"description\":\"Incoming wire\"}"))
+                .andExpect(status().isUnauthorized())
+                // The failure must not describe the mechanism being probed - naming the header or the
+                // property in the body would tell an attacker exactly what they are missing, and
+                // distinguishing "wrong" from "missing" would confirm when a guess is well-formed.
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString(INTERNAL_TOKEN_HEADER))))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString("internal-token"))));
+
+        verifyNoInteractions(accountRepository);
+        verifyNoInteractions(transactionRepository);
+    }
+
+    @Test
+    @DisplayName("Internal token: credit with the correct X-Internal-Token behaves exactly as before - [MEANT TO PASS]")
+    void testInternalCredit_CorrectToken_Succeeds() throws Exception {
+        given(accountRepository.findByIdForUpdate(1L)).willReturn(Optional.of(activeChecking));
+
+        mockMvc.perform(post("/api/v1/internal/accounts/1/credit")
+                .header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"amount\":100.00,\"description\":\"Incoming wire\"}"))
+                .andExpect(status().isOk());
+
+        assertThat(activeChecking.getAvailableBalance()).isEqualByComparingTo(new BigDecimal("1600.00"));
+        verify(transactionRepository).save(any(TransactionEntity.class));
+    }
+
+    @Test
+    @DisplayName("Internal token: debit with no X-Internal-Token is refused 401 and touches nothing - [MEANT TO FAIL]")
+    void testInternalDebit_MissingToken_Rejected() throws Exception {
+        mockMvc.perform(post("/api/v1/internal/accounts/1/debit")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"userId\":42,\"amount\":100.00,\"description\":\"Outgoing wire\"}"))
+                .andExpect(status().isUnauthorized());
+
+        verifyNoInteractions(accountRepository);
+        verifyNoInteractions(transactionRepository);
+    }
+
+    // The scoping half of the contract, and the reason the filter checks the path prefix at all: the
+    // secret guards service-to-service traffic only. If it ever leaked onto the customer-facing API,
+    // every logged-in browser would have to hold a server credential to see its own dashboard.
+    @Test
+    @DisplayName("Internal token: the customer-facing JWT API still works with no X-Internal-Token - [MEANT TO PASS]")
+    void testCustomerFacingEndpoint_NoInternalToken_StillWorks() throws Exception {
+        given(accountRepository.findByUserIdAndStatusNot(42L, AccountStatus.CLOSED))
+                .willReturn(List.of(activeChecking));
+
+        mockMvc.perform(get("/api/v1/accounts").with(fullAuthUser(42)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(1));
+    }
+
+    // ==========================================
+    // Idempotent ledger writes (optional idempotencyKey on credit/debit/transfer)
+    // ==========================================
+
+    // transaction-service issues credit as a remote call from inside its own local @Transactional
+    // block, so a commit failure on its side replays a credit that already landed here. Same key
+    // twice must mean the money moves once.
+    @Test
+    @DisplayName("Idempotency: crediting twice with the SAME key moves the balance once, writes one row - [MEANT TO PASS]")
+    void testInternalCredit_SameIdempotencyKey_AppliedOnce() throws Exception {
+        given(accountRepository.findByIdForUpdate(1L)).willReturn(Optional.of(activeChecking));
+        List<TransactionEntity> ledger = givenLedgerRemembersIdempotencyKeys();
+
+        creditRequest("{\"amount\":100.00,\"description\":\"Incoming wire\",\"idempotencyKey\":\"wire-8821\"}");
+        creditRequest("{\"amount\":100.00,\"description\":\"Incoming wire\",\"idempotencyKey\":\"wire-8821\"}");
+
+        // 1500 + 100, not + 200. The retry is answered 200 as well - the effect it asked for is in
+        // place - which is what keeps the caller from retrying forever.
+        assertThat(activeChecking.getAvailableBalance()).isEqualByComparingTo(new BigDecimal("1600.00"));
+        assertThat(ledger).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("Idempotency: crediting twice with DIFFERENT keys applies both - [MEANT TO PASS]")
+    void testInternalCredit_DifferentIdempotencyKeys_BothApply() throws Exception {
+        given(accountRepository.findByIdForUpdate(1L)).willReturn(Optional.of(activeChecking));
+        List<TransactionEntity> ledger = givenLedgerRemembersIdempotencyKeys();
+
+        creditRequest("{\"amount\":100.00,\"description\":\"Incoming wire\",\"idempotencyKey\":\"wire-8821\"}");
+        creditRequest("{\"amount\":100.00,\"description\":\"Incoming wire\",\"idempotencyKey\":\"wire-8822\"}");
+
+        // Two genuinely different payments that happen to be identical in every other respect are
+        // still two payments - deduplicating on amount and description instead of on the caller's key
+        // would quietly swallow one of them.
+        assertThat(activeChecking.getAvailableBalance()).isEqualByComparingTo(new BigDecimal("1700.00"));
+        assertThat(ledger).hasSize(2);
+    }
+
+    // The compatibility guarantee that makes the field safe to add: no key means the endpoint behaves
+    // exactly as it did before this existed, right down to not consulting the key index at all.
+    @Test
+    @DisplayName("Idempotency: crediting with NO key is unchanged - both calls apply, no lookup happens - [MEANT TO PASS]")
+    void testInternalCredit_NullIdempotencyKey_UnchangedBehaviour() throws Exception {
+        given(accountRepository.findByIdForUpdate(1L)).willReturn(Optional.of(activeChecking));
+        List<TransactionEntity> ledger = givenLedgerRemembersIdempotencyKeys();
+
+        creditRequest("{\"amount\":100.00,\"description\":\"Incoming wire\"}");
+        creditRequest("{\"amount\":100.00,\"description\":\"Incoming wire\"}");
+
+        assertThat(activeChecking.getAvailableBalance()).isEqualByComparingTo(new BigDecimal("1700.00"));
+        assertThat(ledger).hasSize(2);
+        assertThat(ledger).allMatch(transaction -> transaction.getIdempotencyKey() == null);
+        verify(transactionRepository, never()).existsByIdempotencyKey(any());
+    }
+
+    @Test
+    @DisplayName("Idempotency: debiting twice with the SAME key moves the balance once, writes one row - [MEANT TO PASS]")
+    void testInternalDebit_SameIdempotencyKey_AppliedOnce() throws Exception {
+        given(accountRepository.findByIdForUpdate(1L)).willReturn(Optional.of(activeChecking));
+        List<TransactionEntity> ledger = givenLedgerRemembersIdempotencyKeys();
+
+        debitRequest("{\"userId\":42,\"amount\":100.00,\"description\":\"Outgoing wire\",\"idempotencyKey\":\"wire-9001\"}");
+        debitRequest("{\"userId\":42,\"amount\":100.00,\"description\":\"Outgoing wire\",\"idempotencyKey\":\"wire-9001\"}");
+
+        assertThat(activeChecking.getAvailableBalance()).isEqualByComparingTo(new BigDecimal("1400.00"));
+        assertThat(ledger).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("Idempotency: debiting twice with DIFFERENT keys applies both - [MEANT TO PASS]")
+    void testInternalDebit_DifferentIdempotencyKeys_BothApply() throws Exception {
+        given(accountRepository.findByIdForUpdate(1L)).willReturn(Optional.of(activeChecking));
+        List<TransactionEntity> ledger = givenLedgerRemembersIdempotencyKeys();
+
+        debitRequest("{\"userId\":42,\"amount\":100.00,\"description\":\"Outgoing wire\",\"idempotencyKey\":\"wire-9001\"}");
+        debitRequest("{\"userId\":42,\"amount\":100.00,\"description\":\"Outgoing wire\",\"idempotencyKey\":\"wire-9002\"}");
+
+        assertThat(activeChecking.getAvailableBalance()).isEqualByComparingTo(new BigDecimal("1300.00"));
+        assertThat(ledger).hasSize(2);
+    }
+
+    @Test
+    @DisplayName("Idempotency: debiting with NO key is unchanged - both calls apply, no lookup happens - [MEANT TO PASS]")
+    void testInternalDebit_NullIdempotencyKey_UnchangedBehaviour() throws Exception {
+        given(accountRepository.findByIdForUpdate(1L)).willReturn(Optional.of(activeChecking));
+        List<TransactionEntity> ledger = givenLedgerRemembersIdempotencyKeys();
+
+        debitRequest("{\"userId\":42,\"amount\":100.00,\"description\":\"Outgoing wire\"}");
+        debitRequest("{\"userId\":42,\"amount\":100.00,\"description\":\"Outgoing wire\"}");
+
+        assertThat(activeChecking.getAvailableBalance()).isEqualByComparingTo(new BigDecimal("1300.00"));
+        assertThat(ledger).hasSize(2);
+        verify(transactionRepository, never()).existsByIdempotencyKey(any());
+    }
+
+    private void creditRequest(String body) throws Exception {
+        mockMvc.perform(post("/api/v1/internal/accounts/1/credit")
+                .header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(body))
+                .andExpect(status().isOk());
+    }
+
+    private void debitRequest(String body) throws Exception {
+        mockMvc.perform(post("/api/v1/internal/accounts/1/debit")
+                .header(INTERNAL_TOKEN_HEADER, INTERNAL_TOKEN)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(body))
+                .andExpect(status().isOk());
+    }
+
+    // Stands in for the unique index from V8 with the mocked repository: every saved row is
+    // remembered, and the existence check answers from what was actually written. Stubbing
+    // existsByIdempotencyKey to return false-then-true would have been shorter but would pass just as
+    // happily if the service stopped writing the key onto the row at all - the very thing the index
+    // relies on. Returns the list so a test can assert how many rows the ledger really took.
+    private List<TransactionEntity> givenLedgerRemembersIdempotencyKeys() {
+        List<TransactionEntity> written = new ArrayList<>();
+        given(transactionRepository.save(any(TransactionEntity.class))).willAnswer(invocation -> {
+            TransactionEntity transaction = invocation.getArgument(0);
+            written.add(transaction);
+            return transaction;
+        });
+        given(transactionRepository.existsByIdempotencyKey(any())).willAnswer(invocation -> {
+            String key = invocation.getArgument(0);
+            return written.stream().anyMatch(transaction -> key.equals(transaction.getIdempotencyKey()));
+        });
+        return written;
     }
 
     // Reimplements the ISO 7064 mod-97 verification side (mirrors IbanSwiftValidator over in

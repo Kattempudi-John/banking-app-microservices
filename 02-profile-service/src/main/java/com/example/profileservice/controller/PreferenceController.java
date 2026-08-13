@@ -48,7 +48,8 @@ public class PreferenceController {
             @RequestBody @Valid UpdateDailySummaryRequestDto request) {
 
         Long userId = extractUserIdFromAuth();
-        preferenceService.updateDailySummarySettings(userId, request.dailySummaryEnabled(), request.timezone());
+        preferenceService.updateDailySummarySettings(userId, request.dailySummaryEnabled(), request.timezone(),
+                request.dailySummaryHour());
 
         return ResponseEntity.ok("Daily summary preferences successfully updated.");
     }
@@ -56,11 +57,15 @@ public class PreferenceController {
     // email rides along on the preferences response rather than getting its own endpoint: every
     // caller that needs to email a user (notification-service's alert listener and daily summary job)
     // already fetches their preferences first, so this saves a second round trip per send.
+    // dailySummaryHour rides along for the same reason: the page pre-fills the hour picker from this
+    // one response, and notification-service's sweep decides who to send to from it without a second
+    // lookup per user.
     public record UserPreferenceResponse(
             Long userId,
             BigDecimal alertThresholdAmount,
             Boolean dailySummaryEnabled,
             String timezone,
+            Integer dailySummaryHour,
             String email
     ) {}
 

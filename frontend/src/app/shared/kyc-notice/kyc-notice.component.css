@@ -1,0 +1,72 @@
+.kyc-notice {
+  display: flex;
+  gap: var(--space-3);
+  padding: var(--space-5);
+  border-radius: var(--radius-lg);
+  border: var(--border-width) solid;
+}
+
+.kyc-notice-icon {
+  display: flex;
+  flex-shrink: 0;
+}
+
+.kyc-notice-icon svg {
+  width: 20px;
+  height: 20px;
+}
+
+.kyc-notice-content {
+  display: flex;
+  flex-direction: column;
+  /* flex-start keeps the pill and the CTA at their own width instead of stretching the column */
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+
+.kyc-notice-pill {
+  font-size: var(--text-xs);
+  line-height: var(--text-xs-line);
+  font-weight: var(--font-weight-semibold);
+  border-radius: var(--radius-full);
+  padding: var(--space-1) var(--space-2);
+}
+
+.kyc-notice-title {
+  margin: 0;
+  font-size: var(--text-lg);
+  line-height: var(--text-lg-line);
+  font-weight: var(--font-weight-semibold);
+}
+
+.kyc-notice-body {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--text-sm-line);
+}
+
+.kyc-notice-pending {
+  background: var(--color-warning-bg);
+  border-color: var(--color-warning-border);
+  color: var(--color-warning-text);
+}
+
+.kyc-notice-pending .kyc-notice-pill {
+  background: var(--color-warning-border);
+}
+
+.kyc-notice-rejected {
+  background: var(--color-error-bg);
+  border-color: var(--color-error-border);
+  color: var(--color-error-text);
+}
+
+.kyc-notice-rejected .kyc-notice-pill {
+  background: var(--color-error-border);
+}
+
+.kyc-notice-unknown {
+  background: var(--color-info-bg);
+  border-color: var(--color-info-border);
+  color: var(--color-info-text);
+}

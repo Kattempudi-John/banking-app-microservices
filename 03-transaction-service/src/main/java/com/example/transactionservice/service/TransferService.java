@@ -19,19 +19,24 @@ public class TransferService {
 
     private final AccountServiceClient accountServiceClient;
     private final AuthServiceClient authServiceClient;
+    private final RecipientKycValidator recipientKycValidator;
     private final ApplicationEventPublisher eventPublisher;
 
     public TransferService(AccountServiceClient accountServiceClient,
                            AuthServiceClient authServiceClient,
+                           RecipientKycValidator recipientKycValidator,
                            ApplicationEventPublisher eventPublisher) {
         this.accountServiceClient = accountServiceClient;
         this.authServiceClient = authServiceClient;
+        this.recipientKycValidator = recipientKycValidator;
         this.eventPublisher = eventPublisher;
     }
 
     // @RequiresKyc is a custom annotation, not a built in spring one, KycEnforcementAspect
     // intercepts any call to a method carrying this and blocks it before the body even starts
     // if the caller's kyc status is not approved, learned this is aop, aspect oriented programming
+    // No recipient-side check here on purpose: both accounts belong to the caller (account-service
+    // rejects the request otherwise), so the aspect above has already vetted the receiving user.
     @Transactional
     @RequiresKyc
     public TransferResponseDto executeTransfer(Long userId, Long fromAccountId, Long toAccountId, BigDecimal amount) {
@@ -60,6 +65,12 @@ public class TransferService {
                                                           String recipientAccountNumber, BigDecimal amount) {
 
         AccountServiceClient.RecipientLookupResponse recipient = resolveRecipient(recipientAccountNumber);
+
+        // @RequiresKyc above only vouches for the sender. This is the one transfer path where the
+        // money lands on someone else's account, so the receiving side gets checked too - and
+        // before the transfer call below, since account-service debits and credits atomically and
+        // there is no half of that to undo afterwards.
+        recipientKycValidator.requireApprovedRecipient(recipient.ownerUserId());
 
         accountServiceClient.transferToRecipient(new AccountServiceClient.TransferRequest(
                 userId, fromAccountId, recipient.accountId(), amount));
@@ -98,6 +109,13 @@ public class TransferService {
         } catch (RuntimeException e) {
             return null;
         }
+    }
+
+    // Lets the pre-send confirmation lookup show the same verdict the transfer itself will reach,
+    // as a flag instead of an exception - the sender finds out before typing an amount rather than
+    // after pressing send.
+    public boolean isRecipientVerified(Long ownerUserId) {
+        return recipientKycValidator.isApproved(ownerUserId);
     }
 
     private void publishTransferEvent(Long userId, Long fromAccountId, Long toAccountId, BigDecimal amount, UUID transactionId) {

@@ -3,7 +3,7 @@
 <div class="page">
   <div class="page-header">
     <h1>Accounts</h1>
-    @if (!error()) {
+    @if (!error() && kycApproved()) {
       <div class="header-actions">
         @if (accounts().length > 0) {
           <app-button (clicked)="openDepositModal()">Add Funds</app-button>
@@ -12,6 +12,11 @@
       </div>
     }
   </div>
+  <!-- Both actions are refused by account-service until KYC is approved, so say so here rather
+       than offering buttons that can only fail. -->
+  @if (!error() && !kycApproved()) {
+    <app-kyc-notice [status]="kycStatus()" (retry)="loadKycStatus()" />
+  }
   @if (error()) {
     <div class="card stack">
       <p class="text-muted">Unable to load your accounts.</p>

@@ -8,9 +8,11 @@ import org.springframework.stereotype.Component;
 // each service here is an independently-deployable module (the same shared-nothing reasoning the
 // IbanGenerator/IbanSwiftValidator pair in account-service and transaction-service already follows).
 //
-// This service's copy of the phone number isn't what 2FA codes are sent to - auth-service owns that
-// one - but it is the copy the user actually edits on the Profile page, so it's normalized to the
-// same E.164 shape rather than letting the two drift into different formats.
+// This service's copy of the phone number isn't what 2FA codes are sent to, and it is no longer
+// edited here either - the identity form writes through to auth-service and stores the E.164 string
+// that comes back (see ProfileManagementService). What's left for this class is historical rows:
+// PhoneNumberBackfillRunner uses it to bring profiles provisioned before that write-through into the
+// same E.164 shape, so the mirror doesn't display a number in a format the platform no longer uses.
 @Component
 public class PhoneNumberNormalizer {
 
