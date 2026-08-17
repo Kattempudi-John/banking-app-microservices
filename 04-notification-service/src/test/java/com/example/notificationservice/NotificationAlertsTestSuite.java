@@ -13,6 +13,7 @@ import com.example.notificationservice.model.NotificationType;
 import com.example.notificationservice.repository.NotificationRecordRepository;
 import com.example.notificationservice.service.NotificationProviderService;
 import com.example.notificationservice.service.TransactionAlertListener;
+import com.example.notificationservice.service.TwoFactorEmailListener;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -24,13 +25,16 @@ import org.springframework.boot.test.mock.mockito.MockBean;
 import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.never;
@@ -45,6 +49,9 @@ class NotificationAlertsTestSuite {
 
     @Autowired
     private DailyBalanceSummaryJob dailyBalanceSummaryJob;
+
+    @Autowired
+    private TwoFactorEmailListener twoFactorEmailListener;
 
     @MockBean
     private ProfileServiceClient profileServiceClient;
@@ -456,5 +463,138 @@ class NotificationAlertsTestSuite {
         // and it did NOT fall back to the all-users fetch - the single-zone form is still a single
         // zone's worth of work
         verify(profileServiceClient, never()).getAllUsersForDailySummary();
+    }
+
+    // the 2FA code itself is a notification like any other now that it goes by email, so it belongs in
+    // the same dispatch suite as the alerts and summaries - NotificationPersistenceTestSuite covers
+    // what gets RECORDED, this covers what gets SENT
+    // the address comes straight off the event, not from a profile lookup, because auth-service
+    // already has it in hand at the moment it generates the code
+    @Test
+    @DisplayName("Block 14: A 2FA request emails the code to the address on the event - [MEANT TO PASS]")
+    void testBlock14_twoFactorRequest_emailsTheCode() {
+        given(notificationProviderService.dispatchEmail(anyString(), anyString(), anyString())).willReturn(true);
+
+        twoFactorEmailListener.consumeTwoFactorRequest(twoFactorEvent("user@example.com", "123456"));
+
+        verify(notificationProviderService, times(1))
+                .dispatchEmail(eq("user@example.com"), anyString(), contains("123456"));
+        // the address on the event is the one used - no profile lookup happens on this path at all,
+        // which is what keeps a login from depending on profile-service being up
+        verify(profileServiceClient, never()).getUserPreferences(any());
+    }
+
+    // the point of the migration: no SMS goes out for a 2FA code any more, whatever the event still
+    // carries. the payload keeps a phoneNumber, so a listener reading it would silently keep the old
+    // paid channel alive alongside the new one
+    @Test
+    @DisplayName("Block 14b: A 2FA request sends no SMS even though the event carries a number - [MEANT TO PASS]")
+    void testBlock14b_twoFactorRequest_sendsNoSms() {
+        given(notificationProviderService.dispatchEmail(anyString(), anyString(), anyString())).willReturn(true);
+
+        twoFactorEmailListener.consumeTwoFactorRequest(twoFactorEvent("user@example.com", "123456"));
+
+        verify(notificationProviderService, never()).dispatchSms(any(), any());
+    }
+
+    // no address on file is a login that cannot complete, not just a missed alert - nothing is
+    // dispatched, and the miss is recorded rather than passed over in silence, the same way
+    // DailyBalanceSummaryJob handles a user with no email
+    @Test
+    @DisplayName("Block 14c: A 2FA request with no email dispatches nothing and records FAILED - [MEANT TO PASS]")
+    void testBlock14c_twoFactorRequestWithoutEmail_recordsFailed() {
+        twoFactorEmailListener.consumeTwoFactorRequest(twoFactorEvent(null, "123456"));
+
+        verify(notificationProviderService, never()).dispatchEmail(any(), any(), any());
+        verify(notificationProviderService, never()).dispatchSms(any(), any());
+
+        ArgumentCaptor<NotificationRecord> captor = ArgumentCaptor.forClass(NotificationRecord.class);
+        verify(notificationRecordRepository, times(1)).save(captor.capture());
+        assertThat(captor.getValue().getType()).isEqualTo(NotificationType.EMAIL_2FA);
+        assertThat(captor.getValue().getChannel()).isEqualTo(NotificationChannel.EMAIL);
+        assertThat(captor.getValue().getStatus()).isEqualTo(NotificationStatus.FAILED);
+    }
+
+    // the sentence in the email and the countdown on the login screen have to agree. the body used to
+    // say a hardcoded "5 minutes" while the code died at 3:00, so a user who trusted the email was
+    // told they had two minutes that did not exist and got EXPIRED on a code they typed in good faith
+    @Test
+    @DisplayName("Block 14d: The email states the expiry carried on the event - [MEANT TO PASS]")
+    void testBlock14d_twoFactorRequest_bodyStatesTheEventsExpiry() {
+        given(notificationProviderService.dispatchEmail(anyString(), anyString(), anyString())).willReturn(true);
+
+        twoFactorEmailListener.consumeTwoFactorRequest(twoFactorEvent("user@example.com", "123456"));
+
+        ArgumentCaptor<String> body = ArgumentCaptor.forClass(String.class);
+        verify(notificationProviderService).dispatchEmail(anyString(), anyString(), body.capture());
+        assertThat(body.getValue()).contains("It expires in 3 minutes.");
+        // the literal that used to be there - if it survives anywhere in the body the email is lying
+        assertThat(body.getValue()).doesNotContain("5 minutes");
+    }
+
+    // a TTL that is not a whole number of minutes is a config change away, and integer division alone
+    // would render 90s as "1 minute" - telling the user their code dies half a minute before it does
+    @Test
+    @DisplayName("Block 14e: A part-minute expiry reads correctly rather than being truncated - [MEANT TO PASS]")
+    void testBlock14e_twoFactorRequest_partMinuteExpiryReadsCorrectly() {
+        given(notificationProviderService.dispatchEmail(anyString(), anyString(), anyString())).willReturn(true);
+
+        Map<String, Object> event = twoFactorEvent("user@example.com", "123456");
+        event.put("expiresInSeconds", "90");
+        twoFactorEmailListener.consumeTwoFactorRequest(event);
+
+        ArgumentCaptor<String> body = ArgumentCaptor.forClass(String.class);
+        verify(notificationProviderService).dispatchEmail(anyString(), anyString(), body.capture());
+        // singular unit spelled correctly - "1 minutes" in a real security email reads as a phish
+        assertThat(body.getValue()).contains("It expires in 1 minute 30 seconds.");
+    }
+
+    // auth-service and this service deploy independently, so a code can arrive from a producer that
+    // has never heard of expiresInSeconds. that must fall back to the current 180s and still send -
+    // an exception here would drop the code entirely and strand the login
+    @Test
+    @DisplayName("Block 14f: An event with no expiresInSeconds falls back to 3 minutes - [MEANT TO PASS]")
+    void testBlock14f_twoFactorRequest_missingExpiryFallsBackToDefault() {
+        given(notificationProviderService.dispatchEmail(anyString(), anyString(), anyString())).willReturn(true);
+
+        Map<String, Object> event = twoFactorEvent("user@example.com", "123456");
+        event.remove("expiresInSeconds");
+        twoFactorEmailListener.consumeTwoFactorRequest(event);
+
+        ArgumentCaptor<String> body = ArgumentCaptor.forClass(String.class);
+        verify(notificationProviderService).dispatchEmail(anyString(), anyString(), body.capture());
+        assertThat(body.getValue()).contains("123456");
+        assertThat(body.getValue()).contains("It expires in 3 minutes.");
+    }
+
+    // garbage in the key is the other half of the same rollout risk - a null or a non-numeric string
+    // must not take the listener down the catch block and lose the send
+    @Test
+    @DisplayName("Block 14g: An unparseable expiresInSeconds still sends the code - [MEANT TO PASS]")
+    void testBlock14g_twoFactorRequest_unparseableExpiryStillSends() {
+        given(notificationProviderService.dispatchEmail(anyString(), anyString(), anyString())).willReturn(true);
+
+        Map<String, Object> event = twoFactorEvent("user@example.com", "123456");
+        event.put("expiresInSeconds", "soon");
+        twoFactorEmailListener.consumeTwoFactorRequest(event);
+
+        ArgumentCaptor<String> body = ArgumentCaptor.forClass(String.class);
+        verify(notificationProviderService, times(1))
+                .dispatchEmail(anyString(), anyString(), body.capture());
+        assertThat(body.getValue()).contains("It expires in 3 minutes.");
+    }
+
+    // the exact envelope auth-service publishes on notification-events, including the TTL the login
+    // screen counts down. a HashMap rather than Map.of because a null email is a real state - a user
+    // who registered before the field existed - and because these tests override single keys
+    private Map<String, Object> twoFactorEvent(String email, String code) {
+        Map<String, Object> event = new HashMap<>();
+        event.put("action", "TWO_FA_REQUESTED");
+        event.put("userId", "42");
+        event.put("email", email);
+        event.put("phoneNumber", "+15551234567");
+        event.put("code", code);
+        event.put("expiresInSeconds", "180");
+        return event;
     }
 }

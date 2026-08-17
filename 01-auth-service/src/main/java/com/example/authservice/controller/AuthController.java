@@ -3,12 +3,10 @@ package com.example.authservice.controller;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.Base64;
-import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 import java.util.regex.Pattern;
 
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseCookie;
@@ -31,6 +29,7 @@ import com.example.authservice.repository.RefreshTokenRepository;
 import com.example.authservice.repository.UserRepository;
 import com.example.authservice.security.TokenType;
 import com.example.authservice.service.AuthSecurityService;
+import com.example.authservice.service.AuthSecurityService.TwoFaResult;
 import com.example.authservice.service.JwtService;
 import com.example.authservice.util.PhoneNumberNormalizer;
 
@@ -50,12 +49,6 @@ public class AuthController {
     private final UserRepository userRepository;
     private final PasswordEncoder passwordEncoder;
     private final PhoneNumberNormalizer phoneNumberNormalizer;
-
-    // Portfolio-demo affordance: surfaces the just-generated 2FA code in the login response so a
-    // recruiter can click through the real 2FA screen without digging through service logs. This
-    // project only ever runs locally via docker-compose (see README), never a live deployment.
-    @Value("${app.demo.enabled:false}")
-    private boolean demoModeEnabled;
 
     // learned spring does not need an @Autowired annotation here since there is only one
     // constructor, it just automatically injects all five dependencies through this one
@@ -114,9 +107,9 @@ public class AuthController {
             return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of("error", "That email is already registered"));
         }
 
-        // Store the number in E.164 or not at all. This is the number 2FA codes are sent to (see
-        // handleUnrecognizedDeviceLogin below), and the SMS provider rejects any other format - so a
-        // number accepted here in the wrong shape becomes a login that can never complete.
+        // Store the number in E.164 or not at all. 2FA codes go out by email now, but the number
+        // still rides along on the 2FA event as the fallback contact, and the SMS provider rejects
+        // any other format - so a number accepted here in the wrong shape is undeliverable later.
         String normalizedPhone = null;
         if (phoneNumber != null && !phoneNumber.isBlank()) {
             normalizedPhone = phoneNumberNormalizer.normalize(phoneNumber)
@@ -191,22 +184,32 @@ public class AuthController {
 
     private ResponseEntity<?> handleUnrecognizedDeviceLogin(User user) {
         // Unrecognized Device - Require 2FA
+        return issue2faChallenge(user);
+    }
+
+    // Shared by the initial login and by /verify-2fa/resend, so the two can never drift into
+    // answering with different shapes for what is, to the client, the same "we sent you a code"
+    // state. The code itself is not in here and never comes back from the service - the body
+    // carries only the lifetime the UI counts down from.
+    private ResponseEntity<?> issue2faChallenge(User user) {
         String preAuthJwt = jwtService.generateToken(user, TokenType.PRE_AUTH);
-        String code = authSecurityService.triggerSms2fa(user.getId(), user.getPhoneNumber());
+        // Email is passed straight off the User row - auth-service owns that column, so there's no
+        // lookup to make and nothing downstream has to ask another service who this address belongs to.
+        int expiresInSeconds = authSecurityService.trigger2fa(user.getId(), user.getPhoneNumber(), user.getEmail());
 
-        Map<String, String> body = new HashMap<>();
-        body.put("status", "2FA_REQUIRED");
-        body.put("pre_auth_token", preAuthJwt);
-        if (demoModeEnabled) {
-            body.put("demoCode", code);
-        }
-
-        return ResponseEntity.accepted().body(body);
+        // Map.of, not a HashMap: no branch fills this in conditionally any more, and the value has
+        // to stay a number so the client can do arithmetic on it without parsing a string.
+        return ResponseEntity.accepted().body(Map.of(
+                "status", "2FA_REQUIRED",
+                "pre_auth_token", preAuthJwt,
+                "expires_in_seconds", expiresInSeconds));
     }
 
     // ==========================================
     // 2. 2FA Verification Phase
     // ==========================================
+
+    private static final String NOT_AUTHENTICATED_MESSAGE = "Not authenticated. Please log in again.";
 
     @PostMapping("/verify-2fa/sms")
     public ResponseEntity<?> verifySms(@RequestBody Map<String, String> request) {
@@ -214,19 +217,79 @@ public class AuthController {
         // Thanks to our JwtAuthenticationFilter, we ALREADY know who this user is securely!
         // learned securitycontextholder is thread local storage spring security fills in per request,
         // the filter runs earlier in the chain and sets this authentication before this method ever runs
-        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
-        User user = (User) auth.getPrincipal();
+        User user = currentPreAuthUser();
+        if (user == null) {
+            return ResponseEntity.status(401).body(Map.of("error", NOT_AUTHENTICATED_MESSAGE));
+        }
         String code = request.get("code");
 
         // 1. Verify the code
-        boolean isValid = authSecurityService.verifySms2fa(user.getId(), code);
+        TwoFaResult result = authSecurityService.verifySms2fa(user.getId(), code);
 
-        if (!isValid) {
-            return ResponseEntity.status(401).body(Map.of("error", "Invalid 2FA code"));
+        // Each failure gets its own status and a machine-readable reason, because the client has to
+        // react differently to each: a wrong digit means try again, an expired or missing code means
+        // press resend, and a lockout means start the login over. A flat 401 for all four left the
+        // UI guessing, and the two that used to throw came back as 500s.
+        return switch (result) {
+            // 2. Success! Issue Full Access, generate new Device ID, and new Refresh Token
+            case VALID -> buildSuccessfulAuthResponse(user);
+            case INVALID -> ResponseEntity.status(401)
+                    .body(Map.of("error", "Invalid 2FA code", "reason", "INVALID"));
+            case NO_CODE -> ResponseEntity.status(401)
+                    .body(Map.of("error", "No active code. Request a new one.", "reason", "NO_CODE"));
+            // 410 Gone rather than 401: the credential was real, it just no longer exists, and the
+            // frontend keys its "expired, ask for another" state off this status.
+            case EXPIRED -> ResponseEntity.status(410)
+                    .body(Map.of("error", "Your code has expired. Request a new one.", "reason", "EXPIRED"));
+            case LOCKED -> ResponseEntity.status(429)
+                    .body(Map.of("error", "Too many failed attempts. Please log in again.", "reason", "LOCKED"));
+        };
+    }
+
+    // Resending is a separate endpoint rather than a flag on login, because the user has already
+    // passed the password check and re-posting credentials to get a second code would mean the
+    // frontend holding on to the password for the length of the 2FA screen.
+    //
+    // The path is load-bearing. JwtAuthenticationFilter only lets a PRE_AUTH token through on URIs
+    // containing /api/v1/auth/verify-2fa, and SecurityConfig already permits /verify-2fa/** - so
+    // living under that prefix is what makes this reachable at all with the half-authenticated
+    // token the caller is holding. Anywhere else would be a 403 from the filter.
+    @PostMapping("/verify-2fa/resend")
+    public ResponseEntity<?> resend2fa() {
+        User user = currentPreAuthUser();
+        if (user == null) {
+            return ResponseEntity.status(401).body(Map.of("error", NOT_AUTHENTICATED_MESSAGE));
         }
 
-        // 2. Success! Issue Full Access, generate new Device ID, and new Refresh Token
-        return buildSuccessfulAuthResponse(user);
+        // Checked before triggering, since trigger2fa's first act is to delete the row this reads.
+        int retryAfterSeconds = authSecurityService.secondsUntilResendAllowed(user.getId());
+        if (retryAfterSeconds > 0) {
+            return ResponseEntity.status(429).body(Map.of(
+                    "error", "Please wait before requesting another code.",
+                    "retry_after_seconds", retryAfterSeconds));
+        }
+
+        // A fresh pre-auth token comes back with the new code on purpose. The original one is only
+        // good for 5 minutes from login, so a user who resends twice would otherwise end up holding
+        // a code that works and a session token that has already died - stranded on the 2FA screen
+        // with no way forward except starting over.
+        return issue2faChallenge(user);
+    }
+
+    // Both 2FA endpoints sit behind permitAll (the caller has no FULL_AUTH token yet, by
+    // definition), so a request arriving with no Authorization header at all still reaches the
+    // controller - with either a null Authentication or Spring's anonymous one, whose principal is
+    // the String "anonymousUser". Casting either straight to User is a 500. Returns null so the
+    // caller can answer 401, which is what the client can actually act on.
+    private User currentPreAuthUser() {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth == null) {
+            return null;
+        }
+        if (!(auth.getPrincipal() instanceof User user)) {
+            return null;
+        }
+        return user;
     }
 
     private ResponseEntity<?> buildSuccessfulAuthResponse(User user) {

@@ -18,8 +18,8 @@ import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestTemplate;
 
 // Real email delivery via Twilio Email - active when email.provider=twilio, mutually exclusive with
-// the logging and SendGrid clients so Spring only ever has one candidate bean. Carries the balance
-// summaries and transaction alerts; 2FA stays on SMS.
+// the logging and SendGrid clients so Spring only ever has one candidate bean. Carries every
+// notification this service sends, 2FA codes included since they moved off SMS.
 //
 // This is Twilio's own email API (POST https://comms.twilio.com/v1/Emails), NOT the classic SendGrid
 // v3 mail/send that SendGridEmailProviderClient targets. The practical difference that matters here:

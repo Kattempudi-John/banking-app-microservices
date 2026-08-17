@@ -13,7 +13,7 @@ import com.example.notificationservice.repository.NotificationRecordRepository;
 import com.example.notificationservice.service.NotificationProviderService;
 import com.example.notificationservice.service.ProfileNotificationListener;
 import com.example.notificationservice.service.TransactionAlertListener;
-import com.example.notificationservice.service.TwoFactorSmsListener;
+import com.example.notificationservice.service.TwoFactorEmailListener;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -58,7 +58,7 @@ class NotificationPersistenceTestSuite {
     private MockMvc mockMvc;
 
     @Autowired
-    private TwoFactorSmsListener twoFactorSmsListener;
+    private TwoFactorEmailListener twoFactorEmailListener;
 
     @Autowired
     private TransactionAlertListener transactionAlertListener;
@@ -90,36 +90,34 @@ class NotificationPersistenceTestSuite {
     }
 
     @Test
-    @DisplayName("2FA SMS dispatch success persists a SENT notification record - [MEANT TO PASS]")
-    void testTwoFactorSms_Success_PersistsSentRecord() {
-        given(notificationProviderService.dispatchSms(any(), any())).willReturn(true);
-        Map<String, Object> event = Map.of(
-                "action", "SMS_2FA_REQUESTED", "userId", "42", "phoneNumber", "+15551234567", "code", "123456");
+    @DisplayName("2FA email dispatch success persists a SENT notification record - [MEANT TO PASS]")
+    void testTwoFactorEmail_Success_PersistsSentRecord() {
+        given(notificationProviderService.dispatchEmail(any(), any(), any())).willReturn(true);
 
-        twoFactorSmsListener.consumeSmsRequest(event);
+        twoFactorEmailListener.consumeTwoFactorRequest(twoFactorEvent("user@example.com", "123456"));
 
         verify(notificationRecordRepository).save(argThat(record ->
                 record.getUserId().equals(42L)
-                        && record.getType() == NotificationType.SMS_2FA
-                        && record.getChannel() == NotificationChannel.SMS
+                        && record.getType() == NotificationType.EMAIL_2FA
+                        && record.getChannel() == NotificationChannel.EMAIL
                         && record.getStatus() == NotificationStatus.SENT
         ));
     }
 
-    // The record used to store the SMS body verbatim, which put a live one-time code into
+    // The record used to store the message body verbatim, which put a live one-time code into
     // GET /api/v1/notifications - readable off the notifications page long after the login it
-    // belonged to. The SMS itself still has to carry the code; the audit row must not.
+    // belonged to. The email itself still has to carry the code; the audit row must not. Moving the
+    // code from SMS to email changed the identifier being masked, not this rule.
     @Test
     @DisplayName("2FA record stores a masked line, never the code itself - [MEANT TO PASS]")
-    void testTwoFactorSms_RecordNeverContainsTheCode() {
-        given(notificationProviderService.dispatchSms(any(), any())).willReturn(true);
-        Map<String, Object> event = Map.of(
-                "action", "SMS_2FA_REQUESTED", "userId", "42", "phoneNumber", "+15551234567", "code", "987654");
+    void testTwoFactorEmail_RecordNeverContainsTheCode() {
+        given(notificationProviderService.dispatchEmail(any(), any(), any())).willReturn(true);
 
-        twoFactorSmsListener.consumeSmsRequest(event);
+        twoFactorEmailListener.consumeTwoFactorRequest(twoFactorEvent("user@example.com", "987654"));
 
-        // The real SMS keeps the code - redacting that would defeat the point of sending it.
-        verify(notificationProviderService).dispatchSms(eq("+15551234567"), contains("987654"));
+        // The real email keeps the code - redacting that would defeat the point of sending it.
+        verify(notificationProviderService)
+                .dispatchEmail(eq("user@example.com"), any(), contains("987654"));
 
         ArgumentCaptor<NotificationRecord> saved = ArgumentCaptor.forClass(NotificationRecord.class);
         verify(notificationRecordRepository).save(saved.capture());
@@ -127,22 +125,107 @@ class NotificationPersistenceTestSuite {
         assertThat(saved.getValue().getMessage())
                 .as("a one-time code must never be persisted to the notification feed")
                 .doesNotContain("987654");
-        // Masked to the last four digits, so the row still says which number was texted.
-        assertThat(saved.getValue().getMessage()).isEqualTo("Verification code sent to ***4567.");
+        // Masked to the first character and the domain, so the row still says which address was
+        // mailed without republishing it in a feed the user reopens indefinitely.
+        assertThat(saved.getValue().getMessage()).isEqualTo("Verification code sent to u***@example.com.");
+        assertThat(saved.getValue().getMessage()).doesNotContain("user@example.com");
+    }
+
+    // The event carries a phoneNumber too - auth-service publishes the whole contact set - and it must
+    // not end up in the row now that no SMS is sent. A record naming a number nothing was sent to is
+    // both wrong and an unmasked contact detail sitting in the feed.
+    @Test
+    @DisplayName("2FA record carries no phone number now that the code goes by email - [MEANT TO PASS]")
+    void testTwoFactorEmail_RecordCarriesNoPhoneNumber() {
+        given(notificationProviderService.dispatchEmail(any(), any(), any())).willReturn(true);
+
+        twoFactorEmailListener.consumeTwoFactorRequest(twoFactorEvent("user@example.com", "123456"));
+
+        verify(notificationProviderService, never()).dispatchSms(any(), any());
+        assertThat(capturedMessage())
+                .doesNotContain("+15551234567")
+                .doesNotContain("4567");
     }
 
     @Test
-    @DisplayName("2FA SMS dispatch failure persists a FAILED notification record - [MEANT TO FAIL]")
-    void testTwoFactorSms_Failure_PersistsFailedRecord() {
-        // dispatchSms's @Recover swallows the underlying exception - the false return is the only
+    @DisplayName("2FA email dispatch failure persists a FAILED notification record - [MEANT TO FAIL]")
+    void testTwoFactorEmail_Failure_PersistsFailedRecord() {
+        // dispatchEmail's @Recover swallows the underlying exception - the false return is the only
         // signal a failure happened, exactly what the listener now checks.
-        given(notificationProviderService.dispatchSms(any(), any())).willReturn(false);
-        Map<String, Object> event = Map.of(
-                "action", "SMS_2FA_REQUESTED", "userId", "42", "phoneNumber", "+15551234567", "code", "123456");
+        given(notificationProviderService.dispatchEmail(any(), any(), any())).willReturn(false);
 
-        twoFactorSmsListener.consumeSmsRequest(event);
+        twoFactorEmailListener.consumeTwoFactorRequest(twoFactorEvent("user@example.com", "123456"));
 
         verify(notificationRecordRepository).save(argThat(record -> record.getStatus() == NotificationStatus.FAILED));
+    }
+
+    // Users who registered before the email field existed have no address on file, and 2FA over email
+    // makes that a login they cannot complete rather than an alert they miss. Dispatching to a blank
+    // recipient would look like a success while going nowhere, so the miss is recorded as FAILED -
+    // the same shape TransactionAlertListener and DailyBalanceSummaryJob use.
+    @Test
+    @DisplayName("A 2FA request with no email on file records FAILED and dispatches nothing - [MEANT TO PASS]")
+    void testTwoFactorEmail_NoEmailOnFile_RecordsFailedWithoutDispatching() {
+        twoFactorEmailListener.consumeTwoFactorRequest(twoFactorEvent(null, "123456"));
+
+        verify(notificationProviderService, never()).dispatchEmail(any(), any(), any());
+
+        ArgumentCaptor<NotificationRecord> saved = ArgumentCaptor.forClass(NotificationRecord.class);
+        verify(notificationRecordRepository).save(saved.capture());
+        assertThat(saved.getValue().getUserId()).isEqualTo(42L);
+        assertThat(saved.getValue().getType()).isEqualTo(NotificationType.EMAIL_2FA);
+        assertThat(saved.getValue().getStatus()).isEqualTo(NotificationStatus.FAILED);
+        assertThat(saved.getValue().getMessage())
+                .as("the row still must not carry the code, failed send or not")
+                .doesNotContain("123456");
+    }
+
+    // A blank string is the other shape a missing address arrives in, and "" would be accepted by a
+    // null check alone - the provider would then be handed an empty recipient.
+    @Test
+    @DisplayName("A blank email is treated exactly like a missing one - [MEANT TO PASS]")
+    void testTwoFactorEmail_BlankEmailIsTreatedAsMissing() {
+        twoFactorEmailListener.consumeTwoFactorRequest(twoFactorEvent("   ", "123456"));
+
+        verify(notificationProviderService, never()).dispatchEmail(any(), any(), any());
+        verify(notificationRecordRepository).save(argThat(record ->
+                record.getStatus() == NotificationStatus.FAILED));
+    }
+
+    // auth-service and notification-service deploy independently, so during a rollout this listener
+    // sees events both with and without expiresInSeconds. A missing key must be a fallback, never an
+    // exception: the listener catches Throwable-free and would only log, meaning every code in flight
+    // would be silently dropped - a login nobody can finish and no record explaining why.
+    @Test
+    @DisplayName("An event with no expiresInSeconds still sends and records normally - [MEANT TO PASS]")
+    void testTwoFactorEmail_MissingTtlFallsBackWithoutBreakingTheRecord() {
+        given(notificationProviderService.dispatchEmail(any(), any(), any())).willReturn(true);
+
+        twoFactorEmailListener.consumeTwoFactorRequest(twoFactorEventWithoutTtl("user@example.com", "123456"));
+
+        verify(notificationProviderService).dispatchEmail(eq("user@example.com"), any(), contains("123456"));
+        // Still the masked line, still SENT - the missing key changes the sentence in the email, not
+        // the shape of the audit row.
+        verify(notificationRecordRepository).save(argThat(record ->
+                record.getStatus() == NotificationStatus.SENT
+                        && record.getMessage().equals("Verification code sent to u***@example.com.")));
+    }
+
+    // The topic carries more than one kind of event, so the action filter is the whole guard against
+    // this listener mailing a code for something that was never a 2FA request.
+    @Test
+    @DisplayName("An event with another action is ignored entirely - [MEANT TO PASS]")
+    void testTwoFactorEmail_OtherActionsAreIgnored() {
+        // The action this listener answered to before the switch to email. auth-service no longer
+        // publishes it, and if an old producer somehow did, nothing here should act on it.
+        Map<String, Object> legacyEvent = Map.of(
+                "action", "SMS_2FA_REQUESTED", "userId", "42",
+                "email", "user@example.com", "phoneNumber", "+15551234567", "code", "123456");
+
+        twoFactorEmailListener.consumeTwoFactorRequest(legacyEvent);
+
+        verify(notificationProviderService, never()).dispatchEmail(any(), any(), any());
+        verify(notificationRecordRepository, never()).save(any());
     }
 
     @Test
@@ -498,6 +581,29 @@ class NotificationPersistenceTestSuite {
     // ==========================================
     // Helpers
     // ==========================================
+
+    // The exact envelope auth-service puts on notification-events for a login that needs a code:
+    // action, userId, email, phoneNumber, the code itself and the TTL the login screen counts down.
+    // phoneNumber is still published and this listener no longer reads it - a HashMap rather than
+    // Map.of because a null email is a real state (a user who registered before the field existed)
+    // and Map.of rejects nulls outright. expiresInSeconds is a String, as the whole payload is.
+    private Map<String, Object> twoFactorEvent(String email, String code) {
+        Map<String, Object> event = twoFactorEventWithoutTtl(email, code);
+        event.put("expiresInSeconds", "180");
+        return event;
+    }
+
+    // The same envelope as an auth-service that has not been redeployed yet publishes it. The two
+    // services ship independently, so this shape is live traffic during a rollout, not a relic.
+    private Map<String, Object> twoFactorEventWithoutTtl(String email, String code) {
+        Map<String, Object> event = new HashMap<>();
+        event.put("action", "TWO_FA_REQUESTED");
+        event.put("userId", "42");
+        event.put("email", email);
+        event.put("phoneNumber", "+15551234567");
+        event.put("code", code);
+        return event;
+    }
 
     private void givenProfileEmailOnFile() {
         given(profileServiceClient.getUserPreferences(42L))

@@ -30,17 +30,30 @@ account-service:
 auth-service:
   url: ${AUTH_SERVICE_URL:http://auth-service:8080}
 
-# Prod defaults to the real providers, unlike the dev profile which defaults to logging. Every
-# credential comes from the environment - none of these have an inline fallback, so a missing secret
-# fails startup loudly instead of quietly downgrading to logging and dropping real notifications.
+# 2FA is delivered over email now, so SendGrid is the only provider prod has to be able to reach, and
+# the only one whose credentials are mandatory here.
+#
+# sms.provider defaults to "logging", NOT "twilio". It used to default to twilio, and that was a live
+# outage waiting to happen: TwilioSmsProviderClient's @PostConstruct throws IllegalStateException the
+# moment one of its three credentials is blank, and all three fall back to blank below - so a cluster
+# carrying only SendGrid secrets crash-looped this pod at startup, with nothing wrong except that it
+# was asked for a provider 2FA no longer uses. The SMS clients stay wired up rather than deleted
+# (Textbelt and Twilio are still useful for a one-off manual check, and for whatever non-2FA use SMS
+# may get later), they are simply dormant. Turning Twilio back on means setting SMS_PROVIDER=twilio
+# AND all three TWILIO_* values together - one without the other is exactly the crash above.
 sms:
-  provider: ${SMS_PROVIDER:twilio}
+  provider: ${SMS_PROVIDER:logging}
   textbelt-key: ${TEXTBELT_KEY:textbelt}
   twilio:
     account-sid: ${TWILIO_ACCOUNT_SID:}
     auth-token: ${TWILIO_AUTH_TOKEN:}
     from-number: ${TWILIO_FROM_NUMBER:}
 
+# Email is the whole notification path in prod - 2FA codes, balance summaries, transaction alerts -
+# so unlike the dev profile it defaults to real delivery: a prod pod quietly writing 2FA codes into
+# its own log instead of sending them is worse than one that refuses to start. SendGridEmailProviderClient
+# enforces that, throwing at boot when either value below is blank. That is why the two SENDGRID_* keys
+# in k8s/07-notification-service.yaml are the required ones and the TWILIO_* keys are not.
 email:
   provider: ${EMAIL_PROVIDER:sendgrid}
   sendgrid:

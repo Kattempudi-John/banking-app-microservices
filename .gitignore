@@ -55,3 +55,14 @@ aws-deployment-plan/
 
 # stray maven debug output, not meant to be tracked
 maven-debug.log
+
+# scratch folder for drafting prompts and notes, everything in here is personal working
+# material and none of it belongs in the repo
+prompts/
+
+# local working notes - the operational reference and the architecture write-up that goes with
+# it. Both are personal scratch documentation about how the repo actually behaves, including
+# a running list of things the README overstates, so they stay local rather than becoming a
+# second source of truth alongside README.md
+CLAUDE.md
+docs/ARCHITECTURE.md

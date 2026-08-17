@@ -16,6 +16,7 @@ import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
 import org.springframework.boot.test.autoconfigure.orm.jpa.TestEntityManager;
 import org.springframework.dao.DataIntegrityViolationException;
 
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.Optional;
 
@@ -107,6 +108,67 @@ class AuthDatabaseSchemaTestSuite {
         // Then: Code is permanently deleted
         Optional<TwoFactorCode> found = twoFactorCodeRepository.findByUserId(300L);
         assertThat(found).isEmpty();
+    }
+
+    // the lifetime the row expires on and the number the login response counts down from are now the
+    // same configured value, so the constructor takes it rather than hardcoding one - this pins that
+    // expires_at is actually derived from what was passed in, since a stale literal in here would put
+    // the on-screen countdown and the database on two different deadlines
+    @Test
+    @DisplayName("Table 2: TwoFactorCode expires_at is derived from the TTL it was given - [MEANT TO PASS]")
+    void testTwoFactorCode_TtlDrivesExpiresAt() {
+        // Given: A code minted with an explicit 180 second lifetime
+        LocalDateTime before = LocalDateTime.now();
+        TwoFactorCode code = new TwoFactorCode(310L, "hashed-ttl-code", 180);
+        entityManager.persistAndFlush(code);
+        entityManager.clear(); // read the persisted values back, not the in-memory object
+
+        // When: Reading the row back out of the database
+        Optional<TwoFactorCode> stored = twoFactorCodeRepository.findByUserId(310L);
+
+        // Then: Both timestamp columns survived the round trip and sit 180 seconds apart
+        assertThat(stored).isPresent();
+        assertThat(stored.get().getCreatedAt()).isNotNull();
+        assertThat(stored.get().getExpiresAt()).isNotNull();
+        assertThat(Duration.between(stored.get().getCreatedAt(), stored.get().getExpiresAt()).getSeconds())
+                .isEqualTo(180);
+        // and the code is live right now rather than born expired
+        assertThat(stored.get().isExpired()).isFalse();
+        assertThat(stored.get().getCreatedAt()).isAfterOrEqualTo(before.minusSeconds(1));
+    }
+
+    // the no-argument-TTL constructor still exists for callers that don't care, and it has to land
+    // on the same 180 the property defaults to - two different defaults would mean a code whose
+    // database deadline disagrees with the countdown the user is watching
+    @Test
+    @DisplayName("Table 2: TwoFactorCode two-arg constructor falls back to the shared 180s default - [MEANT TO PASS]")
+    void testTwoFactorCode_DefaultTtlMatchesConfiguredFallback() {
+        TwoFactorCode code = new TwoFactorCode(320L, "hashed-default-ttl-code");
+        entityManager.persistAndFlush(code);
+        entityManager.clear();
+
+        Optional<TwoFactorCode> stored = twoFactorCodeRepository.findByUserId(320L);
+
+        assertThat(stored).isPresent();
+        assertThat(Duration.between(stored.get().getCreatedAt(), stored.get().getExpiresAt()).getSeconds())
+                .isEqualTo(TwoFactorCode.DEFAULT_TTL_SECONDS);
+    }
+
+    // created_at is what the 30 second resend cooldown is measured from - it was only ever written
+    // before, never read, so nothing until now would have caught it coming back null or unset
+    @Test
+    @DisplayName("Table 2: created_at is persisted and readable for the resend cooldown - [MEANT TO PASS]")
+    void testTwoFactorCode_CreatedAtIsQueryable() {
+        TwoFactorCode code = new TwoFactorCode(330L, "hashed-cooldown-code", 180);
+        entityManager.persistAndFlush(code);
+        entityManager.clear();
+
+        Optional<TwoFactorCode> stored = twoFactorCodeRepository.findByUserId(330L);
+
+        assertThat(stored).isPresent();
+        // a code minted moments ago is still well inside the cooldown window
+        assertThat(Duration.between(stored.get().getCreatedAt(), LocalDateTime.now()).getSeconds())
+                .isLessThan(30);
     }
 
     // this one is for the bulk revoke query on refresh tokens

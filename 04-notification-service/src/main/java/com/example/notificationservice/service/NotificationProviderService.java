@@ -45,7 +45,10 @@ public class NotificationProviderService {
     @Recover
     public boolean recoverDispatchFailure(RuntimeException e, String userEmail, String subject, String htmlContent) {
         // In a production system, this would write the failed payload to a Dead Letter Queue (DLQ)
-        // or a failed_notifications database table for a cron job to retry tomorrow.
+        // or a failed_notifications database table for a cron job to retry tomorrow. Worth noting
+        // what now rides on this path: 2FA codes deliver by email, so an exhausted retry here is a
+        // login nobody can finish, not only an alert nobody reads - and a code is time-sensitive
+        // enough that "retry tomorrow" is not a real recovery for it.
         log.error("CRITICAL FAILURE: Exhausted all retries for email to [{}]. Reason: {}", userEmail, e.getMessage());
         log.error("Payload saved to Dead Letter Queue for manual review.");
         return false;
@@ -64,8 +67,9 @@ public class NotificationProviderService {
 
     @Recover
     public boolean recoverSmsDispatchFailure(RuntimeException e, String phoneNumber, String message) {
-        // Same DLQ story as recoverDispatchFailure - a 2FA code that never arrives is time-sensitive,
-        // so this at least keeps the failure from crashing the consumer/blocking other Kafka messages.
+        // Same DLQ story as recoverDispatchFailure. Nothing dispatches SMS since 2FA moved to email,
+        // so this path is dormant rather than hot - it stays because the SMS clients do, and a
+        // swallowed failure here still beats one that crashes a consumer.
         log.error("CRITICAL FAILURE: Exhausted all retries for SMS to [{}]. Reason: {}", phoneNumber, e.getMessage());
         log.error("Payload saved to Dead Letter Queue for manual review.");
         return false;

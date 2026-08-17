@@ -144,6 +144,29 @@ describe('NotificationsComponent', () => {
     expect(notificationServiceSpy.getNotifications).toHaveBeenCalledWith(0, { type: 'DAILY_SUMMARY' });
   });
 
+  it('offers EMAIL_2FA as a type filter, since 2FA codes are emailed now', () => {
+    // The option values are the API filter contract, not display labels - they have to match
+    // notification-service's enum exactly. SMS_2FA stays because records written before the switch
+    // are still served by the feed and still have to be reachable.
+    setup();
+
+    const values = Array.from<HTMLOptionElement>(
+      fixture.nativeElement.querySelectorAll('#typeFilter option'),
+    ).map((option) => option.value);
+
+    expect(values).toContain('EMAIL_2FA');
+    expect(values).toContain('SMS_2FA');
+  });
+
+  it('re-fetches the first page with EMAIL_2FA when that type is chosen', () => {
+    setup();
+    notificationServiceSpy.getNotifications.calls.reset();
+
+    setFilter('#typeFilter', 'EMAIL_2FA');
+
+    expect(notificationServiceSpy.getNotifications).toHaveBeenCalledWith(0, { type: 'EMAIL_2FA' });
+  });
+
   it('sends every selected filter together rather than only the last one touched', () => {
     setup();
     setFilter('#typeFilter', 'TRANSACTION_ALERT');

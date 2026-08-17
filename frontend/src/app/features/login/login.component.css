@@ -19,3 +19,35 @@
 .auth-card a {
   font-size: var(--text-sm);
 }
+
+.verify-hint {
+  font-size: var(--text-sm);
+  margin-bottom: var(--space-4);
+}
+
+/* The min-height reserves the height of a button (padding + line box + borders, per the button's
+   own rules) even while only the one-line timer is showing, so the card does not grow and shove
+   the form down at the exact moment the timer swaps for the Resend button. */
+.countdown-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  min-height: calc(var(--space-2) * 2 + var(--text-sm-line) + var(--border-width) * 2);
+  margin-bottom: var(--space-4);
+}
+
+.countdown-timer {
+  font-size: var(--text-sm);
+  line-height: var(--text-sm-line);
+  color: var(--muted-foreground);
+  /* Default proportional figures are different widths, so the text visibly twitches as the digits
+     change every second. Tabular figures keep every digit on the same advance. */
+  font-variant-numeric: tabular-nums;
+}
+
+.countdown-expired {
+  font-size: var(--text-sm);
+  line-height: var(--text-sm-line);
+  color: var(--color-error-text);
+}

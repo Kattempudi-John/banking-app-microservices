@@ -1,7 +1,10 @@
-# notification service deployment, listens on kafka for transfer/profile events and sends alert emails,
-# only running one replica since this is a background worker, not something that takes direct traffic
-# since nothing calls this directly, one copy is enough for now, could bump replicas later
-# purely to process kafka messages faster in parallel, not to handle more inbound requests
+# notification service deployment, listens on kafka for transfer/profile events and sends the emails -
+# 2FA codes, balance summaries and transaction alerts, all of it over SendGrid now that 2FA is email
+# rather than SMS.
+# mostly a background worker, so one replica: the only inbound traffic is the Notifications page
+# reading its own history (GET /api/v1/notifications, routed in 08-ingress-routes.yaml), which is a
+# cheap indexed read. Worth bumping replicas to chew through kafka messages in parallel long before
+# inbound request volume becomes the reason.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -22,8 +25,16 @@ spec:
           image: your-docker-registry/notification-service:latest
           ports:
             - containerPort: 8080
-          # this one skips envFrom on purpose, no db credentials needed since it has no database of its own,
-          # just kafka to consume events and redis, probably for retry/rate limit state down the line
+          # this used to skip envFrom on the belief that the service has no database. It does have one:
+          # every send is written to notification.notification_records, and application-prod.yml runs
+          # Flyway plus ddl-auto=validate against ${DB_HOST}/${DB_USERNAME}/${DB_PASSWORD}. Without
+          # the configmap the pod also never got SPRING_PROFILES_ACTIVE=prod, so it fell back to the
+          # dev profile and its localhost:5432 datasource. Same two refs as every other service.
+          envFrom:
+            - configMapRef:
+                name: banking-global-config
+            - secretRef:
+                name: banking-db-secret
           env:
             - name: KAFKA_BOOTSTRAP_SERVERS
               value: "kafka.banking-app.svc.cluster.local:9092"
@@ -31,23 +42,46 @@ spec:
               value: "redis-master.banking-app.svc.cluster.local"
             - name: REDIS_PORT
               value: "6379"
-            # Twilio (SMS 2FA) and SendGrid (summaries/alerts) credentials.
+            # SendGrid credentials. SendGrid carries everything this service sends in prod - 2FA
+            # codes, balance summaries and transaction alerts - since 2FA moved off SMS, so these
+            # two keys are the only notification secrets a deploy needs.
             #
             # These deliberately reference a secret that is NOT in this repo. Unlike
             # banking-db-secret in 02-secrets.yaml, which holds obviously-fake placeholder values,
-            # these are real credentials that can be used to send messages billed to your account -
-            # so the manifest holding them must never be committed. Create it directly instead:
+            # a SendGrid API key is a real credential that can be used to send mail billed to your
+            # account - so the manifest holding it must never be committed. Create it directly:
             #
             #   kubectl create secret generic banking-notification-secret \
             #     --namespace banking-app \
-            #     --from-literal=TWILIO_ACCOUNT_SID=... \
-            #     --from-literal=TWILIO_AUTH_TOKEN=... \
-            #     --from-literal=TWILIO_FROM_NUMBER=+15551234567 \
             #     --from-literal=SENDGRID_API_KEY=... \
             #     --from-literal=SENDGRID_FROM_EMAIL=alerts@yourdomain.com
             #
-            # optional: true on every key means the pod still starts without this secret present -
-            # it just falls back to the logging providers rather than crash-looping.
+            # No optional: true on these two, unlike the Twilio keys below. It would be misleading:
+            # application-prod.yml sets email.provider=sendgrid, and SendGridEmailProviderClient
+            # throws at boot if either value is blank, so a missing secret is a crash-loop either
+            # way. Declaring them required turns that into a config error kubectl reports against
+            # the pod, naming the key, before the container is ever created.
+            - name: SENDGRID_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: banking-notification-secret
+                  key: SENDGRID_API_KEY
+            - name: SENDGRID_FROM_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: banking-notification-secret
+                  key: SENDGRID_FROM_EMAIL
+            # Twilio SMS, dormant. sms.provider defaults to "logging" in both profiles now that 2FA
+            # is email, so nothing reads these - they stay wired up because the Twilio and Textbelt
+            # clients are still in the codebase for a future SMS channel or a one-off manual check.
+            # optional: true is what makes that safe: with the keys absent from the secret the pod
+            # starts normally. To actually turn SMS back on, add all three keys to the secret above
+            # AND set SMS_PROVIDER=twilio here - either half alone fails startup, which is precisely
+            # how the old SMS_PROVIDER default of "twilio" crash-looped this pod.
+            #
+            #     --from-literal=TWILIO_ACCOUNT_SID=... \
+            #     --from-literal=TWILIO_AUTH_TOKEN=... \
+            #     --from-literal=TWILIO_FROM_NUMBER=+15551234567
             - name: TWILIO_ACCOUNT_SID
               valueFrom:
                 secretKeyRef:
@@ -65,18 +99,6 @@ spec:
                 secretKeyRef:
                   name: banking-notification-secret
                   key: TWILIO_FROM_NUMBER
-                  optional: true
-            - name: SENDGRID_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: banking-notification-secret
-                  key: SENDGRID_API_KEY
-                  optional: true
-            - name: SENDGRID_FROM_EMAIL
-              valueFrom:
-                secretKeyRef:
-                  name: banking-notification-secret
-                  key: SENDGRID_FROM_EMAIL
                   optional: true
 ---
 # clusterip even though nothing external hits this service directly, keeping it consistent with the others

@@ -10,16 +10,28 @@ export interface LoginSuccessResponse {
 
 export interface TwoFaRequiredResponse {
   status: '2FA_REQUIRED';
+  // snake_case is kept verbatim from the auth-service JSON rather than camelCased here, so the
+  // interface stays a literal description of the wire format and nothing has to remap it.
   pre_auth_token: string;
-  // Only present when the backend's app.demo.enabled flag is on (local/demo runs only) — lets the
-  // login UI show/prefill the code instead of it only being visible in notification-service's logs.
-  demoCode?: string;
+  // How long the emailed code stays valid. The backend owns the TTL (it can change per environment),
+  // so the login screen counts down from this value instead of hard-coding three minutes.
+  expires_in_seconds: number;
 }
 
 export type LoginResponse = LoginSuccessResponse | TwoFaRequiredResponse;
 
 export interface VerifyTwoFaRequest {
   code: string;
+}
+
+// Shaped identically to TwoFaRequiredResponse today, but kept as its own type because it is a
+// different endpoint's contract: resend always reissues the pre-auth token (the login one is only
+// good for five minutes, so a user who waits for a second code would otherwise be left holding a
+// fresh code and a dead session), and it can never return the SUCCESS variant that login can.
+export interface ResendTwoFaResponse {
+  status: '2FA_REQUIRED';
+  pre_auth_token: string;
+  expires_in_seconds: number;
 }
 
 export interface RefreshResponse {

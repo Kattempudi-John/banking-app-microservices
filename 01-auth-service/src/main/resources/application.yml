@@ -41,8 +41,11 @@ server:
   port: 8081
 
 app:
-  # portfolio-demo affordance: surfaces the just-generated 2FA code in the login response so it can
-  # be shown in the UI instead of read from notification-service's logs. Explicitly off in prod below.
+  # Portfolio-demo flag, spelled the same way in every service: profile-service auto-approves KYC
+  # and account-service seeds sample transactions while it is on. Nothing in auth-service reads it
+  # any more - the login response used to echo the just-generated 2FA code back under this flag,
+  # which sent the second factor down the very response it was supposed to be a second factor for.
+  # Kept here so the flag looks identical in all five configs. Explicitly off in prod below.
   demo:
     enabled: true
 
@@ -56,3 +59,10 @@ application:
     # under any profile; the literal fallback keeps docker-compose working with zero configuration
     # while a real deployment sets INTERNAL_SERVICE_TOKEN from the same k8s secret everywhere.
     internal-token: ${INTERNAL_SERVICE_TOKEN:local-dev-internal-token}
+    two-factor:
+      # How long a 2FA code stays usable. This one number is the row's expires_at, the number the
+      # login/resend responses hand back as expires_in_seconds, and the value that rides along on
+      # the Kafka event so the email says the same thing the on-screen countdown does - changing it
+      # here changes all four together. Every @Value reading it keeps an inline :180 fallback, so
+      # tests and a fresh checkout need no config at all.
+      code-ttl-seconds: 180

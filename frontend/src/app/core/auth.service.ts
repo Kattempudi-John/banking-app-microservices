@@ -9,6 +9,7 @@ import {
   RefreshResponse,
   RegisterRequest,
   RegisterResponse,
+  ResendTwoFaResponse,
   VerifyTwoFaRequest,
 } from './models/auth.models';
 
@@ -52,6 +53,24 @@ export class AuthService {
             this.accessTokenSignal.set(response.access_token);
           }
         }),
+      );
+  }
+
+  // Same manual Authorization header as verifyTwoFa: the JWT interceptor only attaches
+  // accessToken(), which is still null mid-2FA, so without building the header here the request
+  // would leave the browser unauthenticated and come back 401.
+  resendTwoFaCode(): Observable<ResendTwoFaResponse> {
+    const headers = new HttpHeaders({ Authorization: `Bearer ${this.preAuthToken}` });
+    return this.http
+      .post<ResendTwoFaResponse>(`${this.baseUrl}/verify-2fa/resend`, null, {
+        headers,
+        withCredentials: true,
+      })
+      .pipe(
+        // The backend reissues the pre-auth token on every resend precisely so a user who waits out
+        // one code is not left with a valid new code and an expired session. Restash it here or
+        // that protection is thrown away and the next request still sends the dying token.
+        tap((response) => (this.preAuthToken = response.pre_auth_token)),
       );
   }
 

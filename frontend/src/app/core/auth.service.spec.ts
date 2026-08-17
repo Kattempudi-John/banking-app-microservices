@@ -48,7 +48,7 @@ describe('AuthService', () => {
     service.login({ username: 'jdoe', password: 'secret123' }).subscribe();
 
     const req = httpMock.expectOne(`${environment.authApiUrl}/login`);
-    req.flush({ status: '2FA_REQUIRED', pre_auth_token: 'pre-auth-xyz' });
+    req.flush({ status: '2FA_REQUIRED', pre_auth_token: 'pre-auth-xyz', expires_in_seconds: 180 });
 
     expect(service.accessToken()).toBeNull();
     expect(service.isLoggedIn()).toBeFalse();
@@ -58,7 +58,7 @@ describe('AuthService', () => {
     service.login({ username: 'jdoe', password: 'secret123' }).subscribe();
     httpMock
       .expectOne(`${environment.authApiUrl}/login`)
-      .flush({ status: '2FA_REQUIRED', pre_auth_token: 'pre-auth-xyz' });
+      .flush({ status: '2FA_REQUIRED', pre_auth_token: 'pre-auth-xyz', expires_in_seconds: 180 });
 
     service.verifyTwoFa({ code: '123456' }).subscribe();
     const req = httpMock.expectOne(`${environment.authApiUrl}/verify-2fa/sms`);
@@ -68,6 +68,41 @@ describe('AuthService', () => {
 
     expect(service.accessToken()).toBe('full-token-123');
     expect(service.isLoggedIn()).toBeTrue();
+  });
+
+  // The JWT interceptor only attaches accessToken(), which is null until 2FA completes, so the
+  // pre-auth bearer has to be built by hand or this request goes out anonymous and 401s.
+  it('requests a fresh 2FA code using the pre-auth token', () => {
+    service.login({ username: 'jdoe', password: 'secret123' }).subscribe();
+    httpMock
+      .expectOne(`${environment.authApiUrl}/login`)
+      .flush({ status: '2FA_REQUIRED', pre_auth_token: 'pre-auth-xyz', expires_in_seconds: 180 });
+
+    service.resendTwoFaCode().subscribe();
+    const req = httpMock.expectOne(`${environment.authApiUrl}/verify-2fa/resend`);
+    expect(req.request.method).toBe('POST');
+    expect(req.request.headers.get('Authorization')).toBe('Bearer pre-auth-xyz');
+    expect(req.request.withCredentials).toBeTrue();
+    req.flush({ status: '2FA_REQUIRED', pre_auth_token: 'pre-auth-2nd', expires_in_seconds: 180 });
+  });
+
+  // Resend reissues the pre-auth token so a user who waits out the first code is not left holding a
+  // valid new code and a dead session. That only helps if the fresh token replaces the stored one.
+  it('restashes the reissued pre-auth token so later requests use it', () => {
+    service.login({ username: 'jdoe', password: 'secret123' }).subscribe();
+    httpMock
+      .expectOne(`${environment.authApiUrl}/login`)
+      .flush({ status: '2FA_REQUIRED', pre_auth_token: 'pre-auth-xyz', expires_in_seconds: 180 });
+
+    service.resendTwoFaCode().subscribe();
+    httpMock
+      .expectOne(`${environment.authApiUrl}/verify-2fa/resend`)
+      .flush({ status: '2FA_REQUIRED', pre_auth_token: 'pre-auth-2nd', expires_in_seconds: 180 });
+
+    service.resendTwoFaCode().subscribe();
+    const secondReq = httpMock.expectOne(`${environment.authApiUrl}/verify-2fa/resend`);
+    expect(secondReq.request.headers.get('Authorization')).toBe('Bearer pre-auth-2nd');
+    secondReq.flush({ status: '2FA_REQUIRED', pre_auth_token: 'pre-auth-3rd', expires_in_seconds: 180 });
   });
 
   it('refreshes the access token using the refresh-token cookie', () => {

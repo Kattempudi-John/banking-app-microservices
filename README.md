@@ -47,7 +47,7 @@ graph TD
 
     Profile -- "profile-events, kyc-events" --> Kafka
     Txn -- "successful-transfers, large-transfers-review" --> Kafka
-    Auth -- "notification-events (SMS 2FA), user-events (registration)" --> Kafka
+    Auth -- "notification-events (2FA code, emailed), user-events (registration)" --> Kafka
     Kafka --> Notif
     Kafka --> Audit
     Kafka -- "user-events" --> Profile
@@ -82,11 +82,11 @@ This system was implemented against 10 functional-requirement documents (FR1–F
 
 | Service | Port | Responsibility |
 |---|---|---|
-| `01-auth-service` | 8081 | Login, registration, device fingerprinting, TOTP/SMS 2FA, refresh/logout, JWT issuance — sole owner of the phone number 2FA codes are sent to |
+| `01-auth-service` | 8081 | Login, registration, device fingerprinting, TOTP/emailed-code 2FA, refresh/logout, JWT issuance — sole owner of both contact columns, including the email address 2FA codes are sent to |
 | `02-profile-service` | 8082 | KYC verification/webhook/admin override, identity & contact info, alert & daily-summary preferences; provisions a profile on registration |
 | `03-account-service` | 8083 | Account dashboard, paginated transaction history, self-service open-account/add-funds — sole owner of the accounts ledger; provisions a starter account on registration |
 | `03-transaction-service` | 8084 | Internal transfers, external wires, fraud-threshold review |
-| `04-notification-service` | 8085 | Kafka-driven real-time alerts + scheduled daily balance summary; real SMS/email delivery via Twilio/SendGrid; exposes `/api/v1/notifications` |
+| `04-notification-service` | 8085 | Kafka-driven 2FA codes and real-time alerts + scheduled daily balance summary; real email delivery via SendGrid (dormant Twilio/TextBelt SMS clients still selectable); exposes `/api/v1/notifications` |
 | `05-audit-service` | 8086 | Immutable, insert-only audit log of profile/KYC changes (no REST API) |
 | `frontend` | 4200 | Angular web client — login/2FA, dashboard, transactions, transfers, history, notifications, profile, alert preferences |
 
@@ -94,11 +94,11 @@ This system was implemented against 10 functional-requirement documents (FR1–F
 
 `frontend/` is an Angular 22 single-page app that talks to `auth-service`, `profile-service`, `account-service`, `transaction-service`, and `notification-service` directly over REST (`audit-service` has no REST API, so the frontend never calls it). Each of those services has a `CorsConfigurationSource` bean scoped to `http://localhost:4200` with credentials enabled, since the frontend and backend run on different ports locally.
 
-**Pages:** `/signup` (self-service registration) → `/login` (credentials + SMS 2FA) → `/dashboard` (account list, plus opening a further account and adding funds — both KYC-gated) → `/accounts/:id/transactions` (paginated history) → `/transfer` (own-account transfers, paying another user by account number, and external wire — all KYC-gated) → `/history` (ledger entries and wires merged, filterable) → `/notifications` (delivered alert log) → `/profile` (identity verification, KYC status, account number/IBAN/SWIFT to receive money) → `/profile/alerts` (threshold + daily summary).
+**Pages:** `/signup` (self-service registration) → `/login` (credentials + emailed 2FA code) → `/dashboard` (account list, plus opening a further account and adding funds — both KYC-gated) → `/accounts/:id/transactions` (paginated history) → `/transfer` (own-account transfers, paying another user by account number, and external wire — all KYC-gated) → `/history` (ledger entries and wires merged, filterable) → `/notifications` (delivered alert log) → `/profile` (identity verification, KYC status, account number/IBAN/SWIFT to receive money) → `/profile/alerts` (threshold + daily summary).
 
 **Registration provisioning:** `POST /api/v1/auth/register` (or the `/signup` page) creates the auth-service credentials, then publishes a `user-events` Kafka event that `profile-service` and `account-service` each consume independently to provision their own initial row — a `PENDING_VERIFICATION` profile and a `$0` `CHECKING` account — so a freshly-registered user has a usable (if empty) dashboard and KYC status immediately, no manual seeding required. That starter account comes from the Kafka listener, not the self-service open-account path, so it is deliberately outside the KYC gate — otherwise a brand-new user would be verified-gated out of the very account they need in order to get verified. See [Identity verification (KYC)](#identity-verification-kyc) below for how a user gets verified so the rest unlocks.
 
-Registration also rejects a phone number that is already registered to somebody else with a `409`, alongside the existing duplicate-username and duplicate-email checks. The number is what receives that account's 2FA codes, so letting two users share one hands the second of them the keys to the first one's login.
+Registration rejects a username, email address or phone number already registered to somebody else with a `409`; all three are unique columns on `users`. The email check is the one now carrying the security weight, because the address is what receives that account's 2FA codes — letting two users share one hands the second of them the keys to the first one's login. The phone number stays unique too: it is still the account's contact number and the fallback destination if SMS delivery is ever switched back on, and a shared number would put us straight back in that position.
 
 ## Running this project
 
@@ -133,18 +133,37 @@ docker-compose up -d
 ./mvnw test                    # run from inside any one service's directory
 ```
 
-**5. Create a test user** — register via `POST /api/v1/auth/register` (or the frontend's `/signup` page) with `{"username", "password", "phoneNumber", "email"}`. This is the preferred path: it also publishes the `user-events` Kafka event that provisions a `PENDING_VERIFICATION` profile and a `$0` checking account (with its own IBAN) automatically (see [Frontend](#frontend) above) — `auth-service`, `profile-service`, and `account-service` all need to be running for that to happen. Give each test user a distinct phone number: usernames, emails and phone numbers are all unique, so reusing a number from an earlier test user comes back as a `409` rather than creating the account.
+**5. Create a test user** — register via `POST /api/v1/auth/register` (or the frontend's `/signup` page) with `{"username", "password", "phoneNumber", "email"}`. This is the preferred path: it also publishes the `user-events` Kafka event that provisions a `PENDING_VERIFICATION` profile and a `$0` checking account (with its own IBAN) automatically (see [Frontend](#frontend) above) — `auth-service`, `profile-service`, and `account-service` all need to be running for that to happen. Give each test user a distinct email address and phone number: usernames, emails and phone numbers are all unique, so reusing either from an earlier test user comes back as a `409` rather than creating the account. The email matters most — it is where that user's 2FA codes go.
 
 If you'd rather skip the API and insert a user directly into Postgres (bcrypt hash below is for password `Password123!`), note that this bypasses the `user-events` publish entirely — you'll need to seed `user_profiles`/`accounts` rows yourself too:
 
 ```bash
 docker exec banking-postgres-local psql -U dbadmin -d banking -c "
-INSERT INTO users (username, password, phone_number, totp_enabled)
-VALUES ('e2etest', '\$2b\$10\$FQ/4MWYZrC9XB.zJl1TFuemdJY2lMP7hFzpdHAkweAHHhZP2UBKme', '+15551234567', false);
+INSERT INTO users (username, password, phone_number, email, totp_enabled)
+VALUES ('e2etest', '\$2b\$10\$FQ/4MWYZrC9XB.zJl1TFuemdJY2lMP7hFzpdHAkweAHHhZP2UBKme', '+15551234567', 'e2etest@example.com', false);
 "
 ```
 
-Either way, KYC starts out `PENDING_VERIFICATION`, and transfers, opening a further account and adding funds are all gated on it — fill in the verification form on `/profile` to get approved (see [Identity verification (KYC)](#identity-verification-kyc)), or update `user_profiles` directly. The starter account itself arrives regardless, so an unverified user still has something to look at. To test paying another user you need **two** verified users: the recipient's own verification is checked as well as the sender's. First login from a new browser is a 2FA challenge — the SMS code is only published to Kafka (`notification-service` just logs it, since email/SMS providers are placeholders) — so for local testing without running `notification-service`, insert a `recognized_devices` row for that user (`device_hash` = base64(SHA-256(raw-device-id))) and send that raw value as a `Device-ID` cookie on login to skip 2FA entirely.
+Fill in `email` even for a throwaway user — it is the column 2FA codes are delivered to, and leaving it null means no code can be produced for that user at all, so a pre-seeded recognized device is the only way to log them in.
+
+Either way, KYC starts out `PENDING_VERIFICATION`, and transfers, opening a further account and adding funds are all gated on it — fill in the verification form on `/profile` to get approved (see [Identity verification (KYC)](#identity-verification-kyc)), or update `user_profiles` directly. The starter account itself arrives regardless, so an unverified user still has something to look at. To test paying another user you need **two** verified users: the recipient's own verification is checked as well as the sender's.
+
+**Getting past 2FA locally.** First login from a new browser is a 2FA challenge, and the code is emailed rather than texted: `auth-service` mints it, publishes it on `notification-events`, and `notification-service` delivers it to the address on the user's `users` row. The code is never handed back over the API — the `202` from `POST /api/v1/auth/login` carries only `{"status": "2FA_REQUIRED", "pre_auth_token": "...", "expires_in_seconds": 180}` — so getting in locally means actually reading the code somewhere. Two ways, easiest first:
+
+1. **Read it out of the log (recommended).** With `notification-service` running and `email.provider` left at its `logging` default, the code is written to that service's console instead of being mailed. No credentials, no mailbox, and you get to watch the whole Kafka path run. It does mean `notification-service` and Kafka have to be up: there is no longer a shortcut that skips them.
+2. **Skip 2FA altogether.** Insert a `recognized_devices` row for that user (`device_hash` = base64(SHA-256(raw-device-id))) and send that raw value as a `Device-ID` cookie on login. Handy for scripted/E2E runs where you don't want a challenge at all.
+
+**The code expires, and the login screen says so.** A code is good for three minutes — `application.security.two-factor.code-ttl-seconds` in `auth-service`, default `180`. That one number is the row's `expires_at`, the `expires_in_seconds` the API returns, and the value that rides along on the Kafka event so the email and the on-screen countdown agree. The 2FA screen counts down from it and, at `0:00`, swaps in a **Resend** button: `POST /api/v1/auth/verify-2fa/resend` mints a fresh code and reissues the pre-auth token, since the original is only good for five minutes and a user waiting on a second code would otherwise end up holding a live code and a dead session. Resending within 30 seconds of the current code is a `429` with `retry_after_seconds`. Submitting a lapsed code is a `410`, distinct from the `401` a simply wrong one gets, so the screen can tell the user to request a new code rather than to retype the old one.
+
+**Sending a real email locally.** Register the test user with an address you can actually read, then point `email.provider` at `sendgrid` and supply the key (see [Notification providers](#notification-providers) for the variables and the safety notes). One wrinkle worth stating plainly: Spring Boot does **not** read `.env` — filling that file in and running `./mvnw spring-boot:run` changes nothing, and the service quietly keeps logging instead of sending. The variables have to be in the shell's own environment first:
+
+```bash
+# Git Bash / macOS / Linux, from the repo root
+set -a && source .env && set +a
+cd 04-notification-service && ./mvnw spring-boot:run
+```
+
+The PowerShell equivalent is in [Notification providers](#notification-providers). Export in the same shell you start the service from — a second terminal that never sourced `.env` starts a service with none of the values set.
 
 **6. Start the frontend** from `frontend/`:
 
@@ -203,8 +222,11 @@ hear from the vendor. Two rules hold regardless of that flag:
 An earlier "Simulate KYC Approval (Demo)" button approved a user on a click with no information
 collected at all; it has been removed in favour of the form above.
 
-**The phone number belongs to `auth-service`, not to the identity form.** `users.phone_number` is the
-address 2FA codes are actually delivered to, so it is the only copy that can be authoritative. The
+**The phone number belongs to `auth-service`, not to the identity form.** `auth-service` owns the
+contact columns — `users.email` is where 2FA codes are delivered and `users.phone_number` is the
+account's number of record — so its copy is the only one that can be authoritative. That was
+originally argued from 2FA delivery, and it survives the move to email unchanged: the problem was
+ever two independently editable copies of one fact, not which channel happened to use it. The
 identity form no longer keeps an independently editable copy: `profile-service` writes the submitted
 number through to `auth-service`'s internal phone-number endpoint first, stores whatever E.164 value
 comes back, and reads that same endpoint when pre-filling. If `auth-service` rejects the number the
@@ -212,8 +234,9 @@ submission throws before anything is saved — no profile write, no Kafka event,
 A unique index backs the rule on both sides (`uk_users_phone_number`, `uq_user_profiles_phone_number`),
 so a code path that ever wrote the column directly would be refused by the database rather than
 quietly recreating a duplicate. Before this, the identity form could claim a number already
-registered to another user, and "changing" a number here left login codes still going to the old one
-with nothing to indicate the two had drifted apart. Re-submitting your own unchanged number is a
+registered to another user, and "changing" a number here left the real contact number — at the time,
+the one login codes were texted to — pointing at the old value, with nothing to indicate the two had
+drifted apart. Re-submitting your own unchanged number is a
 success, not a conflict — otherwise nobody could edit their address without also changing their phone.
 
 **The recipient has to be verified too.** A sender passing their own KYC check is only half of it:
@@ -231,25 +254,43 @@ separately from the receiving-side reason the money went back.
 
 ### Notification providers
 
-2FA codes and transaction alerts go out through swappable provider clients in
-`04-notification-service`, selected by a single property each. Both default to `logging`, which
-writes the message to the service log and needs no account or key — so everything above runs with
-zero setup. Exactly one client bean matches the chosen value, so there is never any ambiguity.
+Every notification this system sends — 2FA codes included — now goes out over **email**, through
+swappable provider clients in `04-notification-service` selected by a single property. It defaults
+to `logging`, which writes the message to the service log and needs no account or key, so everything
+above runs with zero setup. Exactly one client bean matches the chosen value, so there is never any
+ambiguity about which one is live.
 
 | Property | Values | Delivers |
 |---|---|---|
-| `sms.provider` | `logging` (default), `textbelt`, `twilio` | 2FA codes |
-| `email.provider` | `logging` (default), `twilio`, `sendgrid` | Balance summaries, transaction alerts, profile security notices |
+| `email.provider` | `logging` (default), `sendgrid`, `twilio` | **2FA codes**, balance summaries, transaction alerts, profile security notices |
+| `sms.provider` | `logging` (default), `textbelt`, `twilio` | Nothing, currently — the SMS path is dormant (see below) |
+
+**Why one channel.** 2FA used to be the one thing that went by SMS, which meant the project needed
+two provider accounts, two sets of credentials and two delivery paths to demonstrate one feature. It
+also meant the least reliable and most expensive channel was the one guarding login: per-message SMS
+costs money from the first text, carrier filtering silently drops application traffic, and the
+number has to be verified separately from the address the same user is already receiving alerts at.
+Consolidating on SendGrid means one key, one verified sender, one client to reason about when a
+message doesn't arrive — and 2FA rides the same delivery path that is already exercised every day by
+the summary job, so a broken provider shows up in ordinary use rather than at someone's login.
+
+**The SMS clients are still here.** `TwilioSmsProviderClient` and `TextBeltSmsProviderClient` have
+not been deleted, and `sms.provider` still selects between them and the logging default. They are
+the clearest illustration of the point the provider abstraction exists to make — the same
+`@ConditionalOnProperty` pattern, two real vendors behind one interface, swapped by a single
+property with no caller touched — and keeping them means switching a channel back on is a config
+change rather than a rewrite. What has changed is that nothing routes 2FA to them any more; they are
+dormant, not dead.
 
 The two real email options are different products, which is why both clients exist:
 
+- **`sendgrid`** — the classic SendGrid v3 API, and the intended provider. Single-sender
+  verification works without DNS access, so it can be stood up on an address you already control,
+  which is what makes it practical for a project without a domain to authenticate.
 - **`twilio`** — Twilio Email (`POST https://comms.twilio.com/v1/Emails`). Authenticates with the
-  same `TWILIO_ACCOUNT_SID`/`TWILIO_AUTH_TOKEN` pair the SMS client uses, so enabling email adds no
-  new secret — only `TWILIO_FROM_EMAIL`. Requires the sender domain to be authenticated via DNS in
-  the Twilio console.
-- **`sendgrid`** — the classic SendGrid v3 API, a separate product with its own key. Its
-  single-sender verification works without DNS access, which makes it the practical fallback when
-  domain authentication isn't an option.
+  same `TWILIO_ACCOUNT_SID`/`TWILIO_AUTH_TOKEN` pair the (now dormant) SMS client uses, so it adds
+  no new secret beyond `TWILIO_FROM_EMAIL`. It requires the sender domain to be authenticated via
+  DNS in the Twilio console, which is the reason it isn't the default.
 
 To send for real, copy the template and fill in your credentials:
 
@@ -275,28 +316,38 @@ Get-Content .env | Where-Object { $_ -match '^\s*[^#].*=' } | ForEach-Object {
 Every credential is read from an environment variable with a blank fallback, so they are never
 written into a tracked file. **Do not replace the `${VAR:}` placeholders in `application.yml` with
 literal values** — that file is committed, and anything that reaches git stays in the history even
-after it's deleted. A leaked Twilio auth token can be used to send messages billed to your account;
-rotate it in the Twilio console immediately if that happens.
+after it's deleted. A leaked SendGrid API key (or Twilio auth token) can be used to send mail billed
+to your account, and mail sent from your verified sender address — rotate it in the provider's
+console immediately if that happens. That key now also carries login codes, so treat it as an auth
+credential rather than a marketing one.
 
 Credentials have no defaults on purpose: a real provider selected with a blank credential fails at
 startup naming the missing property, rather than silently dropping notifications.
 
 For Kubernetes, the notification-service deployment reads the same variable names from a
 `banking-notification-secret` that is deliberately **not** in this repo — create it with
-`kubectl create secret generic` (the exact command is in `k8s/07-notification-service.yaml`). Every
-key is marked `optional: true`, so the pod still starts without it and falls back to logging.
+`kubectl create secret generic` (the exact command is in `k8s/07-notification-service.yaml`). The two
+SendGrid keys are required there rather than `optional: true`: the prod profile selects
+`email.provider=sendgrid`, and the client refuses to start with a blank credential, so marking them
+optional would only turn a config error kubectl could report against the pod into a crash loop. The
+dormant Twilio SMS keys stay `optional: true`, which is what lets the pod start without them.
 
-`textbelt` is a middle option for SMS: its free tier needs no signup at all (1 text/day/IP), enough
-to prove the 2FA path end-to-end without opening a Twilio account.
+`textbelt` remains the cheapest way to exercise the dormant SMS path if you ever want to see it
+work: its free tier needs no signup at all (1 text/day/IP), so the swappable-provider design can be
+demonstrated end-to-end without opening a Twilio account.
 
-The notification feed records that a 2FA code was sent, not the code itself — the stored line is
-`Verification code sent to ***4567.` while the real SMS carries the code. A one-time code written
-into a page the user can reopen later is a credential sitting in an audit trail, so `V3` in
+The notification feed records that a 2FA code was sent, not the code itself — the stored line names
+the masked destination while only the delivered email carries the code. A one-time code written into
+a page the user can reopen later is a credential sitting in an audit trail, so `V3` in
 `04-notification-service` also redacts any historical rows.
 
-Email is delivered to the address captured at registration and stored on the user's profile. A user
-registered before that field existed has none, and is skipped with a logged warning rather than
-being mailed at a fabricated address.
+**Where the address comes from.** `auth-service` owns `users.email` — it is captured at registration,
+unique across accounts, and is the address a 2FA code is sent to; it rides along on the
+`notification-events` message so `notification-service` never has to call back to ask who a code
+belongs to. Alerts and daily summaries read the profile copy instead, since those are driven by the
+preferences that live there. Either way a user with no address on file is skipped with a logged
+warning rather than being mailed at a fabricated one — which for 2FA means they cannot complete a
+login on an unrecognised device at all, so the null case is a real gap and not just a missed alert.
 
 ### Daily balance summary
 
@@ -319,15 +370,20 @@ For an immediate check, trigger it directly:
 
 ```bash
 # One timezone, right now - skips the hour check entirely
-curl -X POST "http://localhost:8085/api/v1/internal/notifications/daily-summary/run?timezone=America/New_York"
+curl -X POST "http://localhost:8085/api/v1/internal/notifications/daily-summary/run?timezone=America/New_York" \
+  -H "X-Internal-Token: local-dev-internal-token"
 
 # Or the exact sweep the scheduler would run
-curl -X POST "http://localhost:8085/api/v1/internal/notifications/daily-summary/run"
+curl -X POST "http://localhost:8085/api/v1/internal/notifications/daily-summary/run" \
+  -H "X-Internal-Token: local-dev-internal-token"
 ```
 
-Like every other unauthenticated endpoint in this project it lives under `/api/v1/internal/`, the one
-prefix `k8s/08-ingress-routes.yaml` deliberately does not route — it sends real email, so a routed
-version would be reachable by anyone who could reach the load balancer.
+The header is not optional: like every other endpoint under `/api/v1/internal/`, this one is gated by
+`InternalTokenFilter` and answers `401` without it (see [On endpoint exposure](#known-limitations)
+below). `local-dev-internal-token` is the dev default baked into all five services so local runs need
+no configuration; a real environment overrides it via `INTERNAL_SERVICE_TOKEN`. The prefix is also
+still absent from `k8s/08-ingress-routes.yaml` — this endpoint sends real email, and a routed version
+would at least be reachable to probe by anyone who could reach the load balancer.
 
 Each summary is written to `notification_records` as a `DAILY_SUMMARY`, so it appears in
 `/notifications` alongside the Kafka-driven alerts. A user who opted in but has no email address on
@@ -343,21 +399,40 @@ Terraform (`terraform/`) defines the target AWS footprint (VPC, RDS Postgres, EK
 
 Being upfront about what's intentionally not production-complete:
 
-- **Notification providers default to logging.** Real delivery is wired and ready — Twilio for SMS, Twilio Email or SendGrid for email — but `sms.provider`/`email.provider` default to `logging` so the project runs with zero credentials. Set them to `twilio` and supply the keys (see [Notification providers](#notification-providers) below) to send for real.
-- **Twilio Email sends are fire-and-forget.** The API is asynchronous: a `202 Accepted` means queued, not delivered, and returns an `operationId` the client logs. Polling `operationLocation` for the final per-message outcome isn't implemented, so a message accepted by Twilio and then bounced is recorded `SENT` here.
+- **Notification providers default to logging.** Real delivery is wired and ready — SendGrid (or Twilio Email) for everything, including 2FA codes — but `email.provider` defaults to `logging` so the project runs with zero credentials. Set it to `sendgrid` and supply the key (see [Notification providers](#notification-providers) above) to send for real. In the default state the code is logged rather than mailed, so local login means reading it off `notification-service`'s console — nothing returns it over the API any more, in any profile.
+- **Email is now a single point of failure for login.** Consolidating on one provider bought simplicity at the cost of a channel with no fallback: if SendGrid is down, or the message lands in spam, or the user's `email` column is null, there is no second route to that user's 2FA code and they cannot log in from an unrecognised device. The dormant SMS clients are the obvious fallback and a real deployment should wire one — code that picks a channel per user, or falls back after a failed dispatch, isn't written yet.
+- **Email sends are fire-and-forget.** Both providers answer `202 Accepted`, which means queued, not delivered. SendGrid's per-message outcome only arrives via its Event Webhook, and Twilio Email's via polling the `operationLocation` the client logs — neither is implemented, so a message accepted by the provider and then bounced is recorded `SENT` here. That mattered less when this only covered alerts; now that a login code rides the same path, `SENT` genuinely does not mean the user received it.
 - **The daily summary has no distributed lock.** `k8s/07-notification-service.yaml` pins `replicas: 1` precisely because a second replica would run the same hourly sweep and double-send. Scaling that deployment out needs ShedLock or equivalent first.
 - **No role-based authorization system yet.** Profile-service's admin KYC-override endpoint requires `ADMIN`/`COMPLIANCE_OFFICER` roles, but nothing in the system currently grants roles to a user — that endpoint is reachable in code but not yet in a real deployment.
 - **Kafka-provisioned profiles/accounts are minimal.** The `user-events` consumer in `profile-service`/`account-service` (see [Frontend](#frontend) above) only sets the bare minimum — a `PENDING_VERIFICATION` profile with no address, and a single `$0` checking account. If Kafka is down when a user registers, they end up with credentials but no profile/account until manually backfilled (no dead-letter/retry queue yet, just a logged error). They aren't stranded — the KYC status lookup provisions a profile row on read, and once verified they can open an account through the self-service path — but the starter account they should have had never arrives on its own.
-- **The phone-number write-through isn't a distributed transaction.** `profile-service` updates `auth-service` first and then saves its own mirror row, precisely so a rejected number never reaches KYC approval. The cost is the opposite ordering risk: if the local save or the Kafka publish fails afterwards, `profile-service` rolls back while `auth-service` has already accepted the new number, so the mirror is briefly stale against the real 2FA destination. Re-submitting the form reconciles it, and the pre-fill reads the authoritative copy so the user is shown the number that actually matters — but there's no outbox or compensating write behind it yet.
+- **The phone-number write-through isn't a distributed transaction.** `profile-service` updates `auth-service` first and then saves its own mirror row, precisely so a rejected number never reaches KYC approval. The cost is the opposite ordering risk: if the local save or the Kafka publish fails afterwards, `profile-service` rolls back while `auth-service` has already accepted the new number, so the mirror is briefly stale against the authoritative copy. Re-submitting the form reconciles it, and the pre-fill reads the authoritative copy so the user is shown the number that actually matters — but there's no outbox or compensating write behind it yet. The stakes here dropped when 2FA moved to email: a stale mirror is now a wrong contact number rather than login codes going to an address nobody is watching.
 - **Recipient KYC only reaches this platform's users.** A wire to an IBAN that doesn't resolve to a local account is sent without any check on who receives it, which is correct — there is no user to look up and no basis to verify another bank's customer — but it does mean the recipient gate is a same-platform guarantee, not a general one.
+- **The internal service token is one shared static secret.** Every service authenticates every other with the same value, so it identifies "something inside the deployment" and not which caller — there is no per-service identity, no rotation story beyond restarting all five with a new value, and no mTLS. It also ships with a working dev default (`local-dev-internal-token`) so local runs need no setup, which means an environment that forgets to set `INTERNAL_SERVICE_TOKEN` is protected by a secret published in this README.
 - **IaC is validated, not deployed** (see [Infrastructure](#infrastructure) above).
 
-**On endpoint exposure:** every unauthenticated endpoint lives under `/api/v1/internal/`, which is
-deliberately absent from `k8s/08-ingress-routes.yaml` and so is unreachable from outside the
-cluster. Everything the ingress does route requires a valid JWT and resolves the user from that
-token rather than from a client-supplied id, so one user cannot read another's data by changing a
-number in a URL. Adding a new unauthenticated endpoint anywhere outside that prefix would publish
-it to the internet — that is the rule to keep in mind when extending any of the services.
+**On endpoint exposure:** the service-to-service endpoints all live under `/api/v1/internal/`, and
+they are no longer merely unrouted. Each of the five services runs an `InternalTokenFilter` that
+requires a shared `X-Internal-Token` header on every request to that prefix, compared with
+`MessageDigest.isEqual` so a wrong token costs the same time no matter how many leading characters
+were right, and rejected with a deliberately uninformative `401` that says nothing about which
+header or property was wrong. The outbound half is a Feign `RequestInterceptor`
+(`FeignInternalTokenConfig`) that attaches the same value to every internal call a service makes, so
+one property configures both directions. Spring Security still has these paths as `permitAll`,
+because the callers are other services with no end-user JWT to present — the filter, not the
+security config, is what authenticates them.
+
+The ingress is now the second layer rather than the only one: `/api/v1/internal/` is still
+deliberately absent from `k8s/08-ingress-routes.yaml`, so the prefix is unreachable from outside the
+cluster as well as unusable without the token. That ordering matters, because the write behind that
+prefix rewrites contact details — a single bad ingress rule, an SSRF, or anything already inside the
+network used to be enough on its own.
+
+Everything the ingress does route requires a valid JWT and resolves the user from that token rather
+than from a client-supplied id, so one user cannot read another's data by changing a number in a
+URL. Two rules to keep in mind when extending any of the services: a new endpoint that cannot
+require a JWT belongs under `/api/v1/internal/` and nowhere else, and a customer-facing path only
+reaches the browser in-cluster if it has a matching rule in `08-ingress-routes.yaml` — a prefix that
+works fine against `docker-compose` will 404 behind the ingress until it is routed there explicitly.
 
 ## License
 

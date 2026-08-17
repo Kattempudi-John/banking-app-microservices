@@ -13,7 +13,9 @@ import com.example.authservice.repository.UserRepository;
 import com.example.authservice.security.TokenType;
 import com.example.authservice.service.AuthSecurityService;
 import com.example.authservice.service.JwtService;
+import com.jayway.jsonpath.JsonPath;
 import jakarta.servlet.http.Cookie;
+import org.hamcrest.Matchers;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -114,7 +116,9 @@ class AuthManagementTestSuite {
 
     // this runs before every single test in the class to set up one shared fake user
     // mockito mock() gives me a fake user object instead of a real db backed one
-    // then I stub out the getters it will need, username, id and phone number
+    // then I stub out the getters it will need, username, id, phone number and email
+    // email is stubbed because the login path now reads it off the user to put on the 2fa event,
+    // an unstubbed mock would hand back null and the payload would quietly lose the address
     // last I stub the user details service so spring security can load this fake user by username
     // saves every test below from repeating this same setup over and over
     @BeforeEach
@@ -123,6 +127,7 @@ class AuthManagementTestSuite {
         given(mockUser.getUsername()).willReturn("johndoe");
         given(mockUser.getId()).willReturn(1L);
         given(mockUser.getPhoneNumber()).willReturn("+15551234567");
+        given(mockUser.getEmail()).willReturn("johndoe@example.com");
 
         given(userDetailsService.loadUserByUsername("johndoe")).willReturn(mockUser);
     }
@@ -167,6 +172,11 @@ class AuthManagementTestSuite {
     // post a real json body to /api/v1/auth/login the same way an actual client would
     // expect a 202 accepted status back instead of a normal 200 since 2fa still has to happen
     // and expect the response body to say 2fa_required and to include a pre auth token
+    // the lifetime comes back as a number too, since the screen has to count down from something
+    // and the client should not be hardcoding a duration this service decides
+    // the demoCode assertion is a regression guard, not a shape check: the login response used to
+    // carry the 2fa code itself whenever app.demo.enabled was on, which handed the second factor
+    // straight back down the same response as the first one. It must never reappear under any flag.
     @Test
     @DisplayName("Final Block: E2E Login Unrecognized Device Triggers 2FA & Issues Pre-Auth Token - [MEANT TO PASS]")
     void testFinalAC_LoginUnrecognizedDevice_Requires2FA() throws Exception {
@@ -181,22 +191,60 @@ class AuthManagementTestSuite {
                 .content("{\"username\":\"johndoe\",\"password\":\"SecurePass123!\"}"))
                 .andExpect(status().isAccepted())
                 .andExpect(jsonPath("$.status").value("2FA_REQUIRED"))
-                .andExpect(jsonPath("$.pre_auth_token").exists());
+                .andExpect(jsonPath("$.pre_auth_token").exists())
+                .andExpect(jsonPath("$.expires_in_seconds").value(180))
+                .andExpect(jsonPath("$.demoCode").doesNotExist());
     }
 
-    // testing that kicking off sms 2fa actually does three things in one call
-    // call triggersms2fa directly with a user id and a phone number
+    // testing that kicking off 2fa actually does three things in one call
+    // call trigger2fa directly with a user id, a phone number and an email address
     // first it should delete any old 2fa code that is still sitting around for that user
     // then it should save a brand new twofactorcode row for the fresh code
     // and finally it should publish a message out to kafka on the notification events topic
     @Test
-    @DisplayName("Block 1: Trigger SMS 2FA Clears Old Codes via Repository and Publishes to Kafka - [MEANT TO PASS]")
-    void testBlock1_TriggerSms2fa_DeletesOldCodeAndPublishesKafka() {
-        authSecurityService.triggerSms2fa(1L, "+15551234567");
+    @DisplayName("Block 1: Trigger 2FA Clears Old Codes via Repository and Publishes to Kafka - [MEANT TO PASS]")
+    void testBlock1_Trigger2fa_DeletesOldCodeAndPublishesKafka() {
+        authSecurityService.trigger2fa(1L, "+15551234567", "johndoe@example.com");
 
         verify(twoFactorCodeRepository).deleteByUserId(1L);
         verify(twoFactorCodeRepository).save(any(TwoFactorCode.class));
         verify(kafkaTemplate).send(eq("notification-events"), any(String.class));
+    }
+
+    // the payload itself is the contract notification-service consumes, so this pins it down rather
+    // than trusting that a message merely got sent - capture the json that went to kafka and check
+    // the action name plus every field the consumer reads, especially the email that delivery now
+    // depends on, since a silent rename or a dropped key here breaks the other side with no failure
+    // showing up anywhere in this service
+    @Test
+    @DisplayName("Block 1: Trigger 2FA Publishes TWO_FA_REQUESTED Payload Carrying Email - [MEANT TO PASS]")
+    void testBlock1_Trigger2fa_PublishesEmailInPayload() {
+        authSecurityService.trigger2fa(1L, "+15551234567", "johndoe@example.com");
+
+        ArgumentCaptor<String> payloadCaptor = ArgumentCaptor.forClass(String.class);
+        verify(kafkaTemplate).send(eq("notification-events"), payloadCaptor.capture());
+
+        String payload = payloadCaptor.getValue();
+        assertThat(payload).contains("\"action\":\"TWO_FA_REQUESTED\"");
+        assertThat(payload).contains("\"userId\":\"1\"");
+        assertThat(payload).contains("\"email\":\"johndoe@example.com\"");
+        assertThat(payload).contains("\"phoneNumber\":\"+15551234567\"");
+        assertThat(payload).contains("\"code\":");
+        // the email tells the user how long the code lasts, so the lifetime has to travel with it -
+        // otherwise notification-service has to hardcode its own guess, and the message and the
+        // on-screen countdown drift apart the moment this service's TTL is retuned
+        assertThat(payload).contains("\"expiresInSeconds\":\"180\"");
+    }
+
+    // the TTL is what the whole countdown hangs off, so it comes back from the service rather than
+    // being reconstructed by the caller - and the code itself deliberately does not, which is the
+    // point of the change: the raw secret has no business reaching the controller layer
+    @Test
+    @DisplayName("Block 1: Trigger 2FA Returns The Code Lifetime, Not The Code - [MEANT TO PASS]")
+    void testBlock1_Trigger2fa_ReturnsTtlSeconds() {
+        int expiresInSeconds = authSecurityService.trigger2fa(1L, "+15551234567", "johndoe@example.com");
+
+        assertThat(expiresInSeconds).isEqualTo(180);
     }
 
     // end to end test for successfully verifying an sms 2fa code
@@ -223,6 +271,243 @@ class AuthManagementTestSuite {
                 .andExpect(header().exists("Set-Cookie"));
 
         verify(twoFactorCodeRepository).delete(validCode);
+    }
+
+    // ==========================================
+    // 2FA Failure Shapes
+    // ==========================================
+
+    // These four used to be indistinguishable to the client. A wrong digit and a missing code both
+    // came back as a bare 401 "Invalid 2FA code", while expired and locked-out threw out of a
+    // @Transactional method and surfaced as 500s - which also rolled back the delete that was
+    // supposed to burn the dead code, leaving it in the table. Each now gets its own status and a
+    // machine-readable reason, and each one that clears a row actually clears it.
+
+    // a wrong digit is recoverable by typing again, so it stays a 401 - but it now says which
+    // failure it was, so the UI can keep the user on the same code instead of sending them to resend
+    @Test
+    @DisplayName("Verify 2FA: Wrong Code Returns 401 With INVALID Reason And Burns An Attempt - [MEANT TO FAIL]")
+    void testVerify2fa_WrongCode_Returns401Invalid() throws Exception {
+        String preAuthToken = jwtService.generateToken(mockUser, TokenType.PRE_AUTH);
+
+        TwoFactorCode storedCode = new TwoFactorCode(1L, hashString("123456"));
+        given(twoFactorCodeRepository.findByUserId(1L)).willReturn(Optional.of(storedCode));
+
+        mockMvc.perform(post("/api/v1/auth/verify-2fa/sms")
+                .header("Authorization", "Bearer " + preAuthToken)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"code\":\"000000\"}"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error").value("Invalid 2FA code"))
+                .andExpect(jsonPath("$.reason").value("INVALID"));
+
+        // the attempt counter is the only thing standing between a 6-digit code and brute force,
+        // so a wrong guess has to be written back, not just rejected
+        assertThat(storedCode.getAttempts()).isEqualTo(1);
+        verify(twoFactorCodeRepository).save(storedCode);
+        verify(twoFactorCodeRepository, never()).delete(storedCode);
+    }
+
+    // an expired code is gone rather than wrong, so 410 - the frontend keys its "expired, press
+    // resend" state off this status. It used to throw, which meant a 500 AND, because the throw
+    // rolled back the enclosing transaction, the expired row survived the request that deleted it.
+    @Test
+    @DisplayName("Verify 2FA: Expired Code Returns 410 And The Dead Row Is Deleted - [MEANT TO FAIL]")
+    void testVerify2fa_ExpiredCode_Returns410() throws Exception {
+        String preAuthToken = jwtService.generateToken(mockUser, TokenType.PRE_AUTH);
+
+        // negative TTL puts expires_at a second in the past, which is what the entity's own
+        // isExpired() reads - no clock mocking needed
+        TwoFactorCode expiredCode = new TwoFactorCode(1L, hashString("123456"), -1);
+        given(twoFactorCodeRepository.findByUserId(1L)).willReturn(Optional.of(expiredCode));
+
+        mockMvc.perform(post("/api/v1/auth/verify-2fa/sms")
+                .header("Authorization", "Bearer " + preAuthToken)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"code\":\"123456\"}"))
+                .andExpect(status().isGone())
+                .andExpect(jsonPath("$.error").value("Your code has expired. Request a new one."))
+                .andExpect(jsonPath("$.reason").value("EXPIRED"));
+
+        verify(twoFactorCodeRepository).delete(expiredCode);
+    }
+
+    // three wrong guesses ends the attempt entirely, so 429 rather than another 401 - there is no
+    // "try again" left to offer. Same rollback bug as the expired branch: it threw, so the row that
+    // was supposed to be cleared stayed put and the next request read the same locked code back.
+    @Test
+    @DisplayName("Verify 2FA: Attempt Limit Reached Returns 429 And Clears The Code - [MEANT TO FAIL]")
+    void testVerify2fa_TooManyAttempts_Returns429() throws Exception {
+        String preAuthToken = jwtService.generateToken(mockUser, TokenType.PRE_AUTH);
+
+        TwoFactorCode lockedCode = new TwoFactorCode(1L, hashString("123456"));
+        lockedCode.setAttempts(3);
+        given(twoFactorCodeRepository.findByUserId(1L)).willReturn(Optional.of(lockedCode));
+
+        // even the correct code is refused once the limit is hit - the lockout is checked first
+        mockMvc.perform(post("/api/v1/auth/verify-2fa/sms")
+                .header("Authorization", "Bearer " + preAuthToken)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"code\":\"123456\"}"))
+                .andExpect(status().isTooManyRequests())
+                .andExpect(jsonPath("$.error").value("Too many failed attempts. Please log in again."))
+                .andExpect(jsonPath("$.reason").value("LOCKED"));
+
+        verify(twoFactorCodeRepository).delete(lockedCode);
+    }
+
+    // submitting against no code at all is its own case - the user has nothing to retype, so the
+    // message points at resend instead of telling them they got the digits wrong
+    @Test
+    @DisplayName("Verify 2FA: No Active Code Returns 401 With NO_CODE Reason - [MEANT TO FAIL]")
+    void testVerify2fa_NoActiveCode_Returns401NoCode() throws Exception {
+        String preAuthToken = jwtService.generateToken(mockUser, TokenType.PRE_AUTH);
+
+        given(twoFactorCodeRepository.findByUserId(1L)).willReturn(Optional.empty());
+
+        mockMvc.perform(post("/api/v1/auth/verify-2fa/sms")
+                .header("Authorization", "Bearer " + preAuthToken)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"code\":\"123456\"}"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error").value("No active code. Request a new one."))
+                .andExpect(jsonPath("$.reason").value("NO_CODE"));
+    }
+
+    // /verify-2fa/** is permitAll, so a request with no Authorization header is not stopped by the
+    // filter chain - it lands in the controller with Spring's anonymous principal. Casting that to
+    // User is a ClassCastException and a 500; the caller has to get a 401 it can actually act on.
+    @Test
+    @DisplayName("Verify 2FA: No Authorization Header Returns 401 Rather Than 500 - [MEANT TO FAIL]")
+    void testVerify2fa_NoAuthHeader_Returns401() throws Exception {
+        mockMvc.perform(post("/api/v1/auth/verify-2fa/sms")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"code\":\"123456\"}"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error").exists());
+
+        verify(twoFactorCodeRepository, never()).findByUserId(any());
+    }
+
+    // ==========================================
+    // 2FA Resend
+    // ==========================================
+
+    // the path has to sit under /verify-2fa, because that is the only prefix JwtAuthenticationFilter
+    // lets a PRE_AUTH token through on - a resend endpoint anywhere else would be answered with the
+    // filter's 403 "Partial authentication" before the controller ever ran, and the user holding a
+    // half-authenticated token is precisely the only user who can ever need this endpoint
+    @Test
+    @DisplayName("Resend 2FA: PRE_AUTH Token Accepted And A New Code Is Issued - [MEANT TO PASS]")
+    void testResend2fa_PreAuthToken_IssuesNewCode() throws Exception {
+        String preAuthToken = jwtService.generateToken(mockUser, TokenType.PRE_AUTH);
+
+        // no code on file, so nothing to wait on
+        given(twoFactorCodeRepository.findByUserId(1L)).willReturn(Optional.empty());
+
+        mockMvc.perform(post("/api/v1/auth/verify-2fa/resend")
+                .header("Authorization", "Bearer " + preAuthToken))
+                .andExpect(status().isAccepted())
+                .andExpect(jsonPath("$.status").value("2FA_REQUIRED"))
+                .andExpect(jsonPath("$.pre_auth_token").exists())
+                .andExpect(jsonPath("$.expires_in_seconds").value(180))
+                // the resend response is the same body as login, and it must stay just as free of
+                // the code itself
+                .andExpect(jsonPath("$.demoCode").doesNotExist());
+
+        // a resend is a whole new code, not a re-send of the old one - the old row goes and a
+        // fresh one is saved, otherwise the code in the second email would not match the database
+        verify(twoFactorCodeRepository).deleteByUserId(1L);
+        verify(twoFactorCodeRepository).save(any(TwoFactorCode.class));
+        verify(kafkaTemplate).send(eq("notification-events"), any(String.class));
+    }
+
+    // the pre-auth token is only good for 5 minutes from login while each code lasts 3, so a user
+    // who resends twice would be holding a live code and a dead session - the response has to hand
+    // back a fresh token or the second resend strands them on a screen that can no longer submit
+    @Test
+    @DisplayName("Resend 2FA: Response Carries A Freshly Minted Pre-Auth Token - [MEANT TO PASS]")
+    void testResend2fa_ReissuesPreAuthToken() throws Exception {
+        String originalToken = jwtService.generateToken(mockUser, TokenType.PRE_AUTH);
+        given(twoFactorCodeRepository.findByUserId(1L)).willReturn(Optional.empty());
+
+        String body = mockMvc.perform(post("/api/v1/auth/verify-2fa/resend")
+                .header("Authorization", "Bearer " + originalToken))
+                .andExpect(status().isAccepted())
+                .andReturn().getResponse().getContentAsString();
+
+        String reissued = JsonPath.read(body, "$.pre_auth_token");
+        // still a PRE_AUTH token addressed to the same user - resending must not quietly promote
+        // anyone past the second factor they have not completed yet
+        assertThat(jwtService.extractTokenType(reissued)).isEqualTo(TokenType.PRE_AUTH);
+        assertThat(jwtService.extractUsername(reissued)).isEqualTo("johndoe");
+        // and it is genuinely a new token, not the one that came in - a distinct jti proves the
+        // expiry clock restarted rather than the same 5 minutes continuing to run down
+        assertThat(jwtService.extractJti(reissued)).isNotEqualTo(jwtService.extractJti(originalToken));
+    }
+
+    // without a cooldown a held-down resend button fans out a mailbox full of codes and burns
+    // through the email provider's quota. The window is measured off the existing row's created_at,
+    // which is already recorded - no extra table, no extra state to keep in sync.
+    @Test
+    @DisplayName("Resend 2FA: Second Request Inside The Cooldown Rejected With 429 - [MEANT TO FAIL]")
+    void testResend2fa_WithinCooldown_Returns429() throws Exception {
+        String preAuthToken = jwtService.generateToken(mockUser, TokenType.PRE_AUTH);
+
+        // constructed now, so created_at is now and the full 30 seconds are still outstanding
+        TwoFactorCode justIssued = new TwoFactorCode(1L, hashString("123456"));
+        given(twoFactorCodeRepository.findByUserId(1L)).willReturn(Optional.of(justIssued));
+
+        mockMvc.perform(post("/api/v1/auth/verify-2fa/resend")
+                .header("Authorization", "Bearer " + preAuthToken))
+                .andExpect(status().isTooManyRequests())
+                .andExpect(jsonPath("$.error").value("Please wait before requesting another code."))
+                // the client shows a disabled button counting down from this, so it has to be a
+                // number and it has to be inside the window rather than some larger leftover
+                .andExpect(jsonPath("$.retry_after_seconds").isNumber())
+                .andExpect(jsonPath("$.retry_after_seconds").value(Matchers.lessThanOrEqualTo(30)))
+                .andExpect(jsonPath("$.retry_after_seconds").value(Matchers.greaterThan(0)));
+
+        // the refusal has to happen before anything is minted, otherwise the rejected request would
+        // still have invalidated the code the user is currently looking at
+        verify(twoFactorCodeRepository, never()).deleteByUserId(any());
+        verify(twoFactorCodeRepository, never()).save(any(TwoFactorCode.class));
+        verify(kafkaTemplate, never()).send(eq("notification-events"), any(String.class));
+    }
+
+    // and once the window has actually elapsed the resend goes through - the cooldown is a delay,
+    // not a one-shot lock, so a user whose first email never arrived is not left with a dead form
+    @Test
+    @DisplayName("Resend 2FA: Request After The Cooldown Elapses Is Allowed - [MEANT TO PASS]")
+    void testResend2fa_AfterCooldown_Allowed() throws Exception {
+        String preAuthToken = jwtService.generateToken(mockUser, TokenType.PRE_AUTH);
+
+        // created_at has no setter (the column is not meant to be rewritten), so the age is stubbed
+        TwoFactorCode staleCode = mock(TwoFactorCode.class);
+        given(staleCode.getCreatedAt()).willReturn(LocalDateTime.now().minusSeconds(45));
+        given(twoFactorCodeRepository.findByUserId(1L)).willReturn(Optional.of(staleCode));
+
+        mockMvc.perform(post("/api/v1/auth/verify-2fa/resend")
+                .header("Authorization", "Bearer " + preAuthToken))
+                .andExpect(status().isAccepted())
+                .andExpect(jsonPath("$.expires_in_seconds").value(180));
+
+        verify(kafkaTemplate).send(eq("notification-events"), any(String.class));
+    }
+
+    // same permitAll hole as the verify endpoint: nothing in the filter chain stops a headerless
+    // request, so the controller itself has to refuse it rather than casting the anonymous
+    // principal to User and turning a missing header into a 500
+    @Test
+    @DisplayName("Resend 2FA: No Authorization Header Returns 401 Rather Than 500 - [MEANT TO FAIL]")
+    void testResend2fa_NoAuthHeader_Returns401() throws Exception {
+        mockMvc.perform(post("/api/v1/auth/verify-2fa/resend"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error").exists());
+
+        // nothing was minted or announced on the back of an unauthenticated request
+        verify(twoFactorCodeRepository, never()).save(any(TwoFactorCode.class));
+        verify(kafkaTemplate, never()).send(eq("notification-events"), any(String.class));
     }
 
     // checking that a pre auth token by itself cannot get into a fully protected endpoint

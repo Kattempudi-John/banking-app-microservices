@@ -18,7 +18,8 @@ import org.springframework.stereotype.Component;
 
 // Real email delivery via SendGrid (Twilio's email product, separate API and separate key from the
 // SMS credentials) - active when email.provider=sendgrid, mutually exclusive with the logging client.
-// Carries the balance summaries and transaction alerts; 2FA stays on SMS.
+// Carries every notification this service sends, 2FA codes included since they moved off SMS - which
+// makes a failure here a login nobody can complete, not just an alert nobody reads.
 @Component
 @ConditionalOnProperty(name = "email.provider", havingValue = "sendgrid")
 public class SendGridEmailProviderClient implements EmailProviderClient {

@@ -10,6 +10,7 @@
       <label for="typeFilter">Type</label>
       <select id="typeFilter" [value]="typeFilter()" (change)="onTypeFilterChange($any($event.target).value)">
         <option value="">All</option>
+        <option value="EMAIL_2FA">Email 2FA</option>
         <option value="SMS_2FA">SMS 2FA</option>
         <option value="TRANSACTION_ALERT">Transaction Alert</option>
         <option value="PROFILE_SECURITY">Profile Security</option>

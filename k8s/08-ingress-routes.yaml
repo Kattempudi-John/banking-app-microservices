@@ -81,3 +81,22 @@ spec:
                 name: profile-service
                 port:
                   number: 8080
+
+          # 7. Notification history (NotificationController) - the frontend's Notifications page
+          # reads it. notification-service is otherwise a pure Kafka consumer, which is why it had no
+          # rule here at all; the endpoint was added later and this file was never updated, so the
+          # page 404s behind the ingress while working fine against docker-compose - the same failure
+          # as rule 6 above, from a different cause.
+          #
+          # Safe for the same reason rule 6 is: NotificationController is annotated
+          # @PreAuthorize("hasAuthority('SCOPE_FULL_AUTH')"), so every path this exposes needs a
+          # fully authenticated token. It also cannot reach the unauthenticated internal endpoints -
+          # those live under /api/v1/internal/notifications/..., and Prefix compares whole segments,
+          # so "/api/v1/notifications" never matches a path whose third segment is "internal".
+          - path: /api/v1/notifications
+            pathType: Prefix
+            backend:
+              service:
+                name: notification-service
+                port:
+                  number: 8080

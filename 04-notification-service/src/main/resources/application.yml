@@ -36,9 +36,14 @@ spring:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
 
-# Which SMS provider actually delivers 2FA codes. "logging" is the default so local dev and CI never
-# need credentials - LoggingSmsProviderClient just writes the message to the log. Exactly one client
-# bean matches the chosen value (@ConditionalOnProperty on each), so Spring is never ambiguous.
+# Which SMS provider is used IF something sends an SMS. Nothing in the app does any more: 2FA codes
+# moved to email, which was the only feature that ever sent one. The clients are kept rather than
+# deleted because they still work and SMS is a plausible future channel (fraud alerts, say) - but
+# treat this whole block as dormant, and expect no SMS traffic in a normal run.
+#
+# "logging" is the default here and in the prod profile, so no environment ever needs SMS credentials
+# to start - LoggingSmsProviderClient just writes the message to the log. Exactly one client bean
+# matches the chosen value (@ConditionalOnProperty on each), so Spring is never ambiguous.
 #
 #   logging  - no credentials, logs instead of sending (default)
 #   textbelt - free tier needs no signup at all, 1 text/day/IP, good for a one-off end-to-end check
@@ -47,31 +52,38 @@ spring:
 # IMPORTANT: this file is tracked by git. Every credential below is read from an environment
 # variable with a blank fallback - set them in the gitignored .env (see .env.example) or export them
 # in your shell. Never replace a ${VAR:} placeholder with a literal value here: anything committed
-# to git stays in the history even after it is deleted, and a leaked Twilio auth token can be used
-# to send messages billed to your account.
+# to git stays in the history even after it is deleted, and a leaked Twilio auth token or SendGrid
+# API key can be used to send messages billed to your account.
 sms:
   provider: ${SMS_PROVIDER:logging}
   textbelt-key: ${TEXTBELT_KEY:textbelt}
   twilio:
-    # Leaving these blank with provider=twilio fails startup on purpose, rather than letting a login
-    # hang on a 2FA code that was never really sent.
+    # Leaving these blank with provider=twilio fails startup on purpose - a credential missing from a
+    # provider someone explicitly asked for should be an obvious error at boot, not a message that
+    # silently never arrives. It is also why provider must stay "logging" unless all three are set:
+    # this is the pair of facts that used to crash-loop the prod pod.
     account-sid: ${TWILIO_ACCOUNT_SID:}
     auth-token: ${TWILIO_AUTH_TOKEN:}
     # Must be a number Twilio has actually issued to your account, in E.164 format (+15551234567).
     from-number: ${TWILIO_FROM_NUMBER:}
 
-# Which provider delivers balance summaries, transaction alerts, and profile security notices.
-# 2FA never goes over email; it's SMS only.
+# Which provider delivers every notification this service sends: 2FA codes, balance summaries,
+# transaction alerts, and profile security notices. 2FA used to be SMS-only and is now email like
+# the rest, which makes this the one provider setting that matters - if email is misconfigured,
+# nobody can log in, not just nobody gets their morning summary.
 #
-#   logging  - no credentials, logs instead of sending (default)
+#   logging  - no credentials, logs instead of sending (default in this dev profile only)
 #   twilio   - real delivery via Twilio Email (POST https://comms.twilio.com/v1/Emails)
 #   sendgrid - real delivery via the classic SendGrid v3 API
 #
 # The two real options are different products with different credentials, which is the whole reason
 # both clients exist. Twilio Email reuses the sms.twilio.* account SID and auth token above, so it
 # needs no new secret - only a verified sender. SendGrid is a separate API with its own key, and its
-# single-sender verification works without DNS access, which makes it the fallback when domain
-# authentication isn't possible.
+# single-sender verification works without DNS access, which is why it, not Twilio Email, is the one
+# prod actually runs on (see application-prod.yml, where sendgrid is the default).
+#
+# Local dev stays on "logging": a 2FA code printed in the console is easier to work with than one
+# waiting in an inbox, and it keeps a checkout with no credentials at all fully able to log in.
 email:
   provider: ${EMAIL_PROVIDER:logging}
   twilio:

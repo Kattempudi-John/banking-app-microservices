@@ -24,10 +24,24 @@
         <a routerLink="/signup">Sign up</a>
       </form>
     } @else {
-      <form class="stack" (ngSubmit)="onVerifySubmit()">
-        @if (demoCode()) {
-          <app-alert-banner type="info" [message]="'Demo Mode — verification code: ' + demoCode()" />
+      <!-- Codes arrive by email, not SMS. Worth saying out loud: a texted code lands on the phone
+           already in the user's hand, while an emailed one needs them to go and look for it. -->
+      <p class="text-muted verify-hint">
+        We emailed a verification code to the address on your account.
+      </p>
+      <!-- Deliberately outside the <form> below: this row owns a Resend button, and a button inside
+           a form is one stray Enter key away from submitting the half-typed code instead. -->
+      <div class="countdown-row">
+        @if (codeExpired()) {
+          <span class="countdown-expired">That code has expired.</span>
+          <app-button variant="secondary" [disabled]="loading()" (clicked)="onResend()">
+            Resend code
+          </app-button>
+        } @else if (codeExpiresAt() !== null) {
+          <span class="countdown-timer">Expires in {{ countdown() }}</span>
         }
+      </div>
+      <form class="stack" (ngSubmit)="onVerifySubmit()">
         <app-input
           id="code"
           label="Verification Code"
@@ -36,7 +50,9 @@
           name="code"
         />
         <app-alert-banner type="error" [message]="errorMessage()" />
-        <app-button type="submit" [disabled]="loading()">Verify</app-button>
+        <!-- An expired code can only ever come back rejected, so submitting it wastes a round trip
+             and one of the user's limited attempts. -->
+        <app-button type="submit" [disabled]="loading() || codeExpired()">Verify</app-button>
       </form>
     }
   </div>

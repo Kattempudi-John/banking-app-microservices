@@ -198,7 +198,8 @@ public class ProfileNotificationListener {
         return value == null || value.isBlank();
     }
 
-    // Same "***4567" shape TwoFactorSmsListener writes into its own records, so a user reading their
+    // The "***4567" shape 2FA records carried while codes went out by SMS, and that
+    // TwoFactorEmailListener still follows for the address it masks instead - so a user reading their
     // feed sees one masking style rather than two.
     private String maskPhoneNumber(String phoneNumber) {
         if (isBlank(phoneNumber)) {
