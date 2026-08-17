@@ -16,6 +16,44 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
+/**
+ * Covers the retry contract of {@link NotificationProviderService} — how many times a provider is
+ * actually called, and what a caller sees when every one of those calls fails.
+ *
+ * <h2>What these four tests are really protecting</h2>
+ * <p>{@code dispatchEmail}/{@code dispatchSms} are annotated {@code @Retryable(maxAttempts = 3)} and
+ * paired with {@code @Recover} methods that <strong>return {@code false} rather than rethrowing</strong>.
+ * The consequence is the whole point of this suite: once the attempts are spent, no exception ever
+ * reaches the caller, so the {@code boolean} return value is the only success signal a caller gets.
+ * Code that wraps a dispatch in {@code try}/{@code catch} and treats "no exception" as success will
+ * record a {@code SENT} notification for mail that was never delivered. These tests pin both halves
+ * of that — the attempt count, and the silence.
+ *
+ * <h2>Test configuration</h2>
+ * <p>{@code @SpringBootTest} rather than a narrower slice or a plain Mockito unit test, because the
+ * behaviour under test is not in the method bodies: it is in the Spring Retry AOP proxy that
+ * {@code @EnableRetry} on {@code NotificationServiceApplication} wraps around the bean. A
+ * hand-constructed {@code new NotificationProviderService(...)} would call the provider exactly once
+ * and never invoke {@code @Recover}, so it would pass while proving nothing. The autowired bean has
+ * to be the proxied one from a real context. No {@code @AutoConfigureMockMvc} — nothing here goes
+ * through HTTP.
+ *
+ * <p>The two {@code @MockBean}s replace the outbound provider clients: {@link EmailProviderClient}
+ * stands in for whichever email provider {@code email.provider} selects (Twilio, SendGrid or the
+ * logging stub) and {@link SmsProviderClient} for the SMS equivalent. They are what makes failure
+ * injectable — no real HTTP is issued and no live provider credentials are needed. Everything else
+ * in the context, {@link NotificationProviderService} included, is the real bean.
+ *
+ * <p>This module has no {@code src/test/resources}, so the context boots the real dev configuration
+ * and needs the Docker Postgres running. That is deliberate and shared across the module's
+ * {@code @SpringBootTest} suites; this class touches no repository and no transaction, so there is
+ * no rollback behaviour to reason about.
+ *
+ * <h2>Fixture state</h2>
+ * <p>No {@code @BeforeEach} or {@code @BeforeAll}. Each test stubs its own mock inline and JUnit's
+ * Mockito integration resets the {@code @MockBean}s between tests, so the {@code times(1)} and
+ * {@code times(3)} counts start from zero every time and the tests are order-independent.
+ */
 @SpringBootTest
 class NotificationProviderServiceTestSuite {
 
@@ -28,54 +66,53 @@ class NotificationProviderServiceTestSuite {
     @MockBean
     private SmsProviderClient smsProviderClient;
 
-    // basic happy path, sending an email that succeeds on the very first try
-    // call dispatchemail directly with a normal address, subject and html body
-    // since emailproviderclient is mocked and not stubbed to throw anything, the call just succeeds
-    // verify send() was called exactly once, confirming no retry logic kicked in for a clean send
     @Test
-    @DisplayName("Block 1: Successful dispatch calls the provider exactly once, no retries - [MEANT TO PASS]")
-    void testBlock1_successfulDispatch_singleAttempt() {
+    @DisplayName("Successful dispatch calls the provider exactly once, no retries - [MEANT TO PASS]")
+    void dispatchEmail_providerSucceedsOnFirstAttempt_callsProviderExactlyOnce() {
         notificationProviderService.dispatchEmail("user_1@bank.com", "Subject", "<p>Body</p>");
 
+        // times(1) is the assertion, not a formality: it proves the retry interceptor does not fire
+        // on a clean send, which a plain verify() would let through silently.
         verify(emailProviderClient, times(1)).send("user_1@bank.com", "Subject", "<p>Body</p>");
     }
 
-    // this is the real test for the @retryable / @recover behavior mentioned in the class comment
-    // stub emailproviderclient.send so it always throws, simulating a provider that is completely down
-    // call dispatchemail and expect it to not throw anything back out to the caller at all,
-    // because @recover is supposed to swallow the persistent failure once retries are exhausted
-    // then verify send() actually got called three separate times, matching maxattempts = 3,
-    // before @recover took over instead of giving up after just the first failure
+    /**
+     * The exhausted-retry path for email. Note the runtime cost: the backoff is 1s doubling to 2s,
+     * so this test genuinely waits about three seconds before {@code @Recover} takes over.
+     */
     @Test
-    @DisplayName("Final Block: Provider failing every attempt is retried 3 times then recovers without propagating - [MEANT TO PASS]")
-    void testFinalAC_persistentProviderFailure_retriesThenRecovers() {
+    @DisplayName("Provider failing every attempt is retried 3 times then recovers without propagating - [MEANT TO PASS]")
+    void dispatchEmail_providerFailsEveryAttempt_retriesThreeTimesThenRecoversWithoutThrowing() {
         doThrow(new RuntimeException("503 Service Unavailable: SendGrid API Gateway timeout"))
                 .when(emailProviderClient).send(anyString(), anyString(), anyString());
 
-        // @Recover means a persistently-failing provider must NOT surface as an exception to the caller.
+        // @Recover returns false instead of rethrowing, so a permanently dead provider must reach the
+        // caller as a quiet false — never as an exception.
         assertThatCode(() ->
                 notificationProviderService.dispatchEmail("user_2@bank.com", "Subject", "<p>Body</p>"))
                 .doesNotThrowAnyException();
 
-        // maxAttempts = 3: the real send() call is attempted exactly 3 times before @Recover takes over.
+        // maxAttempts = 3 counts the first call plus two retries, not three retries on top of it.
         verify(emailProviderClient, times(3)).send(eq("user_2@bank.com"), eq("Subject"), eq("<p>Body</p>"));
     }
 
-    // same happy path as testBlock1_successfulDispatch_singleAttempt, mirrored for SMS - confirms
-    // dispatchSms wires up to SmsProviderClient the same way dispatchEmail wires up to EmailProviderClient
     @Test
     @DisplayName("SMS: Successful dispatch calls the provider exactly once, no retries - [MEANT TO PASS]")
-    void testSms_successfulDispatch_singleAttempt() {
+    void dispatchSms_providerSucceedsOnFirstAttempt_callsProviderExactlyOnce() {
         notificationProviderService.dispatchSms("+15551234567", "Your verification code is 123456.");
 
         verify(smsProviderClient, times(1)).send("+15551234567", "Your verification code is 123456.");
     }
 
-    // same @retryable/@recover contract as the email test, mirrored for SMS - a 2FA code is
-    // time-sensitive, so a persistently failing provider must still not crash the Kafka consumer
+    /**
+     * The SMS mirror of the email exhaustion case. It is not redundant: {@code dispatchSms} carries
+     * its own {@code @Retryable} and its own {@code @Recover} overload, and a signature mismatch on
+     * either would leave the original exception propagating out of a Kafka listener rather than
+     * being absorbed.
+     */
     @Test
     @DisplayName("SMS: Provider failing every attempt is retried 3 times then recovers without propagating - [MEANT TO PASS]")
-    void testSms_persistentProviderFailure_retriesThenRecovers() {
+    void dispatchSms_providerFailsEveryAttempt_retriesThreeTimesThenRecoversWithoutThrowing() {
         doThrow(new RuntimeException("503 Service Unavailable: Twilio API Gateway timeout"))
                 .when(smsProviderClient).send(anyString(), anyString());
 

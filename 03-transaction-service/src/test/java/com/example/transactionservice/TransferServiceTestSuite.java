@@ -63,6 +63,75 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
+/**
+ * Money-movement slice of transaction-service: {@code TransferService}, {@code ExternalWireService},
+ * the {@code FraudResolutionService} behind {@code InternalFraudController}, and the two controllers
+ * in front of them ({@code TransferController} and {@code InternalFraudController}).
+ *
+ * <h2>Why {@code @SpringBootTest} + {@code @AutoConfigureMockMvc} rather than {@code @WebMvcTest}</h2>
+ * Almost everything this suite is here to prove lives <em>outside</em> the MVC layer that a
+ * {@code @WebMvcTest} slice would give us:
+ * <ul>
+ *   <li>{@code KycEnforcementAspect} is AOP around {@code @RequiresKyc} service methods - a web slice
+ *       does not create the proxies, so every KYC test would silently pass through ungated code.</li>
+ *   <li>{@code InternalTokenFilter} is a servlet filter in the real security chain; the shared-secret
+ *       tests are meaningless without it.</li>
+ *   <li>The Kafka publish is driven by {@code @TransactionalEventListener(phase = AFTER_COMMIT)},
+ *       which needs a real transaction manager and a real event multicaster.</li>
+ *   <li>The outbound Feign {@code RequestInterceptor} from {@code FeignInternalTokenConfig} is an
+ *       ordinary bean that only a full context contributes.</li>
+ * </ul>
+ * The trade-off is boot cost, paid once per cached context for the whole class.
+ *
+ * <h2>What is real, what is mocked</h2>
+ * Real: both services, the KYC aspect, {@code IbanSwiftValidator}, the security filter chain,
+ * {@code GlobalExceptionHandler}, the event publisher, and the Feign request interceptor. Mocked with
+ * {@code @MockBean}:
+ * <ul>
+ *   <li>{@code AccountServiceClient} - every balance mutation in this system happens in
+ *       account-service, so this mock is how the suite both simulates its rejections (insufficient
+ *       funds, ownership mismatch, unknown IBAN) and proves that transaction-service delegates
+ *       instead of touching a balance itself.</li>
+ *   <li>{@code ProfileServiceClient} - the KYC verdict for both the caller and the recipient.</li>
+ *   <li>{@code AuthServiceClient} - only the recipient preview uses it (to resolve a display name),
+ *       but it must still be mocked: an unmocked Feign client would attempt a live call to
+ *       auth-service on port 8081.</li>
+ *   <li>{@code TransactionRepository} - no row is ever written or read; assertions inspect the
+ *       captured entity instead. Nothing here is transactional at the test level, so there is no
+ *       rollback to reason about and no database state to leak between tests. The H2 datasource in
+ *       {@code src/test/resources/application.properties} exists purely so JPA auto-configuration can
+ *       start (Flyway off, {@code ddl-auto=none}); it is never queried.</li>
+ *   <li>Both {@code KafkaTemplate}s - Kafka auto-configuration is excluded outright, so there is no
+ *       broker, embedded or otherwise. The templates are asserted against, never sent through.</li>
+ * </ul>
+ *
+ * <h2>Test configuration</h2>
+ * {@code spring.autoconfigure.exclude} drops {@code KafkaAutoConfiguration} so the context starts
+ * without a broker on the machine.
+ * <p>
+ * {@code application.security.internal-token} is pinned to a value that is deliberately <em>not</em>
+ * the dev default baked into {@code InternalTokenFilter} / {@code FeignInternalTokenConfig}. If either
+ * one ignored the property and compared against a hardcoded constant, a suite that used the default
+ * would still go green and would prove nothing about how the secret behaves once k8s overrides it.
+ * Pinning a different value is the only way the tests can fail on that mistake.
+ *
+ * <h2>Two calling styles, on purpose</h2>
+ * Tests that assert an HTTP status, a JSON body, or filter/validation behaviour go through
+ * {@code MockMvc} with a {@code jwt()} post-processor. Tests that assert business behaviour call
+ * {@code TransferService} / {@code ExternalWireService} directly, which keeps them free of request
+ * plumbing but means {@code KycEnforcementAspect} still has to find a caller: it reads the
+ * {@code userId} claim off a {@code Jwt} principal in {@code SecurityContextHolder}, not the
+ * {@code userId} argument. {@link #authenticateAsFullAuthUser(long)} installs exactly that, so a
+ * direct call hits the aspect the way a real request would. {@code @WithMockUser} is not
+ * interchangeable here - its plain {@code User} principal fails the cast to {@code Jwt} - and is used
+ * only where the test is about the authorization scope rather than the caller identity.
+ *
+ * <h2>Shared fixture state</h2>
+ * {@code @BeforeEach} stubs the caller (user 42) as KYC-APPROVED so the common path works without
+ * ceremony; the KYC-rejection tests re-stub it. {@code @AfterEach} clears the
+ * {@code SecurityContextHolder}, which is thread-local and would otherwise carry an authenticated
+ * principal into the next test in the same thread. There is no {@code @BeforeAll} state.
+ */
 @SpringBootTest
 @AutoConfigureMockMvc
 @TestPropertySource(properties = {
@@ -74,9 +143,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 })
 class TransferServiceTestSuite {
 
-    // The shared service-to-service secret, identical in all five services: header name, property
-    // name, and the fact that every /api/v1/internal/ request must carry it. Spelled out again here
-    // rather than referenced from the annotation above, which only accepts compile-time literals.
+    // Spelled out again rather than referenced from the annotation above, which only accepts
+    // compile-time literals.
     private static final String INTERNAL_TOKEN = "test-suite-internal-token";
     private static final String INTERNAL_TOKEN_HEADER = "X-Internal-Token";
 
@@ -107,9 +175,6 @@ class TransferServiceTestSuite {
     @MockBean
     private ProfileServiceClient profileServiceClient;
 
-    // Only the recipient-preview tests touch this one, but it has to be mocked rather than left as
-    // the real Feign client - the preview resolves a display name, and an unmocked client would try
-    // a live call to auth-service on port 8081.
     @MockBean
     private AuthServiceClient authServiceClient;
 
@@ -124,23 +189,21 @@ class TransferServiceTestSuite {
     private static final String VALID_SWIFT = "DEUTDEFF";
 
     // Default: caller is KYC-APPROVED. Individual KYC-rejection tests override this stub.
-    // KycEnforcementAspect resolves the caller from SecurityContextHolder, not from the
-    // userId method parameter, so tests calling the service directly (not through MockMvc)
-    // need a real Jwt-shaped Authentication installed for @RequiresKyc to reach this stub at all.
     @BeforeEach
     void setUp() {
         given(profileServiceClient.getKycStatus(42L)).willReturn(Map.of("status", "APPROVED"));
     }
 
+    // SecurityContextHolder is thread-local and survives the test method, so an authenticated
+    // principal would otherwise leak into whatever runs next on this thread.
     @AfterEach
     void clearSecurityContext() {
         SecurityContextHolder.clearContext();
     }
 
-    // KycEnforcementAspect casts the SecurityContext principal to a Jwt (it reads the caller's
-    // "userId" claim, not the JWT subject) - this installs a real Jwt-shaped Authentication so
-    // direct service-layer calls (bypassing MockMvc/@WithMockUser entirely) hit the aspect the same
-    // way a real authenticated request would.
+    // KycEnforcementAspect casts the SecurityContext principal to a Jwt and reads its "userId" claim
+    // (not the JWT subject), so a Jwt-shaped Authentication is what makes @RequiresKyc reachable from
+    // a direct service-layer call.
     private static Authentication jwtAuthentication(long userId, String scope) {
         Jwt jwt = Jwt.withTokenValue("test-token")
                 .header("alg", "none")
@@ -157,13 +220,15 @@ class TransferServiceTestSuite {
         SecurityContextHolder.getContext().setAuthentication(jwtAuthentication(userId, "FULL_AUTH"));
     }
 
-    // checking that trying to move more money than is actually available gets rejected -
-    // account-service's InternalAccountController is where that check now actually runs, so this
-    // test simulates its rejection by having the Feign client throw the same exception it would
-    // translate a 400 "INSUFFICIENT_FUNDS" response into (see FeignErrorConfig)
+    /**
+     * The balance check moved into account-service's {@code InternalAccountController}, so the only
+     * thing transaction-service can be held to is that it surfaces the rejection unchanged. The stub
+     * throws exactly what {@code FeignErrorConfig} translates a 400 {@code INSUFFICIENT_FUNDS}
+     * response into.
+     */
     @Test
     @DisplayName("Block 1: Insufficient funds rejects transfer with INSUFFICIENT_FUNDS - [MEANT TO FAIL]")
-    void testBlock1_ExecuteTransfer_InsufficientFunds_ThrowsBadRequest() {
+    void executeTransfer_accountServiceRejectsForInsufficientFunds_propagatesBadRequest() {
         authenticateAsFullAuthUser(42);
         willThrow(new ResponseStatusException(HttpStatus.BAD_REQUEST, "INSUFFICIENT_FUNDS"))
                 .given(accountServiceClient).transfer(any());
@@ -174,11 +239,13 @@ class TransferServiceTestSuite {
                 .hasMessageContaining("INSUFFICIENT_FUNDS");
     }
 
-    // making sure a user cannot transfer money into or out of an account that is not actually
-    // theirs - again, account-service enforces this now; simulate its 403 rejection here
+    /**
+     * Ownership is enforced in account-service too; the stub stands in for its 403 so this side's
+     * pass-through can be asserted.
+     */
     @Test
     @DisplayName("Block 2: Transfer between accounts not owned by the caller is forbidden - [MEANT TO FAIL]")
-    void testBlock2_ExecuteTransfer_OwnershipMismatch_ThrowsForbidden() {
+    void executeTransfer_accountsNotOwnedByCaller_propagatesForbidden() {
         authenticateAsFullAuthUser(42);
         willThrow(new ResponseStatusException(HttpStatus.FORBIDDEN, "Both accounts must belong to the authenticated user"))
                 .given(accountServiceClient).transfer(any());
@@ -189,13 +256,15 @@ class TransferServiceTestSuite {
                 .hasMessageContaining("Both accounts must belong to the authenticated user");
     }
 
-    // the pessimistic locking itself now happens inside account-service (verified there via the
-    // docker-compose end-to-end check), so from transaction-service's side the equivalent
-    // guarantee to verify is that the transfer is delegated there with exactly the right request -
-    // it never mutates any balance locally itself
+    /**
+     * The pessimistic lock now lives in account-service (covered end-to-end there), so the equivalent
+     * guarantee on this side is delegation: the request must arrive intact and no balance may be
+     * mutated locally. The {@code verify} on an exact {@code TransferRequest} is what proves the
+     * second half - any local shortcut would show up as a missing or altered call.
+     */
     @Test
     @DisplayName("Block 3: Transfer delegates the balance mutation to account-service with the correct request - [MEANT TO PASS]")
-    void testBlock3_ExecuteTransfer_DelegatesToAccountService() {
+    void executeTransfer_validRequest_delegatesBalanceMutationToAccountService() {
         authenticateAsFullAuthUser(42);
 
         transferService.executeTransfer(42L, 1L, 2L, new BigDecimal("100.00"));
@@ -203,23 +272,21 @@ class TransferServiceTestSuite {
         verify(accountServiceClient).transfer(new AccountServiceClient.TransferRequest(42L, 1L, 2L, new BigDecimal("100.00")));
     }
 
-    // full end to end test for a normal successful internal transfer, going through the real http endpoint
-    // deliberately not wrapping this test itself in a transaction, since the real code relies on
-    // @transactionaleventlistener(phase = after_commit), and that would never fire if this test
-    // wrapped everything in a transaction that just gets rolled back at the end
-    // expect status ok with a transaction id and a completed status in the response, the transfer
-    // delegated to account-service with the right request, and a fundstransferredevent published
+    /**
+     * Deliberately NOT {@code @Transactional} at the test level: the production publish runs from
+     * {@code @TransactionalEventListener(phase = AFTER_COMMIT)}, which never fires if the test wraps
+     * the call in a transaction that gets rolled back at the end. A test-level {@code @Transactional}
+     * here would turn the Kafka assertion into a permanent false negative.
+     * <p>
+     * This is also the only test that reaches {@code TransferController.extractUserIdFromAuth()},
+     * which casts the principal to a {@code Jwt} - {@code @WithMockUser}'s {@code User} principal
+     * would fail that cast.
+     */
     @Test
     @DisplayName("Final Block: Successful internal transfer commits balances, returns confirmation ID, and publishes FundsTransferredEvent to Kafka AFTER commit - [MEANT TO PASS]")
-    void testFinalAC_InternalTransfer_SuccessCommitsAndPublishesEvent() throws Exception {
-        // NOTE: deliberately NOT @Transactional at the test level - the production code relies on
-        // @TransactionalEventListener(phase = AFTER_COMMIT), which never fires if the test itself
-        // wraps the call in a transaction that gets rolled back.
+    void executeInternalTransfer_validRequest_returns200AndPublishesFundsTransferredAfterCommit() throws Exception {
         InternalTransferRequestDto request = new InternalTransferRequestDto(1L, 2L, new BigDecimal("100.00"));
 
-        // Unlike the other tests in this suite, this one actually reaches TransferController's
-        // extractUserIdFromAuth(), which casts the principal to a Jwt - @WithMockUser's plain
-        // User principal would fail that cast, so this needs a real Jwt-shaped mock principal.
         mockMvc.perform(post("/api/v1/transfers/internal")
                 .with(jwt().jwt(j -> j.claim("scope", "FULL_AUTH").claim("userId", 42L)))
                 .contentType(MediaType.APPLICATION_JSON)
@@ -232,15 +299,15 @@ class TransferServiceTestSuite {
         verify(fundsTransferredKafkaTemplate).send(eq("successful-transfers"), any(String.class), any(FundsTransferredEvent.class));
     }
 
-    // making sure an obviously malformed iban gets caught before it ever reaches the service layer
-    // build a raw json payload with a completely bogus iban string, not even close to the real format
-    // post that to the external wire endpoint
-    // expect a plain 400 bad request, this is jakarta validation's @pattern annotation on the dto
-    // catching the bad shape before any real business logic even runs
+    /**
+     * Raw JSON rather than a DTO instance, because the point is the shape that arrives over the wire:
+     * {@code ExternalWireRequestDto}'s Jakarta {@code @Pattern} rejects it during binding, before any
+     * business logic runs.
+     */
     @Test
-    @DisplayName("Block 4: Structurally invalid IBAN/SWIFT rejected before reaching the service - [MEANT TO FAIL]")
+    @DisplayName("Block 4: Structurally invalid IBAN rejected by bean validation before reaching the service - [MEANT TO FAIL]")
     @WithMockUser(username = "42", authorities = {"SCOPE_FULL_AUTH"})
-    void testBlock4_ExternalWire_MalformedIban_ReturnsBadRequest() throws Exception {
+    void executeExternalWire_structurallyMalformedIban_returns400() throws Exception {
         String payload = """
                 {"iban":"NOT_AN_IBAN","swiftCode":"DEUTDEFF","beneficiaryName":"John Smith","amount":100.00}
                 """;
@@ -252,19 +319,18 @@ class TransferServiceTestSuite {
                 .andExpect(status().isBadRequest());
     }
 
-    // one level deeper than the last test, this iban looks correctly formatted but the checksum is wrong
-    // build a request with an iban that is one digit off from the real valid checksum iban constant,
-    // which fails the actual mod 97 checksum math even though a simple regex would let it through -
-    // this is caught by validateFormat() before account-service is ever called
-    // call initiatewire directly instead of going through mockmvc this time
-    // expect a responsestatusexception mentioning invalid iban or swift code format
+    /**
+     * One level deeper than the malformed-IBAN case: this string is the right shape, so a regex would
+     * wave it through. Only the MOD 97 arithmetic in {@code IbanSwiftValidator} catches it, which is
+     * why the test calls the service directly rather than relying on the DTO's {@code @Pattern}.
+     */
     @Test
     @DisplayName("Block 5: Structurally valid but checksum-invalid IBAN rejected by IbanSwiftValidator - [MEANT TO FAIL]")
-    void testBlock5_ExternalWire_ChecksumInvalidIban_ThrowsBadRequest() {
+    void initiateWire_ibanFailingMod97Checksum_throwsInvalidFormat() {
         authenticateAsFullAuthUser(42);
 
         var request = new com.example.transactionservice.dto.ExternalWireRequestDto(
-                "GB30NWBK60161331926819", // one digit off from the valid checksum IBAN -> fails MOD 97
+                "GB30NWBK60161331926819", // one digit off from VALID_IBAN -> fails the MOD 97 checksum
                 VALID_SWIFT, "John Smith", new BigDecimal("100.00"));
 
         assertThatThrownBy(() -> externalWireService.initiateWire(42L, 1L, request))
@@ -272,14 +338,14 @@ class TransferServiceTestSuite {
                 .hasMessageContaining("Invalid IBAN or SWIFT code format");
     }
 
-    // making sure an external wire for more money than is available gets rejected up front -
-    // account-service's debit endpoint enforces this now; simulate its rejection here
-    // build a wire request using the known valid iban and swift constants but asking for way more, 5000.01
-    // call initiatewire directly
-    // expect a responsestatusexception mentioning insufficient_funds, same style error as internal transfers
+    /**
+     * The wire equivalent of the internal-transfer case: account-service's debit endpoint owns the
+     * balance check, so the stub throws its translated rejection and this side must surface it
+     * unchanged rather than dressing it up as something else.
+     */
     @Test
-    @DisplayName("Block 6: Insufficient funds rejects external wire before reserving funds - [MEANT TO FAIL]")
-    void testBlock6_ExternalWire_InsufficientFunds_ThrowsBadRequest() {
+    @DisplayName("Block 6: Insufficient funds rejects the external wire with INSUFFICIENT_FUNDS - [MEANT TO FAIL]")
+    void initiateWire_debitRejectedForInsufficientFunds_propagatesBadRequest() {
         authenticateAsFullAuthUser(42);
         willThrow(new ResponseStatusException(HttpStatus.BAD_REQUEST, "INSUFFICIENT_FUNDS"))
                 .given(accountServiceClient).debit(eq(1L), any());
@@ -292,15 +358,17 @@ class TransferServiceTestSuite {
                 .hasMessageContaining("INSUFFICIENT_FUNDS");
     }
 
-    // checking the exact boundary of the fraud review threshold, right at five thousand dollars
-    // build a wire request for exactly five thousand dollars, the threshold value itself
-    // call initiatewire directly (account-service's debit call succeeds by default - a mocked void
-    // method does nothing unless stubbed to throw)
-    // since the rule is strictly greater than five thousand, this amount should complete right away
-    // expect the response status to say completed and confirm no fraud review kafka event went out
+    /**
+     * The lower half of the fraud-review boundary. The rule is <em>strictly greater than</em> $5000,
+     * so $5000.00 exactly is the largest amount that must still clear without review - one cent more
+     * is the paired case below.
+     * <p>
+     * account-service's debit is not stubbed here on purpose: a mocked void method does nothing unless
+     * told to throw, which is the "debit succeeded" path.
+     */
     @Test
-    @DisplayName("Block 7: Wire at or below $5000 completes immediately without a fraud event - [MEANT TO PASS]")
-    void testBlock7_ExternalWire_AtThreshold_CompletesWithoutFraudEvent() {
+    @DisplayName("Block 7: Wire of exactly $5000 completes immediately without a fraud event - [MEANT TO PASS]")
+    void initiateWire_amountExactlyAtFraudThreshold_completesWithoutFraudEvent() {
         authenticateAsFullAuthUser(42);
 
         var request = new com.example.transactionservice.dto.ExternalWireRequestDto(
@@ -312,15 +380,14 @@ class TransferServiceTestSuite {
         verify(largeTransferKafkaTemplate, never()).send(any(), any(), any());
     }
 
-    // the flip side of the last test, going over the five thousand dollar threshold this time
-    // build a wire request for seventy five hundred dollars, comfortably over the threshold
-    // call initiatewire directly
-    // expect the response status to say pending_approval instead of completed
-    // confirm the debit was delegated to account-service with the right amount, a wire_transactions
-    // record got saved locally, and a largetransferrequestedevent went out to the fraud review topic
+    /**
+     * The upper half of the same boundary. Funds are reserved up front (debit) but the wire is not
+     * released, and the review event carries the transaction id so the fraud team's verdict can be
+     * routed back to this exact wire.
+     */
     @Test
     @DisplayName("Final Block: Wire over $5000 is pre-reserved, marked PENDING_APPROVAL, and publishes LargeTransferRequestedEvent - [MEANT TO PASS]")
-    void testFinalAC_ExternalWire_OverThreshold_PendingApprovalAndFraudEvent() {
+    void initiateWire_amountOverFraudThreshold_holdsFundsAndPublishesLargeTransferEvent() {
         authenticateAsFullAuthUser(42);
 
         var request = new com.example.transactionservice.dto.ExternalWireRequestDto(
@@ -335,14 +402,15 @@ class TransferServiceTestSuite {
         verify(largeTransferKafkaTemplate).send(eq("large-transfers-review"), eq(response.transactionId().toString()), any(LargeTransferRequestedEvent.class));
     }
 
-    // making sure a pre auth session, meaning 2fa was never finished, cannot move money at all
-    // withmockuser only grants scope_pre_auth here instead of the full auth scope other tests use
-    // build a small ten dollar transfer request and post it to the internal transfer endpoint
-    // expect a 403 forbidden since moving real money requires a fully authenticated session
+    /**
+     * {@code SCOPE_PRE_AUTH} is the token issued after a password but before 2FA is finished. It is a
+     * real, valid, authenticated session - which is exactly why the endpoint has to reject it on
+     * scope rather than on authentication.
+     */
     @Test
     @WithMockUser(username = "42", authorities = {"SCOPE_PRE_AUTH"})
     @DisplayName("Block 8: Pre-Auth (partial 2FA) token denied on internal transfer endpoint - [MEANT TO FAIL]")
-    void testBlock8_InternalTransfer_PreAuthTokenDenied() throws Exception {
+    void executeInternalTransfer_preAuthScopeOnly_returns403() throws Exception {
         InternalTransferRequestDto request = new InternalTransferRequestDto(1L, 2L, new BigDecimal("10.00"));
 
         mockMvc.perform(post("/api/v1/transfers/internal")
@@ -351,13 +419,9 @@ class TransferServiceTestSuite {
                 .andExpect(status().isForbidden());
     }
 
-    // same idea but no logged in user at all this time, not even a partial session
-    // no withmockuser annotation here on purpose
-    // post the same small transfer request with no authentication attached
-    // expect some flavor of 4xx client error, confirming anonymous requests never get near real money
     @Test
     @DisplayName("Block 9: Unauthenticated request denied on internal transfer endpoint - [MEANT TO FAIL]")
-    void testBlock9_InternalTransfer_UnauthenticatedDenied() throws Exception {
+    void executeInternalTransfer_noAuthentication_returns4xx() throws Exception {
         InternalTransferRequestDto request = new InternalTransferRequestDto(1L, 2L, new BigDecimal("10.00"));
 
         mockMvc.perform(post("/api/v1/transfers/internal")
@@ -366,14 +430,9 @@ class TransferServiceTestSuite {
                 .andExpect(status().is4xxClientError());
     }
 
-    // checking that kyc enforcement actually blocks a transfer for a user who is not approved yet
-    // override the kyc stub to say pending_verification, call executetransfer directly
-    // expect it to throw kycrequiredexception, the specific exception the aop aspect throws,
-    // and its message should mention the pending_verification status so its clear why it was blocked
-    // last, confirm account-service never even got called, no money moved before the kyc check ran
     @Test
     @DisplayName("Block 10: Non-APPROVED KYC status blocks an internal transfer - [MEANT TO FAIL]")
-    void testBlock10_NonApprovedKyc_BlocksInternalTransfer() {
+    void executeTransfer_callerKycPendingVerification_throwsKycRequiredAndMovesNoMoney() {
         authenticateAsFullAuthUser(42);
         given(profileServiceClient.getKycStatus(42L)).willReturn(Map.of("status", "PENDING_VERIFICATION"));
 
@@ -387,15 +446,9 @@ class TransferServiceTestSuite {
         verify(accountServiceClient, never()).transfer(any());
     }
 
-    // same kyc gating check but this time on the external wire path instead of internal transfers
-    // override the kyc stub to say rejected this time, a harsher status
-    // build a normal, otherwise valid wire request
-    // call initiatewire directly
-    // expect kycrequiredexception with a message mentioning rejected
-    // and confirm neither account-service nor the local transaction record got touched
     @Test
     @DisplayName("Final Block: Non-APPROVED KYC status blocks an external wire before any funds move - [MEANT TO FAIL]")
-    void testFinalAC_NonApprovedKyc_BlocksExternalWire() {
+    void initiateWire_callerKycRejected_throwsKycRequiredBeforeAnyFundsMove() {
         authenticateAsFullAuthUser(42);
         given(profileServiceClient.getKycStatus(42L)).willReturn(Map.of("status", "REJECTED"));
 
@@ -414,15 +467,16 @@ class TransferServiceTestSuite {
         verify(transactionRepository, never()).save(any());
     }
 
-    // GlobalExceptionHandler is what turns KycRequiredException into a real 403 over HTTP - the
-    // two tests above call the service directly, bypassing the RestControllerAdvice entirely, so
-    // this one specifically goes through MockMvc to prove a real request gets 403, not the
-    // unhandled 500 KycEnforcementAspect's own Javadoc used to (incorrectly) promise.
+    /**
+     * {@code GlobalExceptionHandler} is what turns {@code KycRequiredException} into a real 403 over
+     * HTTP. The two tests above call the service directly and so bypass the
+     * {@code @RestControllerAdvice} entirely; this one goes through MockMvc specifically to prove a
+     * real request gets 403 rather than the unhandled 500 the aspect's own Javadoc used to promise.
+     */
     @Test
     @DisplayName("Block 11: Non-APPROVED KYC status returns HTTP 403 (not an unhandled 500) - [MEANT TO FAIL]")
-    void testBlock11_NonApprovedKyc_ReturnsHttp403() throws Exception {
+    void executeInternalTransfer_callerKycNotApproved_returns403WithSenderFacingReason() throws Exception {
         given(profileServiceClient.getKycStatus(42L)).willReturn(Map.of("status", "PENDING_VERIFICATION"));
-
         InternalTransferRequestDto request = new InternalTransferRequestDto(1L, 2L, new BigDecimal("50.00"));
 
         mockMvc.perform(post("/api/v1/transfers/internal")
@@ -438,16 +492,17 @@ class TransferServiceTestSuite {
                         org.hamcrest.Matchers.not(org.hamcrest.Matchers.containsString("PENDING_VERIFICATION"))));
     }
 
-    // the other half of Block 11: not "we asked and the answer was no" but "we couldn't ask at all".
-    // The gate still fails closed - an unreachable profile-service is never read as approval and no
-    // money moves - but the caller is told it's a retryable outage (503) rather than an unhandled
-    // crash (500, what a bare RuntimeException/Feign failure used to produce) or a verdict on them (403).
+    /**
+     * The other half of the 403 case: not "we asked and the answer was no" but "we could not ask at
+     * all". The gate still fails closed - an unreachable profile-service is never read as approval -
+     * but the caller is told it is a retryable outage (503) rather than an unhandled crash (500, what
+     * a bare Feign failure used to produce) or a verdict on them (403).
+     */
     @Test
     @DisplayName("Block 12: Unreachable profile-service returns HTTP 503 and moves no money - [MEANT TO FAIL]")
-    void testBlock12_ProfileServiceUnreachable_Returns503AndMovesNoMoney() throws Exception {
+    void executeInternalTransfer_profileServiceUnreachable_returns503AndMovesNoMoney() throws Exception {
         // What Feign throws when the connection can't be made at all, rather than an HTTP error body.
         given(profileServiceClient.getKycStatus(42L)).willThrow(new RuntimeException("Connection refused: connect"));
-
         InternalTransferRequestDto request = new InternalTransferRequestDto(1L, 2L, new BigDecimal("50.00"));
 
         mockMvc.perform(post("/api/v1/transfers/internal")
@@ -468,12 +523,9 @@ class TransferServiceTestSuite {
     // used for a genuinely external destination.
     // ==========================================
 
-    // an on-us wire that clears the fraud threshold immediately should complete both legs right
-    // away - debit the sender via account-service as usual, but also credit the resolved
-    // destination account, and report onUsTransfer=true so the frontend can say so
     @Test
     @DisplayName("On-us wire under threshold resolves via IBAN and credits the destination immediately - [MEANT TO PASS]")
-    void testOnUsWire_UnderThreshold_CreditsDestinationImmediately() {
+    void initiateWire_onUsIbanUnderThreshold_creditsDestinationImmediately() {
         authenticateAsFullAuthUser(42);
         given(accountServiceClient.lookupByIban(VALID_IBAN))
                 .willReturn(new AccountServiceClient.AccountLookupResponse(99L, 55L, "CHECKING", "ACTIVE", VALID_SWIFT));
@@ -497,13 +549,15 @@ class TransferServiceTestSuite {
     // IBAN / BIC pairing on an on-us wire
     // ==========================================
 
-    // The IBAN and the BIC on one wire are supposed to name the same bank. isValidIban runs a real
-    // mod-97 checksum so a wrong IBAN is caught, but a BIC has no check digit at all - any
-    // well-formed string passed, and the destination was resolved from the IBAN alone, so a wire
-    // addressed to some other bank still landed in one of our accounts.
+    /**
+     * The IBAN and the BIC on one wire are supposed to name the same bank. {@code isValidIban} runs a
+     * real MOD 97 checksum so a wrong IBAN is caught, but a BIC has no check digit at all - any
+     * well-formed string passed, and the destination was resolved from the IBAN alone, so a wire
+     * addressed to some other bank still landed in one of our accounts.
+     */
     @Test
     @DisplayName("On-us wire with a BIC belonging to a different bank is rejected - [MEANT TO FAIL]")
-    void testOnUsWire_SwiftCodeDoesNotMatchIbanHolder_Rejected() {
+    void initiateWire_onUsIbanWithBicOfDifferentBank_rejectsBeforeDebit() {
         authenticateAsFullAuthUser(42);
         given(accountServiceClient.lookupByIban(VALID_IBAN))
                 .willReturn(new AccountServiceClient.AccountLookupResponse(99L, 55L, "CHECKING", "ACTIVE", VALID_SWIFT));
@@ -522,12 +576,16 @@ class TransferServiceTestSuite {
         verify(accountServiceClient, never()).credit(any(), any());
     }
 
-    // The pairing is checked before the recipient's KYC status, so a sender who typed the wrong bank
-    // is told that - rather than being handed a 403 that describes the recipient and leaks whether
-    // that person is verified to someone who addressed the wire incorrectly.
+    /**
+     * Ordering matters here, not just the outcome. The pairing is checked before the recipient's KYC
+     * status so that a sender who typed the wrong bank is told that - rather than being handed a 403
+     * describing the recipient, which would leak whether that person is verified to someone who
+     * addressed the wire incorrectly. The recipient is stubbed unverified precisely so a
+     * wrong-order implementation would produce a {@code KycRequiredException} instead.
+     */
     @Test
     @DisplayName("A mismatched BIC is reported as such, not as a recipient KYC failure - [MEANT TO FAIL]")
-    void testOnUsWire_MismatchedSwiftTakesPrecedenceOverRecipientKyc() {
+    void initiateWire_mismatchedBicAndUnverifiedRecipient_reportsBicMismatchNotKycFailure() {
         authenticateAsFullAuthUser(42);
         given(accountServiceClient.lookupByIban(VALID_IBAN))
                 .willReturn(new AccountServiceClient.AccountLookupResponse(99L, 55L, "CHECKING", "ACTIVE", VALID_SWIFT));
@@ -541,15 +599,17 @@ class TransferServiceTestSuite {
                 .hasMessageContaining("doesn't match the bank holding this IBAN");
     }
 
-    // Case and stray whitespace are not a different bank, so the comparison itself must not treat
-    // them as one. Note this exercises the service directly: over HTTP, ExternalWireRequestDto's
-    // @Pattern already requires an upper-case BIC and rejects "xbusus31" with 400 before this code
-    // is reached. That upper-case-only contract predates this check and is unchanged - the
-    // normalization here exists so the comparison stays correct on its own terms rather than
-    // silently depending on a caller having upper-cased first.
+    /**
+     * Case and stray whitespace are not a different bank, so the comparison must not treat them as
+     * one. This exercises the service directly on purpose: over HTTP,
+     * {@code ExternalWireRequestDto}'s {@code @Pattern} already requires an upper-case BIC and would
+     * reject {@code "deutdeff"} with a 400 before this code is reached. That upper-case-only contract
+     * predates the pairing check and is unchanged - the normalization exists so the comparison stays
+     * correct on its own terms instead of silently depending on a caller having upper-cased first.
+     */
     @Test
     @DisplayName("On-us BIC comparison ignores case and surrounding whitespace - [MEANT TO PASS]")
-    void testOnUsWire_SwiftCodeMatchesIgnoringCase_Allowed() {
+    void initiateWire_onUsBicDifferingOnlyByCase_completesAndCreditsDestination() {
         authenticateAsFullAuthUser(42);
         given(accountServiceClient.lookupByIban(VALID_IBAN))
                 .willReturn(new AccountServiceClient.AccountLookupResponse(99L, 55L, "CHECKING", "ACTIVE", VALID_SWIFT));
@@ -564,11 +624,14 @@ class TransferServiceTestSuite {
         verify(accountServiceClient).credit(eq(99L), any());
     }
 
-    // A wire to a bank that genuinely isn't us keeps working: there is no directory to check the
-    // pairing against, and refusing a correct BIC we simply cannot verify would be worse.
+    /**
+     * A wire to a bank that genuinely is not us keeps working: there is no directory to check the
+     * pairing against, and refusing a correct BIC we simply cannot verify would be worse than not
+     * checking.
+     */
     @Test
     @DisplayName("Genuinely external wire is unaffected by the BIC pairing rule - [MEANT TO PASS]")
-    void testExternalWire_UnresolvedIban_SkipsSwiftPairingCheck() {
+    void initiateWire_unresolvedIbanWithForeignBic_skipsPairingCheckAndStaysExternal() {
         authenticateAsFullAuthUser(42);
         given(accountServiceClient.lookupByIban(VALID_IBAN))
                 .willThrow(new ResponseStatusException(HttpStatus.NOT_FOUND, "Account not found"));
@@ -582,12 +645,14 @@ class TransferServiceTestSuite {
         verify(accountServiceClient).debit(eq(1L), any());
     }
 
-    // the flip side: an on-us wire over the threshold should still only hold funds (debit-only) at
-    // initiation, exactly like a genuinely external wire does - the destination doesn't get its
-    // half of the transfer until fraud review approves it (see the next test)
+    /**
+     * The counterpart to the under-threshold on-us wire: being on-us must not shortcut fraud review.
+     * At initiation the destination gets nothing - only the hold is taken - and its half of the
+     * transfer waits for the approval covered further down.
+     */
     @Test
     @DisplayName("On-us wire over threshold holds funds without crediting the destination yet - [MEANT TO PASS]")
-    void testOnUsWire_OverThreshold_HoldsWithoutCreditingYet() {
+    void initiateWire_onUsIbanOverThreshold_holdsFundsWithoutCreditingDestination() {
         authenticateAsFullAuthUser(42);
         given(accountServiceClient.lookupByIban(VALID_IBAN))
                 .willReturn(new AccountServiceClient.AccountLookupResponse(99L, 55L, "CHECKING", "ACTIVE", VALID_SWIFT));
@@ -605,12 +670,14 @@ class TransferServiceTestSuite {
         verify(largeTransferKafkaTemplate).send(eq("large-transfers-review"), any(), any(LargeTransferRequestedEvent.class));
     }
 
-    // an IBAN that doesn't belong to any account here (account-service returns 404, translated by
-    // FeignErrorConfig into a 404 ResponseStatusException) must fall back to today's simulated
-    // external behavior exactly - the regression guard that this feature doesn't change existing wires
+    /**
+     * The regression guard for the whole on-us feature: an IBAN belonging to no account here
+     * (account-service 404, translated by {@code FeignErrorConfig}) must behave exactly as wires did
+     * before on-us resolution existed.
+     */
     @Test
     @DisplayName("Wire with an unresolved IBAN stays a genuinely external, non-on-us wire - [MEANT TO PASS]")
-    void testExternalWire_UnresolvedIban_IsNotOnUs() {
+    void initiateWire_unresolvedIban_completesAsNonOnUsWireWithNoCredit() {
         authenticateAsFullAuthUser(42);
         willThrow(new ResponseStatusException(HttpStatus.NOT_FOUND, "Account not found"))
                 .given(accountServiceClient).lookupByIban(VALID_IBAN);
@@ -625,12 +692,13 @@ class TransferServiceTestSuite {
         verify(accountServiceClient, never()).credit(any(), any());
     }
 
-    // completing the held-wire story from testOnUsWire_OverThreshold above: once fraud review
-    // approves a held wire that has a destinationAccountId, the destination should finally get
-    // credited as part of finalizing it - this is the second leg that was deferred at initiation
+    /**
+     * Completes the held-wire story: the second leg deferred at initiation is finally paid out when
+     * fraud review approves a wire that carries a {@code destinationAccountId}.
+     */
     @Test
     @DisplayName("Approving a held on-us wire credits the destination account before completing - [MEANT TO PASS]")
-    void testFraudApproval_HeldOnUsWire_CreditsDestinationOnApproval() throws Exception {
+    void updateFraudStatus_approvedHeldOnUsWire_creditsDestinationAndCompletes() throws Exception {
         UUID transactionId = UUID.randomUUID();
         TransactionEntity heldWire = new TransactionEntity();
         heldWire.setTransactionId(transactionId);
@@ -657,11 +725,15 @@ class TransferServiceTestSuite {
         verify(transactionRepository).save(argThat(tx -> tx.getStatus() == TransactionStatus.COMPLETED));
     }
 
-    // and the control case: approving a genuinely external held wire (no destinationAccountId) must
-    // NOT call credit at all - there's no real destination account here to credit, exactly today's behavior
+    /**
+     * The control case for the test above: a held wire with no {@code destinationAccountId} is
+     * genuinely external, so there is no account here to credit and no platform user to re-vet. The
+     * {@code lookupAccountOwner} verify is the load-bearing one - it proves the review path does not
+     * go asking account-service about a destination that does not exist.
+     */
     @Test
     @DisplayName("Approving a held genuinely-external wire does not attempt to credit anything - [MEANT TO PASS]")
-    void testFraudApproval_HeldExternalWire_DoesNotCreditAnything() throws Exception {
+    void updateFraudStatus_approvedHeldExternalWire_completesWithoutCreditOrOwnerLookup() throws Exception {
         UUID transactionId = UUID.randomUUID();
         TransactionEntity heldWire = new TransactionEntity();
         heldWire.setTransactionId(transactionId);
@@ -680,8 +752,6 @@ class TransferServiceTestSuite {
 
         verify(accountServiceClient, never()).credit(any(), any());
         verify(transactionRepository).save(argThat(tx -> tx.getStatus() == TransactionStatus.COMPLETED));
-        // Nothing to re-vet either: there is no platform user behind a genuinely external wire, so
-        // the review path must not go asking account-service who owns a destination that isn't there.
         verify(accountServiceClient, never()).lookupAccountOwner(any());
     }
 
@@ -721,14 +791,16 @@ class TransferServiceTestSuite {
                 .andExpect(status().isOk());
     }
 
-    // the core case: the reviewer clears the wire, but by now the recipient's verification no longer
-    // stands. The money must not land, and it must not sit in PENDING_APPROVAL forever either - it
-    // goes back to the sender. The audit trail has to say why: the reviewer approved, the recipient
-    // is what stopped it, and recording it as a fraud rejection would be a false record of the
-    // reviewer's decision.
+    /**
+     * The reviewer clears the wire, but by now the recipient's verification no longer stands. The
+     * money must not land, and it must not sit in PENDING_APPROVAL forever either - it goes back to
+     * the sender. The description assertions are about the audit trail: the reviewer's real verdict
+     * has to survive, the reversal has to be attributed to the recipient, and filing it as
+     * {@code Fraud Review: REJECTED} would be a false record of a decision the reviewer never made.
+     */
     @Test
     @DisplayName("Approving a held on-us wire whose recipient is no longer verified reverses it and refunds the sender - [MEANT TO FAIL]")
-    void testFraudApproval_RecipientNoLongerVerified_ReversesAndRefunds() throws Exception {
+    void updateFraudStatus_approvedWireWhoseRecipientLostVerification_reversesAndRefundsSender() throws Exception {
         UUID transactionId = UUID.randomUUID();
         givenHeldOnUsWire(transactionId);
         given(accountServiceClient.lookupAccountOwner(99L))
@@ -742,19 +814,19 @@ class TransferServiceTestSuite {
         verify(accountServiceClient).credit(eq(1L), any());
         verify(transactionRepository).save(argThat(tx ->
                 tx.getStatus() == TransactionStatus.REJECTED
-                        // the reviewer's real verdict is preserved...
                         && tx.getDescription().contains("Fraud Review: APPROVED")
-                        // ...the reversal is attributed to the recipient...
                         && tx.getDescription().contains("recipient cannot receive funds")
-                        // ...and it is never filed as the reviewer having rejected it
                         && !tx.getDescription().contains("Fraud Review: REJECTED")));
     }
 
-    // the over-blocking guard for the test above: a recipient who is still approved at review time
-    // gets credited exactly as before, and the sender is not refunded
+    /**
+     * The over-blocking guard for the reversal above: a recipient who is still approved at review
+     * time is credited exactly as before, and the "never credit the sender" verify is what proves no
+     * spurious refund was issued alongside it.
+     */
     @Test
     @DisplayName("Approving a held on-us wire whose recipient is still verified credits the destination as before - [MEANT TO PASS]")
-    void testFraudApproval_RecipientStillVerified_CreditsDestination() throws Exception {
+    void updateFraudStatus_approvedWireWhoseRecipientStillVerified_creditsDestinationAndNotSender() throws Exception {
         UUID transactionId = UUID.randomUUID();
         givenHeldOnUsWire(transactionId);
         given(accountServiceClient.lookupAccountOwner(99L))
@@ -768,12 +840,14 @@ class TransferServiceTestSuite {
         verify(transactionRepository).save(argThat(tx -> tx.getStatus() == TransactionStatus.COMPLETED));
     }
 
-    // if we cannot even establish who is being paid, we cannot establish that they may be paid -
-    // fail closed the same way an outright unverified recipient does, rather than crediting on a
-    // guess or leaving the wire (and the sender's money) stranded in PENDING_APPROVAL
+    /**
+     * If we cannot establish who is being paid, we cannot establish that they may be paid - so a
+     * failed owner lookup fails closed exactly like an outright unverified recipient, rather than
+     * crediting on a guess or leaving the sender's money stranded in PENDING_APPROVAL.
+     */
     @Test
     @DisplayName("Approving a held on-us wire whose owner lookup fails reverses it rather than crediting blind - [MEANT TO FAIL]")
-    void testFraudApproval_OwnerLookupUnavailable_ReversesAndRefunds() throws Exception {
+    void updateFraudStatus_approvedWireWithFailingOwnerLookup_reversesRatherThanCreditingBlind() throws Exception {
         UUID transactionId = UUID.randomUUID();
         givenHeldOnUsWire(transactionId);
         // Covers both halves of the failure case: the ErrorDecoder turns account-service's 404 into
@@ -789,9 +863,9 @@ class TransferServiceTestSuite {
     }
 
     // ==========================================
-    // Recipient-side KYC: an APPROVED sender still cannot push money into the account of someone
-    // whose own verification hasn't cleared. @RequiresKyc only ever vets the caller, so these
-    // cover the other half - the user on the receiving end.
+    // Recipient-side KYC at initiation: an APPROVED sender still cannot push money into the account
+    // of someone whose own verification hasn't cleared. @RequiresKyc only ever vets the caller, so
+    // these cover the other half - the user on the receiving end - across all three transfer paths.
     // ==========================================
 
     private static final String RECIPIENT_ACCOUNT_NUMBER = "1234567890";
@@ -803,12 +877,14 @@ class TransferServiceTestSuite {
                         99L, 55L, "CHECKING", "******7890", "ACTIVE"));
     }
 
-    // the core case: sender is fully approved, recipient is still waiting on their verification
-    // the transfer must be refused, and refused early enough that account-service is never asked to
-    // move anything - there is no half-transfer to unwind once transferToRecipient has run
+    /**
+     * The three {@code never()} verifies together are the point: there is no half-transfer to unwind
+     * once {@code transferToRecipient} has run, so the refusal has to land before account-service is
+     * asked to move anything at all - by any of its three entry points.
+     */
     @Test
     @DisplayName("Transfer to a PENDING_VERIFICATION recipient is rejected before any debit - [MEANT TO FAIL]")
-    void testRecipientKyc_PendingVerificationRecipient_BlocksTransferBeforeDebit() {
+    void executeTransferToRecipient_recipientKycPendingVerification_throwsKycRequiredBeforeAnyDebit() {
         authenticateAsFullAuthUser(42);
         givenRecipientExists();
         given(profileServiceClient.getKycStatus(55L)).willReturn(Map.of("status", "PENDING_VERIFICATION"));
@@ -823,11 +899,13 @@ class TransferServiceTestSuite {
         verify(accountServiceClient, never()).debit(any(), any());
     }
 
-    // same gate, harsher status - and the message must stay generic either way, the sender is not
-    // told which of the two it was
+    /**
+     * Same gate, harsher status. The message must stay generic either way: the sender is never told
+     * which of the two verdicts the recipient carries, since that is the recipient's business.
+     */
     @Test
     @DisplayName("Transfer to a REJECTED recipient is rejected without naming their status - [MEANT TO FAIL]")
-    void testRecipientKyc_RejectedRecipient_BlocksTransfer() {
+    void executeTransferToRecipient_recipientKycRejected_throwsKycRequiredWithoutNamingTheStatus() {
         authenticateAsFullAuthUser(42);
         givenRecipientExists();
         given(profileServiceClient.getKycStatus(55L)).willReturn(Map.of("status", "REJECTED"));
@@ -841,11 +919,9 @@ class TransferServiceTestSuite {
         verify(accountServiceClient, never()).transferToRecipient(any());
     }
 
-    // the control case for the two above: both sides approved, so the transfer goes through
-    // untouched and still delegates to account-service exactly as before
     @Test
     @DisplayName("Transfer to an APPROVED recipient completes and delegates to account-service - [MEANT TO PASS]")
-    void testRecipientKyc_ApprovedRecipient_TransferSucceeds() {
+    void executeTransferToRecipient_recipientKycApproved_completesAndDelegatesToAccountService() {
         authenticateAsFullAuthUser(42);
         givenRecipientExists();
         given(profileServiceClient.getKycStatus(55L)).willReturn(Map.of("status", "APPROVED"));
@@ -858,28 +934,32 @@ class TransferServiceTestSuite {
                 42L, 1L, 99L, new BigDecimal("100.00")));
     }
 
-    // an own-accounts transfer has no second person in it, so it must not pay for a second
-    // profile-service round trip - the caller's own status (checked once by the aspect) is the only
-    // one that exists here
+    /**
+     * An own-accounts transfer has no second person in it, so it must not pay for a second
+     * profile-service round trip. The {@code verifyNoMoreInteractions} is doing the real work here:
+     * on its own the single {@code getKycStatus(42L)} verify would still pass if a recipient lookup
+     * had also fired.
+     */
     @Test
     @DisplayName("Own-account transfer still works and consults only the caller's KYC status - [MEANT TO PASS]")
-    void testRecipientKyc_OwnAccountTransfer_DoesNotConsultARecipientStatus() {
+    void executeTransfer_ownAccountsOnly_completesAfterCheckingOnlyTheCallerKyc() {
         authenticateAsFullAuthUser(42);
 
         var response = transferService.executeTransfer(42L, 1L, 2L, new BigDecimal("100.00"));
 
         assertThat(response.status()).isEqualTo("COMPLETED");
         verify(accountServiceClient).transfer(new AccountServiceClient.TransferRequest(42L, 1L, 2L, new BigDecimal("100.00")));
-        // Exactly one KYC lookup, and it was the sender's - nothing went looking for a recipient.
         verify(profileServiceClient).getKycStatus(42L);
         verifyNoMoreInteractions(profileServiceClient);
     }
 
-    // the wire equivalent of the first test: an IBAN that resolves here means a real platform user
-    // is about to be credited, so they get vetted, and nothing is reserved when they fail
+    /**
+     * The wire path's version of the recipient gate: an IBAN that resolves here means a real platform
+     * user is about to be credited, so they get vetted, and nothing is reserved when they fail.
+     */
     @Test
     @DisplayName("On-us wire to an unverified account holder is blocked before funds are reserved - [MEANT TO FAIL]")
-    void testRecipientKyc_OnUsWireToUnverifiedHolder_BlockedBeforeDebit() {
+    void initiateWire_onUsIbanHeldByUnverifiedUser_throwsKycRequiredBeforeFundsReserved() {
         authenticateAsFullAuthUser(42);
         given(accountServiceClient.lookupByIban(VALID_IBAN))
                 .willReturn(new AccountServiceClient.AccountLookupResponse(99L, 55L, "CHECKING", "ACTIVE", VALID_SWIFT));
@@ -897,12 +977,14 @@ class TransferServiceTestSuite {
         verify(transactionRepository, never()).save(any());
     }
 
-    // and the boundary the recipient check must never cross: a genuinely external IBAN has no
-    // platform user behind it, and another bank's customer isn't ours to verify - so this stays
-    // allowed, with the sender's status the only one ever looked up
+    /**
+     * The boundary the recipient check must never cross: a genuinely external IBAN has no platform
+     * user behind it, and another bank's customer is not ours to verify. The
+     * {@code verifyNoMoreInteractions} proves the sender's status was the only one ever looked up.
+     */
     @Test
     @DisplayName("Wire to an IBAN that doesn't resolve here is still allowed with no recipient KYC lookup - [MEANT TO PASS]")
-    void testRecipientKyc_UnresolvedIbanWire_StillAllowed() {
+    void initiateWire_unresolvedIban_completesWithNoRecipientKycLookup() {
         authenticateAsFullAuthUser(42);
         willThrow(new ResponseStatusException(HttpStatus.NOT_FOUND, "Account not found"))
                 .given(accountServiceClient).lookupByIban(VALID_IBAN);
@@ -919,11 +1001,13 @@ class TransferServiceTestSuite {
         verifyNoMoreInteractions(profileServiceClient);
     }
 
-    // the preview is where the frontend warns, not where it blocks - an unverified recipient still
-    // answers 200 so the sender sees who they'd be paying, just flagged as unverified
+    /**
+     * The preview is where the frontend warns, not where it blocks: an unverified recipient still
+     * answers 200 so the sender can see who they would be paying, just flagged as unverified.
+     */
     @Test
     @DisplayName("Recipient preview reports verified=false instead of failing for an unverified recipient - [MEANT TO PASS]")
-    void testRecipientKyc_Preview_ReturnsVerifiedFalseWithoutFailing() throws Exception {
+    void previewRecipient_unverifiedRecipient_returns200WithVerifiedFalse() throws Exception {
         givenRecipientExists();
         given(profileServiceClient.getKycStatus(55L)).willReturn(Map.of("status", "PENDING_VERIFICATION"));
         given(authServiceClient.getDisplayName(55L))
@@ -940,9 +1024,14 @@ class TransferServiceTestSuite {
     // Transfer History (GET /api/v1/transfers) - powers the frontend's History page
     // ==========================================
 
+    /**
+     * transaction-service does not know which accounts a user owns; account-service does. The
+     * {@code verify} proves the query was scoped by that resolved list rather than by anything the
+     * caller supplied.
+     */
     @Test
     @DisplayName("Transfer history resolves the caller's account IDs via account-service and queries by them - [MEANT TO PASS]")
-    void testTransferHistory_ResolvesOwnedAccountIdsAndReturnsRecords() throws Exception {
+    void getTransferHistory_authenticatedCaller_returns200AfterResolvingOwnedAccountIds() throws Exception {
         given(accountServiceClient.getAccountIdsByUser(42L)).willReturn(List.of(1L, 2L));
         given(transactionRepository.findByAccountIdInWithFilters(eq(List.of(1L, 2L)), isNull(), isNull(), isNull(), any()))
                 .willReturn(new PageImpl<>(List.of()));
@@ -956,7 +1045,7 @@ class TransferServiceTestSuite {
 
     @Test
     @DisplayName("Transfer history narrowed to an accountId not owned by the caller is forbidden - [MEANT TO FAIL]")
-    void testTransferHistory_AccountIdFilterNotOwned_Returns403() throws Exception {
+    void getTransferHistory_accountIdFilterNotOwnedByCaller_returns403() throws Exception {
         given(accountServiceClient.getAccountIdsByUser(42L)).willReturn(List.of(1L));
 
         mockMvc.perform(get("/api/v1/transfers")
@@ -967,7 +1056,7 @@ class TransferServiceTestSuite {
 
     @Test
     @DisplayName("Transfer history is rejected for an unauthenticated caller - [MEANT TO FAIL]")
-    void testTransferHistory_UnauthenticatedDenied() throws Exception {
+    void getTransferHistory_noAuthentication_returns4xx() throws Exception {
         mockMvc.perform(get("/api/v1/transfers"))
                 .andExpect(status().is4xxClientError());
     }
@@ -978,11 +1067,15 @@ class TransferServiceTestSuite {
     // only thing standing in the way was the k8s ingress declining to route the prefix.
     // ==========================================
 
-    // The whole point of the filter: no secret, no entry - even though the authorize layer marks
-    // this path permitAll, and even though the caller is otherwise a perfectly well-formed request.
+    /**
+     * The whole point of the filter: no secret, no entry - even though the authorize layer marks this
+     * path {@code permitAll} and the request is otherwise perfectly well formed. The two
+     * {@code never()} verifies prove the request was turned away in the filter, before any lookup or
+     * money movement could run.
+     */
     @Test
     @DisplayName("Block 13: Fraud-status endpoint with no X-Internal-Token is rejected with 401 - [MEANT TO FAIL]")
-    void testBlock13_FraudStatus_NoInternalToken_Returns401() throws Exception {
+    void updateFraudStatus_missingInternalTokenHeader_returns401AndRunsNothingDownstream() throws Exception {
         UUID transactionId = UUID.randomUUID();
 
         mockMvc.perform(patch("/api/v1/internal/transfers/{id}/fraud-status", transactionId)
@@ -993,16 +1086,17 @@ class TransferServiceTestSuite {
                 .andExpect(jsonPath("$.error").exists())
                 .andExpect(jsonPath("$.message").exists());
 
-        // Turned away in the filter, so nothing downstream ever ran - no lookup, no money.
         verify(transactionRepository, never()).findById(any());
         verify(accountServiceClient, never()).credit(any(), any());
     }
 
-    // A wrong secret is answered exactly like a missing one, and the message gives away neither the
-    // header nor the property name - a caller probing this endpoint learns nothing to go looking for.
+    /**
+     * A wrong secret is answered exactly like a missing one, and the message names neither the header
+     * nor the property - a caller probing this endpoint learns nothing to go looking for.
+     */
     @Test
     @DisplayName("Block 14: Fraud-status endpoint with a wrong X-Internal-Token is rejected with 401 - [MEANT TO FAIL]")
-    void testBlock14_FraudStatus_WrongInternalToken_Returns401() throws Exception {
+    void updateFraudStatus_wrongInternalToken_returns401WithoutNamingHeaderOrProperty() throws Exception {
         UUID transactionId = UUID.randomUUID();
 
         mockMvc.perform(patch("/api/v1/internal/transfers/{id}/fraud-status", transactionId)
@@ -1019,12 +1113,14 @@ class TransferServiceTestSuite {
         verify(accountServiceClient, never()).credit(any(), any());
     }
 
-    // The over-blocking guard: the correct secret still resolves a wire exactly as before. No JWT on
-    // this one on purpose - a service-to-service caller has no end-user token to present, and the
-    // secret is now the whole of what authorizes the call.
+    /**
+     * The over-blocking guard: the correct secret still resolves a wire exactly as before. No JWT on
+     * this one on purpose - a service-to-service caller has no end-user token to present, and the
+     * shared secret is now the whole of what authorizes the call.
+     */
     @Test
     @DisplayName("Block 15: Fraud-status endpoint with the correct X-Internal-Token resolves the wire as before - [MEANT TO PASS]")
-    void testBlock15_FraudStatus_CorrectInternalToken_StillWorks() throws Exception {
+    void updateFraudStatus_correctInternalTokenAndNoJwt_resolvesWireAsBefore() throws Exception {
         UUID transactionId = UUID.randomUUID();
         givenHeldOnUsWire(transactionId);
         given(accountServiceClient.lookupAccountOwner(99L))
@@ -1041,11 +1137,14 @@ class TransferServiceTestSuite {
         verify(transactionRepository).save(argThat(tx -> tx.getStatus() == TransactionStatus.COMPLETED));
     }
 
-    // The other side of the gate, and the regression that would hurt most if the filter's path check
-    // were wrong: a customer request carries no X-Internal-Token and must never be asked for one.
+    /**
+     * The other side of the gate, and the regression that would hurt most if the filter's path check
+     * were wrong: a customer request carries no {@code X-Internal-Token} and must never be asked for
+     * one.
+     */
     @Test
     @DisplayName("Block 16: Customer-facing JWT endpoint still works with no X-Internal-Token header - [MEANT TO PASS]")
-    void testBlock16_CustomerFacingEndpoint_NeedsNoInternalToken() throws Exception {
+    void getTransferHistory_customerJwtWithoutInternalToken_returns200() throws Exception {
         given(accountServiceClient.getAccountIdsByUser(42L)).willReturn(List.of(1L, 2L));
         given(transactionRepository.findByAccountIdInWithFilters(eq(List.of(1L, 2L)), isNull(), isNull(), isNull(), any()))
                 .willReturn(new PageImpl<>(List.of()));
@@ -1055,12 +1154,16 @@ class TransferServiceTestSuite {
                 .andExpect(status().isOk());
     }
 
-    // The outbound half of the same contract. All three Feign clients here call nothing but other
-    // services' /api/v1/internal/ endpoints, so the moment those services enforce their own filters,
-    // a missing header on this side is every transfer failing - not a degraded feature.
+    /**
+     * The outbound half of the shared-secret contract. All three Feign clients in this module call
+     * nothing but other services' {@code /api/v1/internal/} endpoints, so the moment those services
+     * enforce their own filters a missing header on this side is every transfer failing, not a
+     * degraded feature. Every client here is a {@code @MockBean}, so a bare {@code RequestTemplate}
+     * put through the real interceptor is the only way to observe the header being attached.
+     */
     @Test
     @DisplayName("Block 17: Outbound Feign interceptor attaches the shared secret to every request - [MEANT TO PASS]")
-    void testBlock17_FeignInterceptor_AttachesInternalTokenHeader() {
+    void apply_bareRequestTemplate_attachesConfiguredInternalTokenHeader() {
         RequestTemplate template = new RequestTemplate();
 
         internalTokenRequestInterceptor.apply(template);
@@ -1075,28 +1178,28 @@ class TransferServiceTestSuite {
     // leaving the wire PENDING_APPROVAL and the resolution re-runnable against real money.
     // ==========================================
 
-    // The trap this test exists for: the destination credit and the sender refund are two DIFFERENT
-    // effects on ONE wire. Keying both off the transaction id alone would make whichever ran second
-    // look like a duplicate of the first, and account-service would silently swallow it - money that
-    // should have moved quietly not moving, with a success response either way.
-    // Both resolutions below are driven against the SAME transaction id deliberately: keys taken
-    // from two different wires would differ no matter how carelessly they were built, so only one id
-    // can actually catch the mistake.
+    /**
+     * The destination credit and the sender refund are two DIFFERENT effects on ONE wire. Keying both
+     * off the transaction id alone would make whichever ran second look like a duplicate of the
+     * first, and account-service would silently swallow it - money that should have moved quietly not
+     * moving, with a success response either way.
+     * <p>
+     * Both resolutions are driven against the SAME transaction id deliberately: keys taken from two
+     * different wires would differ no matter how carelessly they were built, so only one id can
+     * actually catch the mistake. That makes this test order-dependent by construction - the approval
+     * has to run first, and the entity is manually put back into PENDING_APPROVAL between the two
+     * calls, which is not a sequence a real reviewer produces.
+     */
     @Test
     @DisplayName("Block 18: Destination credit and sender refund on one wire carry DIFFERENT idempotency keys - [MEANT TO FAIL]")
-    void testBlock18_FraudResolution_CreditAndRefundUseDistinctIdempotencyKeys() throws Exception {
+    void updateFraudStatus_sameWireCreditedThenRefunded_usesDistinctIdempotencyKeys() throws Exception {
         UUID transactionId = UUID.randomUUID();
         TransactionEntity heldWire = givenHeldOnUsWire(transactionId);
         given(accountServiceClient.lookupAccountOwner(99L))
                 .willReturn(new AccountServiceClient.AccountOwnerResponse(55L));
         given(profileServiceClient.getKycStatus(55L)).willReturn(Map.of("status", "APPROVED"));
 
-        // First effect: approval credits the destination account.
         approveAsReviewer(transactionId);
-
-        // Second effect: the same wire put back in review and rejected, refunding the sender. Not a
-        // sequence a real reviewer produces - it is how one wire is made to emit both effects so
-        // their keys can be compared.
         heldWire.setStatus(TransactionStatus.PENDING_APPROVAL);
         rejectAsReviewer(transactionId);
 
@@ -1127,11 +1230,10 @@ class TransferServiceTestSuite {
 
     @Test
     @DisplayName("Block 19: Unreachable account-service at wire initiation returns HTTP 503 and saves no wire - [MEANT TO FAIL]")
-    void testBlock19_AccountServiceUnreachableAtInitiation_Returns503AndSavesNothing() throws Exception {
+    void executeExternalWire_accountServiceUnreachableAtInitiation_returns503AndSavesNoWire() throws Exception {
         // What Feign throws when the connection can't be made at all, rather than an HTTP error body.
         willThrow(new RuntimeException("Connection refused: connect"))
                 .given(accountServiceClient).lookupByIban(VALID_IBAN);
-
         String payload = objectMapper.writeValueAsString(new com.example.transactionservice.dto.ExternalWireRequestDto(
                 VALID_IBAN, VALID_SWIFT, "Jane Doe", new BigDecimal("100.00")));
 
@@ -1153,18 +1255,20 @@ class TransferServiceTestSuite {
         verify(transactionRepository, never()).save(any());
     }
 
-    // The over-blocking guard for the test above, and the reason its try/catch is scoped to the
-    // lookup call alone. resolveOnUsDestination also runs the recipient-KYC check, which throws for
-    // an unverified recipient - catching RuntimeException around the whole method body would rewrite
-    // that 403 verdict as a 503 outage and disable the recipient-KYC rule while still looking like
-    // it ran. account-service answers here perfectly well; it is the recipient who is the problem.
+    /**
+     * The over-blocking guard for the 503 above, and the reason its try/catch is scoped to the lookup
+     * call alone. {@code resolveOnUsDestination} also runs the recipient-KYC check, which throws for
+     * an unverified recipient - catching {@code RuntimeException} around the whole method body would
+     * rewrite that 403 verdict as a 503 outage and disable the recipient-KYC rule while still looking
+     * like it ran. account-service answers here perfectly well; it is the recipient who is the
+     * problem.
+     */
     @Test
     @DisplayName("Block 20: Unverified recipient at wire initiation still returns 403, never 503 - [MEANT TO FAIL]")
-    void testBlock20_UnverifiedRecipientAtInitiation_Returns403Not503() throws Exception {
+    void executeExternalWire_unverifiedOnUsRecipient_returns403NotAnOutage503() throws Exception {
         given(accountServiceClient.lookupByIban(VALID_IBAN))
                 .willReturn(new AccountServiceClient.AccountLookupResponse(99L, 55L, "CHECKING", "ACTIVE", VALID_SWIFT));
         given(profileServiceClient.getKycStatus(55L)).willReturn(Map.of("status", "PENDING_VERIFICATION"));
-
         String payload = objectMapper.writeValueAsString(new com.example.transactionservice.dto.ExternalWireRequestDto(
                 VALID_IBAN, VALID_SWIFT, "Jane Doe", new BigDecimal("100.00")));
 

@@ -38,28 +38,68 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
-// Covers InternalTokenFilter (inbound) and the Feign RequestInterceptor (outbound) - the two halves
-// of the shared X-Internal-Token contract every service in this project implements identically.
-//
-// Until this filter existed, /api/v1/internal/** was protected by exactly one thing: the k8s ingress
-// choosing not to route that prefix. For this service that gap was worse than elsewhere, because the
-// endpoint sitting behind it triggers real email sends.
-//
-// The token is overridden to a value that is NOT the dev default on purpose. With the default in
-// place, a typo in the property name would still pass every test here - both sides would quietly
-// fall back to their @Value default and agree with each other, and the mistake would only surface in
-// a deployed environment where the override is real.
+/**
+ * Covers both halves of the shared {@code X-Internal-Token} contract in notification-service:
+ * {@link InternalTokenFilter} on the way in, and the Feign {@link RequestInterceptor} declared by
+ * {@code FeignInternalTokenConfig} on the way out. Every service in this project implements the
+ * same contract identically, so the two halves are tested together — the failure mode worth
+ * catching is the two sides drifting apart, which neither half can show on its own.
+ *
+ * <p>Until this filter existed, {@code /api/v1/internal/**} was protected by exactly one thing: the
+ * k8s ingress choosing not to route that prefix. For this service that gap was worse than
+ * elsewhere, because the endpoint sitting behind it triggers real email sends.
+ *
+ * <h2>What is real and what is mocked</h2>
+ *
+ * <p>Everything that decides the outcome is real: the servlet filter chain, the Spring Security
+ * configuration, the internal controller, and the Feign interceptor bean pulled from the live
+ * context. Only the collaborators <em>behind</em> the endpoint are replaced:
+ *
+ * <ul>
+ *   <li>{@code DailyBalanceSummaryJob} — the sweep itself. Mocked so a rejected request can be
+ *       proven to have done no work at all, rather than only proven to have returned 401; a 401
+ *       returned after the sweep already ran would still have sent the email.</li>
+ *   <li>{@code NotificationProviderService} — the SendGrid/Twilio dispatch layer. Mocked so no test
+ *       in this suite can reach a real provider, and so "no email left the building" is directly
+ *       verifiable.</li>
+ *   <li>{@code NotificationRecordRepository} — persistence. Mocked both to keep the rejection tests
+ *       free of database state and to stub the one row the customer-facing feed test reads back.</li>
+ * </ul>
+ *
+ * <p>There is no {@code @BeforeEach}: the only shared state is the two constants and the
+ * {@code buildRecord} helper, and Spring Boot resets the {@code @MockBean}s between tests, so each
+ * test stubs and verifies from a clean mock. The suite is not transactional and writes nothing.
+ *
+ * <h2>Test configuration</h2>
+ *
+ * <p>{@code @SpringBootTest} + {@code @AutoConfigureMockMvc} rather than {@code @WebMvcTest}:
+ * {@code InternalTokenFilter} is a plain {@code @Component} servlet filter registered by Boot's
+ * filter auto-configuration, and the outbound {@code internalTokenRequestInterceptor} is not a web
+ * bean at all. A sliced web test would load neither, and would therefore prove nothing about the
+ * mechanism this suite exists to protect. The cost is a full context: because this module has no
+ * {@code src/test/resources}, the suite boots the real dev configuration and needs the local Docker
+ * Postgres up, even though the repository is mocked and no test touches a table.
+ *
+ * <p>{@code @TestPropertySource} pins {@code application.security.internal-token} to a value that
+ * is deliberately <strong>not</strong> the dev default baked into the filter's {@code @Value}.
+ * That is the point of the override, not incidental setup: with the default in place, a typo in the
+ * property name would still pass every test here, because both sides would quietly fall back to
+ * their own default and agree with each other. The mistake would then surface only in a deployed
+ * environment where the override is real. (The sibling suite in account-service pins the default
+ * value and is weaker for exactly this reason.)
+ *
+ * <p>{@code spring.datasource.hikari.maximum-pool-size=2} is not a performance tweak. Every
+ * {@code @SpringBootTest} whose properties differ gets its own cached context, and each cached
+ * context holds a Hikari pool open for the rest of the run — Hikari's {@code minimumIdle} defaults
+ * to {@code maximumPoolSize}, so that is ten real connections parked per context. Adding this suite
+ * pushed the shared local Postgres past {@code max_connections}, and the symptom was the
+ * <em>last</em> suite to start failing with "sorry, too many clients already", a suite with nothing
+ * to do with this change. The pool exists here only so Flyway and Hibernate can start.
+ */
 @SpringBootTest
 @AutoConfigureMockMvc
 @TestPropertySource(properties = {
         "application.security.internal-token=suite-internal-token",
-        // Every @SpringBootTest here whose properties differ gets its own cached context, and each
-        // cached context holds a Hikari pool open for the rest of the run - Hikari's minimumIdle
-        // defaults to maximumPoolSize, so that is 10 real connections parked per context. Adding this
-        // suite pushed the shared local Postgres past max_connections, and the symptom was the LAST
-        // suite to start failing with "sorry, too many clients already" - a suite that has nothing to
-        // do with this change. Nothing in here touches the database (the repository is mocked); the
-        // pool exists only so Flyway and Hibernate can start.
         "spring.datasource.hikari.maximum-pool-size=2"
 })
 class InternalTokenSecurityTestSuite {
@@ -76,9 +116,6 @@ class InternalTokenSecurityTestSuite {
     @Qualifier("internalTokenRequestInterceptor")
     private RequestInterceptor internalTokenRequestInterceptor;
 
-    // Mocked so a rejected request can be proven to have done no work at all, rather than only
-    // proven to have returned 401 - a 401 returned after the sweep already ran would still have sent
-    // the email.
     @MockBean
     private DailyBalanceSummaryJob dailyBalanceSummaryJob;
 
@@ -94,12 +131,12 @@ class InternalTokenSecurityTestSuite {
 
     @Test
     @DisplayName("Internal daily-summary trigger with no X-Internal-Token is rejected and runs nothing - [MEANT TO PASS]")
-    void testInternalTrigger_noToken_rejectedAndDoesNoWork() throws Exception {
+    void triggerDailySummary_missingInternalToken_returns401AndRunsNoJob() throws Exception {
         mockMvc.perform(post(INTERNAL_RUN_PATH).param("timezone", "America/New_York"))
                 .andExpect(status().isUnauthorized());
 
-        // The whole point of the filter: the request must die before the job, and therefore before
-        // any provider call, is ever reached.
+        // These four verifies are the whole point of the filter: the request must die before the job,
+        // and therefore before any provider call or record write, is ever reached.
         verify(dailyBalanceSummaryJob, never()).processUsersForTimezone(anyString());
         verify(dailyBalanceSummaryJob, never()).processDailySummaries();
         verify(notificationProviderService, never()).dispatchEmail(any(), any(), any());
@@ -108,7 +145,7 @@ class InternalTokenSecurityTestSuite {
 
     @Test
     @DisplayName("Internal daily-summary trigger with a wrong X-Internal-Token is rejected - [MEANT TO PASS]")
-    void testInternalTrigger_wrongToken_rejected() throws Exception {
+    void triggerDailySummary_wrongInternalToken_returns401AndRunsNoJob() throws Exception {
         mockMvc.perform(post(INTERNAL_RUN_PATH)
                         .param("timezone", "America/New_York")
                         .header(InternalTokenFilter.INTERNAL_TOKEN_HEADER, "not-the-right-token"))
@@ -118,12 +155,15 @@ class InternalTokenSecurityTestSuite {
         verify(notificationProviderService, never()).dispatchEmail(any(), any(), any());
     }
 
-    // A token that shares a prefix with the real one must fail exactly like one that shares nothing.
-    // MessageDigest.isEqual compares the full byte array either way; a String.equals here would
-    // return faster on the second case than the first and leak how much was guessed right.
+    /**
+     * A token sharing a prefix with the real one must fail exactly like one sharing nothing.
+     * {@code MessageDigest.isEqual} compares the full byte array either way; a {@code String.equals}
+     * here would return faster on a token that matches nothing than on this one, leaking how much of
+     * the secret a caller has already guessed.
+     */
     @Test
     @DisplayName("A token matching only a prefix of the real one is rejected - [MEANT TO PASS]")
-    void testInternalTrigger_prefixOfTheRealToken_rejected() throws Exception {
+    void triggerDailySummary_tokenMatchingOnlyAPrefixOfTheRealOne_returns401() throws Exception {
         mockMvc.perform(post(INTERNAL_RUN_PATH)
                         .header(InternalTokenFilter.INTERNAL_TOKEN_HEADER, "suite-internal"))
                 .andExpect(status().isUnauthorized());
@@ -131,12 +171,15 @@ class InternalTokenSecurityTestSuite {
         verify(dailyBalanceSummaryJob, never()).processDailySummaries();
     }
 
-    // The rejection body is part of the cross-service contract: both keys, same text. It also must
-    // not tell a caller which header or property would satisfy it - a 401 that names the header is a
-    // free hint for anyone probing the prefix.
+    /**
+     * The rejection body is part of the cross-service contract: JSON carrying both an {@code error}
+     * and a {@code message} key. It must also stay uninformative — a 401 naming the header, the
+     * property or the configured value is a free hint for anyone probing the prefix, which is why
+     * the second block asserts on absence rather than presence.
+     */
     @Test
-    @DisplayName("The 401 body carries error and message with the same text and names no header or property - [MEANT TO PASS]")
-    void testRejectionBody_shapeAndDiscretion() throws Exception {
+    @DisplayName("The 401 body carries error and message and names no header, property or token value - [MEANT TO PASS]")
+    void triggerDailySummary_missingInternalToken_returns401BodyWithErrorAndMessageAndNoHints() throws Exception {
         String body = mockMvc.perform(post(INTERNAL_RUN_PATH))
                 .andExpect(status().isUnauthorized())
                 .andExpect(content().contentTypeCompatibleWith("application/json"))
@@ -155,7 +198,7 @@ class InternalTokenSecurityTestSuite {
 
     @Test
     @DisplayName("Internal daily-summary trigger with the correct X-Internal-Token behaves as before - [MEANT TO PASS]")
-    void testInternalTrigger_correctToken_runsTheJob() throws Exception {
+    void triggerDailySummary_correctTokenWithTimezone_returns200AndSweepsThatTimezone() throws Exception {
         mockMvc.perform(post(INTERNAL_RUN_PATH)
                         .param("timezone", "America/New_York")
                         .header(InternalTokenFilter.INTERNAL_TOKEN_HEADER, CONFIGURED_TOKEN))
@@ -165,12 +208,14 @@ class InternalTokenSecurityTestSuite {
         verify(dailyBalanceSummaryJob).processUsersForTimezone("America/New_York");
     }
 
-    // The no-timezone form runs the full sweep. Covered separately because it is a different branch
-    // of the controller, and a filter that only let one of the two through would be worse than one
-    // that let neither.
+    /**
+     * Covered separately from the timezone form because the no-timezone form is a different branch
+     * of the controller, and a filter that let only one of the two through would be worse than one
+     * that let neither: the scheduled sweep would keep half working and half silently failing.
+     */
     @Test
     @DisplayName("Internal trigger with the correct token and no timezone still runs the full sweep - [MEANT TO PASS]")
-    void testInternalTrigger_correctToken_noTimezone_runsFullSweep() throws Exception {
+    void triggerDailySummary_correctTokenWithoutTimezone_returns200AndRunsFullSweep() throws Exception {
         mockMvc.perform(post(INTERNAL_RUN_PATH)
                         .header(InternalTokenFilter.INTERNAL_TOKEN_HEADER, CONFIGURED_TOKEN))
                 .andExpect(status().isOk());
@@ -178,12 +223,14 @@ class InternalTokenSecurityTestSuite {
         verify(dailyBalanceSummaryJob).processDailySummaries();
     }
 
-    // The filter is scoped to /api/v1/internal/ and nothing else. A customer hitting the
-    // Notifications page carries a JWT and has never heard of the internal token; if the filter
-    // leaked outside its prefix, the whole customer-facing endpoint would 401 for everyone.
+    /**
+     * The filter is scoped to {@code /api/v1/internal/} and nothing else. A customer opening the
+     * Notifications page carries a JWT and has never heard of the internal token; if the filter
+     * leaked past its prefix, the customer-facing endpoint would 401 for every user at once.
+     */
     @Test
     @DisplayName("GET /api/v1/notifications still works with a JWT and no X-Internal-Token - [MEANT TO PASS]")
-    void testCustomerEndpoint_unaffectedByTheFilter() throws Exception {
+    void getNotifications_jwtCallerWithNoInternalToken_returns200WithTheFeed() throws Exception {
         given(notificationRecordRepository.findByUserId(eq(42L), any()))
                 .willReturn(new PageImpl<>(List.of(buildRecord(42L))));
 
@@ -192,13 +239,15 @@ class InternalTokenSecurityTestSuite {
                 .andExpect(jsonPath("$.content.length()").value(1));
     }
 
-    // The outbound half. Both endpoints this service calls - profile-service's preferences lookup and
-    // account-service's batch balance fetch - live under /api/v1/internal/ there, so a missing header
-    // here means the daily summary starts getting 401s from both downstreams the moment they enforce.
-    // Nothing in this service would fail to compile or start; the summaries would simply stop.
+    /**
+     * The outbound half. Both endpoints this service calls — profile-service's preferences lookup
+     * and account-service's batch balance fetch — live under {@code /api/v1/internal/} there, so a
+     * missing header means the daily summary starts getting 401s from both downstreams the moment
+     * they enforce. Nothing here would fail to compile or start; the summaries would simply stop.
+     */
     @Test
     @DisplayName("The Feign interceptor attaches X-Internal-Token to outbound requests - [MEANT TO PASS]")
-    void testFeignInterceptor_attachesTheInternalToken() {
+    void applyInterceptor_outboundFeignRequest_attachesTheConfiguredInternalToken() {
         RequestTemplate template = new RequestTemplate();
 
         internalTokenRequestInterceptor.apply(template);
@@ -208,17 +257,19 @@ class InternalTokenSecurityTestSuite {
                 .containsExactly(CONFIGURED_TOKEN);
     }
 
-    // Inbound and outbound read the same property. If they ever drifted onto two different keys, this
-    // service could call out perfectly well while rejecting every service calling in - a failure that
-    // looks like a problem in the other service rather than this one.
+    /**
+     * Inbound and outbound read the same property, so this feeds the service's own outbound header
+     * straight back into its own inbound filter. If the two ever drifted onto different keys, this
+     * service could call out perfectly well while rejecting every service calling in — a failure
+     * that looks like a bug in the other service rather than this one.
+     */
     @Test
     @DisplayName("The outbound token matches the one the inbound filter accepts - [MEANT TO PASS]")
-    void testInboundAndOutboundTokensAgree() throws Exception {
+    void triggerDailySummary_tokenTakenFromTheOutboundInterceptor_returns200() throws Exception {
         RequestTemplate template = new RequestTemplate();
         internalTokenRequestInterceptor.apply(template);
         String outboundToken = template.headers().get(InternalTokenFilter.INTERNAL_TOKEN_HEADER).iterator().next();
 
-        // Feeding this service's own outbound header straight back into its own inbound filter.
         mockMvc.perform(post(INTERNAL_RUN_PATH)
                         .header(InternalTokenFilter.INTERNAL_TOKEN_HEADER, outboundToken))
                 .andExpect(status().isOk());

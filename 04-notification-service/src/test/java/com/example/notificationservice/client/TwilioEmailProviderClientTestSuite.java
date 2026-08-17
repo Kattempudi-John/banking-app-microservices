@@ -22,14 +22,47 @@ import static org.springframework.test.web.client.match.MockRestRequestMatchers.
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withServerError;
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withStatus;
 
-// Deliberately a plain JUnit test with no Spring context. This service has no test datasource
-// configured and NotificationRecord binds real PostgreSQL enum types that H2 cannot emulate, so
-// @SpringBootTest here would need a live database to check an HTTP client that has nothing to do
-// with one. MockRestServiceServer covers the whole contract without either.
-//
-// Sits in the client package rather than beside the other suites one level up because it reaches the
-// package-private test constructor (to inject a mocked RestTemplate) and initialiseClient() directly
-// - neither is worth widening to public purely to relocate a test file.
+/**
+ * Covers {@link TwilioEmailProviderClient} — the HTTP wire contract it holds with Twilio's Email API
+ * ({@code POST https://comms.twilio.com/v1/Emails}) and the startup guard in
+ * {@link TwilioEmailProviderClient#initialiseClient()}.
+ *
+ * <h2>Slice and test configuration</h2>
+ * <p>Plain JUnit 5. There is deliberately <strong>no Spring context and no database</strong> here,
+ * and that is a decision rather than an omission: {@code 04-notification-service} has no
+ * {@code src/test/resources}, so a {@code @SpringBootTest} boots the real dev configuration and
+ * needs the Docker Postgres — {@code NotificationRecord} binds real PostgreSQL enum types that H2
+ * cannot emulate. Requiring a live database to exercise an HTTP client that never touches one buys
+ * nothing. {@link MockRestServiceServer} pins the entire request/response contract without either.
+ *
+ * <h2>What is real and what is faked</h2>
+ * <p>The client itself is real, as is its Jackson serialisation and its
+ * {@link org.springframework.http.HttpHeaders#setBasicAuth} header construction — those are exactly
+ * what these tests exist to pin down. Only the transport is faked: {@link MockRestServiceServer}
+ * binds to the {@link RestTemplate} handed to the client and answers from the expectations each test
+ * declares, so no HTTP leaves the JVM. Nothing is a Mockito mock; there are no {@code @MockBean}s
+ * because there is no context to put them in.
+ *
+ * <h2>Why this class can be tested at all, and {@code TextBeltSmsProviderClient} cannot</h2>
+ * <p>{@link TwilioEmailProviderClient} carries a second, package-private constructor whose only
+ * reason to exist is this suite: it takes the {@link RestTemplate} as a parameter, giving
+ * {@link MockRestServiceServer} something to bind to. The public constructor calls
+ * {@code new RestTemplate()} internally, which would leave no seam.
+ * {@link TextBeltSmsProviderClient} has only that second form — it builds its {@link RestTemplate}
+ * in a field initialiser with no injection point — so its send path cannot be intercepted this way
+ * and has no equivalent suite.
+ *
+ * <p>The same seam argument dictates the package: this class sits in
+ * {@code com.example.notificationservice.client} rather than beside the other suites one level up
+ * because both the test constructor and {@code initialiseClient()} are package-private, and neither
+ * is worth widening to {@code public} purely to relocate a test file.
+ *
+ * <h2>Fixture state</h2>
+ * <p>All state is per-test. {@code @BeforeEach} builds a fresh {@link RestTemplate}, binds a fresh
+ * {@link MockRestServiceServer} to it and constructs a fully-configured client from the shared SID /
+ * token / sender constants, so one test's unmet expectation cannot leak into the next. The two
+ * misconfiguration tests build their own deliberately broken client instead of using that one.
+ */
 class TwilioEmailProviderClientTestSuite {
 
     private static final String SEND_ENDPOINT = "https://comms.twilio.com/v1/Emails";
@@ -38,7 +71,8 @@ class TwilioEmailProviderClientTestSuite {
     private static final String FROM_EMAIL = "alerts@example.com";
     private static final String FROM_NAME = "Banking Alerts";
 
-    // Twilio's real 202 body - the send is accepted here and processed asynchronously afterwards.
+    // Copied verbatim from a real Twilio 202 rather than invented: the send is only accepted here and
+    // delivered asynchronously afterwards, and operationId is the sole handle for tracing it later.
     private static final String ACCEPTED_BODY = """
             {
                 "operationId": "comms_operation_01h9krwprkeee8fzqspvwy6nq8",
@@ -57,11 +91,14 @@ class TwilioEmailProviderClientTestSuite {
         client = new TwilioEmailProviderClient(ACCOUNT_SID, AUTH_TOKEN, FROM_EMAIL, FROM_NAME, restTemplate);
     }
 
-    // the happy path, a 202 accepted is what twilio answers on success, anything in the 2xx range
-    // means accepted for delivery and the client should return quietly without throwing
+    /**
+     * 202 Accepted, not 200, is what a successful Twilio Email send answers with — the message is
+     * queued and delivered later. Returning quietly therefore means accepted-for-delivery rather
+     * than delivered, and any 2xx has to be treated that way.
+     */
     @Test
-    @DisplayName("Block 1: A 202 Accepted response completes the send without throwing - [MEANT TO PASS]")
-    void testBlock1_acceptedResponse_completesQuietly() {
+    @DisplayName("A 202 Accepted response completes the send without throwing - [MEANT TO PASS]")
+    void send_twilioAccepts202_completesWithoutThrowing() {
         mockServer.expect(requestTo(SEND_ENDPOINT))
                 .andExpect(method(HttpMethod.POST))
                 .andRespond(withStatus(HttpStatus.ACCEPTED)
@@ -74,12 +111,15 @@ class TwilioEmailProviderClientTestSuite {
         mockServer.verify();
     }
 
-    // twilio email authenticates with plain http basic using the account sid as the username, the
-    // same credential pair the sms client already uses, this pins that wire format down so a refactor
-    // cannot quietly switch it to a bearer token and only find out against the live api
+    /**
+     * Twilio Email authenticates with plain HTTP Basic using the account SID as the username — the
+     * same credential pair the SMS client already uses. Pinning the encoded header down here is what
+     * stops a refactor quietly switching to a bearer token and only discovering it against the live
+     * API.
+     */
     @Test
-    @DisplayName("Block 2: The request carries HTTP Basic auth built from the account SID and auth token - [MEANT TO PASS]")
-    void testBlock2_requestUsesBasicAuthFromTwilioCredentials() {
+    @DisplayName("The request carries HTTP Basic auth built from the account SID and auth token - [MEANT TO PASS]")
+    void send_configuredSidAndAuthToken_sendsBasicAuthHeaderOverJson() {
         String expected = "Basic " + Base64.getEncoder()
                 .encodeToString((ACCOUNT_SID + ":" + AUTH_TOKEN).getBytes(StandardCharsets.UTF_8));
 
@@ -96,11 +136,14 @@ class TwilioEmailProviderClientTestSuite {
         mockServer.verify();
     }
 
-    // the json body shape twilio's /v1/Emails endpoint expects, nested from/to/content objects rather
-    // than sendgrid's personalizations array, getting this wrong is a 400 at runtime with no compiler help
+    /**
+     * Twilio's {@code /v1/Emails} endpoint expects nested {@code from}/{@code to}/{@code content}
+     * objects, not SendGrid's {@code personalizations} array. Getting the shape wrong is a 400 at
+     * runtime with no compiler help, which is why the body is asserted field by field.
+     */
     @Test
-    @DisplayName("Block 3: The JSON body matches Twilio's from/to/content shape - [MEANT TO PASS]")
-    void testBlock3_requestBodyMatchesTwilioSchema() {
+    @DisplayName("The JSON body matches Twilio's from/to/content shape - [MEANT TO PASS]")
+    void send_htmlOnlyMessage_postsTwilioFromToContentJson() {
         mockServer.expect(requestTo(SEND_ENDPOINT))
                 .andExpect(method(HttpMethod.POST))
                 .andExpect(jsonPath("$.from.address").value(FROM_EMAIL))
@@ -108,8 +151,9 @@ class TwilioEmailProviderClientTestSuite {
                 .andExpect(jsonPath("$.to[0].address").value("customer@example.com"))
                 .andExpect(jsonPath("$.content.subject").value("Your Daily Balance Summary"))
                 .andExpect(jsonPath("$.content.html").value("<html><body>Balance: $5432.10</body></html>"))
-                // the plain-text alternative is left unset rather than duplicated from the HTML, and
-                // NON_NULL has to keep the key out of the payload entirely instead of sending null
+                // The plain-text alternative is left unset rather than duplicated from the HTML, so
+                // @JsonInclude(NON_NULL) has to drop the key entirely — sending an explicit null here
+                // is a different payload to Twilio, hence doesNotExist rather than a null value check.
                 .andExpect(jsonPath("$.content.text").doesNotExist())
                 .andRespond(withStatus(HttpStatus.ACCEPTED)
                         .contentType(MediaType.APPLICATION_JSON)
@@ -120,12 +164,14 @@ class TwilioEmailProviderClientTestSuite {
         mockServer.verify();
     }
 
-    // a rejected send has to come back out as a runtimeexception specifically, that is the type
-    // NotificationProviderService's @retryable watches for, a checked or swallowed failure would skip
-    // the retries and never record a FAILED notification
+    /**
+     * The exception type is the point, not just the failure: {@code RuntimeException} is what
+     * {@code NotificationProviderService}'s {@code @Retryable} watches for. A checked or swallowed
+     * failure would skip the retries and never record a {@code FAILED} notification.
+     */
     @Test
-    @DisplayName("Block 4: A rejected send throws RuntimeException so the retry layer catches it - [MEANT TO PASS]")
-    void testBlock4_rejectedSend_throwsRuntimeException() {
+    @DisplayName("A 400 rejection from Twilio surfaces as RuntimeException - [MEANT TO PASS]")
+    void send_twilioRejectsWith400_throwsRuntimeException() {
         mockServer.expect(requestTo(SEND_ENDPOINT))
                 .andExpect(method(HttpMethod.POST))
                 .andRespond(withStatus(HttpStatus.BAD_REQUEST)
@@ -139,11 +185,14 @@ class TwilioEmailProviderClientTestSuite {
         mockServer.verify();
     }
 
-    // same requirement for a server side outage, a 5xx is transient and exactly the case the backoff
-    // in NotificationProviderService exists for, so it has to surface as the retryable type too
+    /**
+     * Same requirement as the 400 case, for the transient half of the problem: a 5xx is exactly what
+     * the backoff in {@code NotificationProviderService} exists for, so it has to surface as the
+     * same retryable type rather than being distinguished from a client error here.
+     */
     @Test
-    @DisplayName("Block 5: A 5xx from Twilio also surfaces as RuntimeException - [MEANT TO PASS]")
-    void testBlock5_serverError_throwsRuntimeException() {
+    @DisplayName("A 5xx from Twilio also surfaces as RuntimeException - [MEANT TO PASS]")
+    void send_twilioReturns500_throwsRuntimeException() {
         mockServer.expect(requestTo(SEND_ENDPOINT))
                 .andExpect(method(HttpMethod.POST))
                 .andRespond(withServerError());
@@ -155,11 +204,14 @@ class TwilioEmailProviderClientTestSuite {
         mockServer.verify();
     }
 
-    // the startup guard, a blank credential has to fail at boot naming the exact missing property
-    // rather than being discovered inside a kafka listener where it becomes a silently undelivered alert
+    /**
+     * The startup guard exists so a blank credential brings the application down at boot naming the
+     * exact missing property, instead of being discovered inside a Kafka listener where it becomes a
+     * silently undelivered alert.
+     */
     @Test
-    @DisplayName("Block 6: A blank from-email fails initialisation naming the property - [MEANT TO PASS]")
-    void testBlock6_blankFromEmail_failsInitialisation() {
+    @DisplayName("A blank from-email fails initialisation naming the property - [MEANT TO PASS]")
+    void initialiseClient_blankFromEmail_throwsIllegalStateExceptionNamingFromEmailProperty() {
         TwilioEmailProviderClient misconfigured =
                 new TwilioEmailProviderClient(ACCOUNT_SID, AUTH_TOKEN, "  ", FROM_NAME, restTemplate);
 
@@ -168,12 +220,14 @@ class TwilioEmailProviderClientTestSuite {
                 .hasMessageContaining("email.twilio.from-email");
     }
 
-    // the credentials are shared with the sms client, so a blank one has to point at the sms.twilio.*
-    // key it actually comes from, naming an email.twilio.* property here would send someone looking
-    // for config that does not exist
+    /**
+     * The credentials are shared with the SMS client, so a blank token must point at the
+     * {@code sms.twilio.*} key it actually comes from. Naming an {@code email.twilio.*} property
+     * here would send whoever reads the boot failure looking for config that does not exist.
+     */
     @Test
-    @DisplayName("Block 7: A blank auth token names the shared sms.twilio.auth-token property - [MEANT TO PASS]")
-    void testBlock7_blankAuthToken_namesSharedSmsProperty() {
+    @DisplayName("A blank auth token names the shared sms.twilio.auth-token property - [MEANT TO PASS]")
+    void initialiseClient_blankAuthToken_throwsIllegalStateExceptionNamingSharedSmsProperty() {
         TwilioEmailProviderClient misconfigured =
                 new TwilioEmailProviderClient(ACCOUNT_SID, "", FROM_EMAIL, FROM_NAME, restTemplate);
 
@@ -182,10 +236,13 @@ class TwilioEmailProviderClientTestSuite {
                 .hasMessageContaining("sms.twilio.auth-token");
     }
 
-    // a fully configured client has to initialise cleanly, the guard is only meant to catch blanks
+    /**
+     * The complement to the two blank-property cases: the guard is only meant to catch blanks, so a
+     * fully-configured client — the one built in {@code setUp()} — must pass through it untouched.
+     */
     @Test
-    @DisplayName("Block 8: A fully configured client initialises without error - [MEANT TO PASS]")
-    void testBlock8_fullyConfiguredClient_initialisesCleanly() {
+    @DisplayName("A fully configured client initialises without error - [MEANT TO PASS]")
+    void initialiseClient_allRequiredPropertiesSet_completesWithoutThrowing() {
         assertThatCode(() -> client.initialiseClient()).doesNotThrowAnyException();
     }
 }
