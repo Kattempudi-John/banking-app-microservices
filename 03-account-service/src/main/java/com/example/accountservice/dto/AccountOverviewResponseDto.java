@@ -2,23 +2,36 @@ package com.example.accountservice.dto;
 
 import java.math.BigDecimal;
 
+/**
+ * Owner-facing view of a single account, as returned by {@code GET /api/v1/accounts}.
+ *
+ * <p>This shape is for the account owner alone. That endpoint resolves the account set from the
+ * caller's JWT, so a user can only ever receive their own accounts in it — which is the only reason
+ * it is safe to carry {@code accountNumber} unmasked. It must not be reused for any response
+ * describing somebody else's account; the internal recipient-lookup response deliberately omits the
+ * unmasked number for exactly that reason.
+ *
+ * @param accountId the ledger identifier, never {@code null}
+ * @param accountType the {@code AccountType} constant rendered as its name
+ * @param availableBalance scale 4, may be zero, never {@code null}
+ * @param routingNumber 9 digits, unmasked because routing numbers are public banking information
+ * @param maskedAccountNumber all but the trailing digits replaced; safe to display anywhere
+ * @param accountNumber the full unmasked number, owner's eyes only — the Transfer page pays another
+ *     user by account number, so a recipient must be able to read their own and pass it on
+ * @param iban may be {@code null} on accounts predating the IBAN backfill; unmasked because it is
+ *     meant to be shared in order to receive transfers
+ * @param swiftCode identifies this bank rather than the account, so the same value for every user
+ * @param status the {@code AccountStatus} constant rendered as its name
+ */
 public record AccountOverviewResponseDto(
         Long accountId,
         String accountType,
         BigDecimal availableBalance,
-        String routingNumber, // Routing numbers are public banking info and sent in plain text
+        String routingNumber,
         String maskedAccountNumber,
-        // The unmasked number, for the owner's own eyes only. This DTO is built exclusively for
-        // GET /api/v1/accounts, which resolves the account set from the caller's JWT - so a user can
-        // only ever see their own here. It's needed because the Transfer page pays another user BY
-        // account number, which means the recipient has to be able to read their own and pass it on;
-        // maskedAccountNumber alone made that impossible from the UI.
-        //
-        // Deliberately NOT added to InternalAccountController's recipient-lookup response, which
-        // describes somebody ELSE's account and must stay masked.
         String accountNumber,
-        String iban, // Meant to be shared to receive transfers, so unmasked like routingNumber
-        String swiftCode, // Identifies this bank, not the individual account - same value for everyone
+        String iban,
+        String swiftCode,
         String status
 ) {
 }

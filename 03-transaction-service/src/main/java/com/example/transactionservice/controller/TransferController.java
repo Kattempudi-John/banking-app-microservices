@@ -31,6 +31,17 @@ import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.List;
 
+/**
+ * Customer-facing transfer API.
+ *
+ * <p>Every endpoint requires a fully authenticated token: a session that has passed login but not
+ * yet a second factor carries a partial scope and is rejected at the class level, before any
+ * handler runs. Account ids in a request body are never trusted for authorisation — ownership is
+ * resolved server-side from the {@code userId} claim on each call.
+ *
+ * <p>The money-moving endpoints additionally require the caller's identity verification to be
+ * approved, which the service layer enforces; the read-only ones deliberately do not.
+ */
 @RestController
 @RequestMapping("/api/v1/transfers")
 @PreAuthorize("hasAuthority('SCOPE_FULL_AUTH')")
@@ -47,8 +58,24 @@ public class TransferController {
         this.transferHistoryService = transferHistoryService;
     }
 
-    // Powers the frontend's History page (the wire-transfer half of it - account-service's own
-    // /api/v1/accounts/transactions covers deposits/internal-transfer ledger entries).
+    /**
+     * Returns the caller's wire-transfer history, newest first.
+     *
+     * <p>Covers wires only. Deposits and internal-transfer ledger entries live in account-service
+     * and are fetched separately, so this is one half of what a user sees as their history and will
+     * look empty for a user who has only ever made internal transfers.
+     *
+     * @param accountId optional; when given it must be an account the caller owns or the request is
+     *     refused, and when omitted the result spans every account they own
+     * @param status optional exact-match filter on transaction status
+     * @param from optional inclusive lower bound, ISO date-time
+     * @param to optional inclusive upper bound, ISO date-time
+     * @param pageable defaults to 50 rows sorted by {@code createdAt} descending if the client
+     *     sends nothing
+     * @return a page of transactions; empty rather than an error when the caller owns no accounts
+     * @throws org.springframework.web.server.ResponseStatusException with {@code FORBIDDEN} when
+     *     {@code accountId} names an account the caller does not own
+     */
     @GetMapping
     public ResponseEntity<Page<TransactionEntity>> getTransferHistory(
             @RequestParam(required = false) Long accountId,
@@ -64,14 +91,30 @@ public class TransferController {
         return ResponseEntity.ok(transfers);
     }
 
-    // learned a record can be declared right inside a controller class like this, keeps a tiny
-    // dto that only this one controller cares about from needing its own separate file
+    /**
+     * Request to move funds between two accounts the caller already owns.
+     *
+     * @param fromAccountId required; ownership is verified server-side, not taken on trust
+     * @param toAccountId required; must also belong to the caller, or the transfer is refused
+     * @param amount required and strictly positive; zero and negative values are rejected as 400
+     */
     public record InternalTransferRequestDto(
             @NotNull Long fromAccountId,
             @NotNull Long toAccountId,
             @NotNull @Positive BigDecimal amount
     ) {}
 
+    /**
+     * Moves funds between two of the caller's own accounts and confirms immediately.
+     *
+     * <p>Completes synchronously or not at all — there is no pending state on this path and no
+     * fraud threshold, both accounts being on this platform and both belonging to the caller.
+     *
+     * @param request both accounts must be owned by the authenticated caller
+     * @return 200 with a confirmation whose status is always {@code COMPLETED}
+     * @throws com.example.transactionservice.aspect.KycEnforcementAspect.KycRequiredException as a
+     *     403 when the caller's identity verification is not approved
+     */
     @PostMapping("/internal")
     public ResponseEntity<TransferResponseDto> executeInternalTransfer(
             @RequestBody @Valid InternalTransferRequestDto request) {
@@ -88,26 +131,50 @@ public class TransferController {
         return ResponseEntity.ok(response);
     }
 
+    /**
+     * Request to pay another person's account by its full account number.
+     *
+     * @param fromAccountId required; must belong to the caller
+     * @param recipientAccountNumber required and non-blank; the full number, as the sender typed it
+     * @param amount required and strictly positive
+     */
     public record RecipientTransferRequestDto(
             @NotNull Long fromAccountId,
             @NotBlank String recipientAccountNumber,
             @NotNull @Positive BigDecimal amount
     ) {}
 
-    // verified says whether a transfer to this recipient would actually be accepted - assembled here
-    // from transaction-service's own KYC check, so account-service keeps knowing nothing about KYC.
-    // A bare boolean rather than the real status: the UI only needs "can they be paid", and the
-    // sender has no business seeing someone else's verification standing.
+    /**
+     * What a sender is shown about a recipient before committing to pay them.
+     *
+     * @param maskedAccountNumber partially redacted; the full number is never echoed back
+     * @param accountType product label, for display only
+     * @param displayName may be {@code null} when no name could be resolved, which does not stop
+     *     the payment
+     * @param verified whether a transfer to this recipient would currently be accepted, assembled
+     *     from this service's own KYC check so account-service need know nothing about KYC;
+     *     deliberately a bare flag rather than the real status, because the sender needs only
+     *     "can they be paid" and has no business seeing someone else's verification standing
+     */
     public record RecipientPreviewDto(String maskedAccountNumber, String accountType, String displayName,
                                       boolean verified) {}
 
-    // Read-only lookup the Transfer page calls as soon as a recipient account number is entered, so the
-    // sender can confirm who they're paying before any money moves. Intentionally does NOT carry
-    // @RequiresKyc - looking up a name moves no funds, and failing this with a KYC error would be
-    // confusing. It leaks nothing beyond a name and a masked number, both of which the sender needs
-    // to have been told by the recipient already.
-    // For the same reason an unverified recipient answers 200 with verified=false instead of the 403
-    // the send itself would give: this is where the frontend warns, not where it blocks.
+    /**
+     * Resolves a recipient account number so the sender can confirm who they are paying.
+     *
+     * <p>Read-only and intentionally ungated by KYC: looking up a name moves no money, and refusing
+     * it with a verification error would misdescribe the problem. For the same reason an unverified
+     * recipient answers 200 with {@code verified} false instead of the 403 the send itself would
+     * give — this is where the frontend warns, not where it blocks.
+     *
+     * <p>Discloses nothing the sender was not already told by the recipient: a name and a masked
+     * number, both of which they need to have had the account number at all.
+     *
+     * @param accountNumber the full account number as typed, never blank
+     * @return 200 with the preview
+     * @throws org.springframework.web.server.ResponseStatusException with {@code NOT_FOUND} and a
+     *     message about the number typed when no account holds it
+     */
     @GetMapping("/recipients/{accountNumber}")
     public ResponseEntity<RecipientPreviewDto> previewRecipient(@PathVariable String accountNumber) {
         var recipient = transferService.resolveRecipient(accountNumber);
@@ -118,6 +185,20 @@ public class TransferController {
                 recipient.maskedAccountNumber(), recipient.accountType(), displayName, verified));
     }
 
+    /**
+     * Pays another person's account by number and confirms immediately.
+     *
+     * <p>The only path where both parties are verified: the sender by the gate on the service
+     * method, the recipient by an explicit check made before any money moves. A 403 here may
+     * therefore be about either party, so clients must show the message that arrives rather than
+     * assume it concerns the sender.
+     *
+     * @param request the recipient account number must resolve to an existing account owned by an
+     *     approved user
+     * @return 200 with a confirmation whose status is always {@code COMPLETED}
+     * @throws org.springframework.web.server.ResponseStatusException with {@code NOT_FOUND} when no
+     *     account holds that number
+     */
     @PostMapping("/to-recipient")
     public ResponseEntity<TransferResponseDto> executeTransferToRecipient(
             @RequestBody @Valid RecipientTransferRequestDto request) {
@@ -134,21 +215,41 @@ public class TransferController {
         return ResponseEntity.ok(response);
     }
 
-    // mixing @RequestParam and @RequestBody on the same endpoint, learned spring is fine reading
-    // fromAccountId off the query string while the rest of the payload comes from the json body
+    /**
+     * Sends an outgoing wire, which may complete at once or be held for fraud review.
+     *
+     * <p>Unlike the other transfer endpoints this one can answer 200 with a status of
+     * {@code PENDING_APPROVAL}: any amount strictly above {@code 5000.00} is held for review, while
+     * exactly {@code 5000.00} clears. A held wire has already debited the sender, so a client must
+     * present that response as "sent, awaiting review" and not as "not yet sent".
+     *
+     * <p>A failure part-way through can leave the sender debited with no wire recorded and no
+     * automatic refund, and the request carries no idempotency key, so a client must not blindly
+     * retry a wire whose outcome it does not know.
+     *
+     * @param fromAccountId read from the query string while the rest of the wire comes from the
+     *     body; must be an account the caller owns
+     * @param request IBAN must pass mod-97 and the BIC must be 8 or 11 characters; when the IBAN
+     *     turns out to belong to an account on this platform the BIC must also match that account's
+     *     bank, which is the only case where a wrong BIC can be detected at all
+     * @return 200 with the wire id, a status of either {@code COMPLETED} or
+     *     {@code PENDING_APPROVAL}, and whether the wire stayed on this platform
+     * @throws org.springframework.web.server.ResponseStatusException with {@code BAD_REQUEST} for a
+     *     malformed or mismatched IBAN/BIC pair
+     */
     @PostMapping("/external")
     public ResponseEntity<TransferResponseDto> executeExternalWire(
             @RequestParam Long fromAccountId,
             @RequestBody @Valid ExternalWireRequestDto request) {
-        
+
         Long userId = extractUserIdFromAuth();
-        
+
         TransferResponseDto response = externalWireService.initiateWire(
-                userId, 
-                fromAccountId, 
+                userId,
+                fromAccountId,
                 request
         );
-        
+
         return ResponseEntity.ok(response);
     }
 
@@ -160,16 +261,11 @@ public class TransferController {
         if (!authentication.isAuthenticated()) {
             throw new SecurityException("User is not authenticated");
         }
-        // The JWT subject holds the username, not the id — auth-service puts the numeric
-        // userId in its own claim instead, since this service has no User table to resolve it from.
         Jwt jwt = (Jwt) authentication.getPrincipal();
         return jwt.getClaim("userId");
     }
 }
 
-// Colocated with its controller the same way InternalFraudController's FraudResolutionService is -
-// a small, distinct concern (querying transfer history) that doesn't belong on TransferService
-// (transfer execution) or ExternalWireService (wire initiation).
 @Service
 class TransferHistoryService {
 

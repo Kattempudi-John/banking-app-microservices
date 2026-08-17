@@ -6,8 +6,15 @@ import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Positive;
 
-// a record used purely as a request dto, learned validation annotations can go right on the
-// record's own components like this instead of needing a whole class with private fields and getters
+/**
+ * Carries a new large-transaction alert threshold.
+ *
+ * <p>Constraints are enforced only when the controller parameter is also marked {@code @Valid};
+ * without it these annotations are inert and an invalid amount reaches the service layer.
+ *
+ * @param alertThresholdAmount required and strictly positive, minimum {@code 0.01}, so disabling
+ *     alerts cannot be expressed by sending zero
+ */
 public record UpdateAlertThresholdRequestDto(
 
         @NotNull(message = "Alert threshold cannot be null")

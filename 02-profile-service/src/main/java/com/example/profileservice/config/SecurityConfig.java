@@ -26,8 +26,13 @@ import javax.crypto.spec.SecretKeySpec;
 import java.util.Base64;
 import java.util.List;
 
-// @EnableMethodSecurity is what actually makes @PreAuthorize on the controllers take effect,
-// without it those annotations would just sit there completely ignored
+/**
+ * Configures request authorization, the servlet filter order, and JWT verification for this service.
+ *
+ * <p>Method security is enabled here, which is what makes {@code @PreAuthorize} on the controllers
+ * take effect; without it those annotations are parsed and ignored, and every guarded endpoint
+ * silently becomes reachable by any authenticated caller.
+ */
 @Configuration
 @EnableWebSecurity
 @EnableMethodSecurity
@@ -36,9 +41,6 @@ public class SecurityConfig {
     private final KycWebhookFilter kycWebhookFilter;
     private final InternalTokenFilter internalTokenFilter;
 
-    // Same base64-encoded HMAC secret auth-service signs tokens with (shared via the
-    // JWT_SECRET_KEY k8s secret in prod, see application-prod.yml) so this service can verify
-    // a token's signature on its own, without ever calling back to auth-service.
     @Value("${application.security.jwt.secret-key:404E635266556A586E3272357538782F413F4428472B4B6250645367566B5970}")
     private String secretKey;
 
@@ -47,35 +49,49 @@ public class SecurityConfig {
         this.internalTokenFilter = internalTokenFilter;
     }
 
+    /**
+     * Builds the stateless filter chain: two shared-secret filters ahead of authentication, then
+     * bearer-token resource-server validation.
+     *
+     * <p>{@code KycWebhookFilter} and {@code InternalTokenFilter} both run before
+     * {@code UsernamePasswordAuthenticationFilter} because neither of their callers authenticates —
+     * the vendor webhook proves itself with an HMAC signature, sibling services with a shared token.
+     * Their order relative to each other is free: they guard the disjoint prefixes
+     * {@code /api/v1/webhooks/} and {@code /api/v1/internal/} and each passes straight through on any
+     * other path, so no request is ever inspected by both.
+     *
+     * <p>Those two prefixes are {@code permitAll} at the Spring Security layer precisely because the
+     * filters, not this chain, are what gate them. Raising {@code /api/v1/internal/**} to
+     * {@code authenticated()} breaks every caller: these are service-to-service calls with no
+     * end-user token to present — notification-service sweeping daily-summary opt-ins has no user in
+     * the room at all.
+     *
+     * <p>{@code /api/v1/internal/} is also the one prefix the k8s ingress does not route, so any new
+     * unauthenticated endpoint must live under it. A {@code permitAll} path under a routed prefix
+     * such as {@code /api/v1/profiles} is published to the internet.
+     *
+     * <p>The {@code ERROR} dispatch type is permitted so Spring's internal re-dispatch to
+     * {@code /error} can render a body. Without it that dispatch is authorized as a fresh request and
+     * every 400 or 404 reaches the caller as a bodyless 401 with the real reason lost. Matching the
+     * dispatch type rather than the path keeps {@code /error} itself unreachable from outside.
+     *
+     * <p>Resource-server JWT validation uses {@link #jwtDecoder()} and maps the token's
+     * {@code scope} claim to authorities ({@code FULL_AUTH} becomes {@code SCOPE_FULL_AUTH}), which
+     * is what {@code PreferenceController}'s class-level {@code @PreAuthorize} check tests.
+     *
+     * @param http the builder Spring supplies; CSRF is disabled because no session cookie is issued
+     * @return the built chain, registered as the single chain for this service
+     * @throws Exception propagated from {@code HttpSecurity.build()} when the chain is misconfigured
+     */
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
         http
             .csrf(AbstractHttpConfigurer::disable)
-            // Allow the Angular dev server (and later, its deployed origin) to call this API
-            // cross-origin, including sending the Authorization header on credentialed requests.
             .cors(cors -> cors.configurationSource(corsConfigurationSource()))
-            // webhooks and the kyc-status lookup stay open at the spring security layer since
-            // they are protected by other means instead, the webhook by its own hmac signature
-            // filter below, and kyc-status because it is meant for internal service to service calls
             .authorizeHttpRequests(auth -> auth
-                // Spring re-dispatches internally to /error to render an error body. Without this,
-                // that dispatch is authorized as if it were a fresh request, so every 400/404 comes
-                // back as a bodyless 401 and the real reason never reaches the caller. Matching on
-                // the ERROR dispatch type keeps /error itself from being publicly reachable.
                 .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
                 .requestMatchers("/api/v1/webhooks/**").permitAll()
-                // Service-to-service only, and the ONE prefix the k8s ingress does not route.
-                // Anything unauthenticated has to live here: the ingress matches by path prefix, so a
-                // permitAll endpoint under /api/v1/profiles (which is routed) is published to the
-                // internet - exactly what the old /api/v1/profiles/*/kyc-status rule did.
-                //
-                // Still permitAll, and it has to stay that way: InternalTokenFilter is what gates
-                // this prefix now. Tightening the rule to .authenticated() instead would demand a JWT
-                // from callers who have no end-user token to send - notification-service sweeping
-                // daily-summary opt-ins has no user in the room at all - and would break every one
-                // of these calls.
                 .requestMatchers("/api/v1/internal/**").permitAll()
-                // Swagger/OpenAPI UI - documentation, not application data
                 .requestMatchers("/swagger-ui/**", "/swagger-ui.html", "/v3/api-docs/**").permitAll()
                 .anyRequest().authenticated()
             )
@@ -83,22 +99,25 @@ public class SecurityConfig {
                 .sessionCreationPolicy(SessionCreationPolicy.STATELESS)
             )
             .addFilterBefore(kycWebhookFilter, UsernamePasswordAuthenticationFilter.class)
-            // Both secret-checking filters sit ahead of authentication because neither of their
-            // callers authenticates: the vendor's webhook proves itself with an HMAC, our own
-            // services with a shared token. Their order relative to each other does not matter -
-            // they guard disjoint prefixes (/api/v1/webhooks/ vs /api/v1/internal/) and each one
-            // passes straight through on any path that is not its own, so no request is ever seen
-            // by both as something to check.
             .addFilterBefore(internalTokenFilter, UsernamePasswordAuthenticationFilter.class)
-            // Validates the bearer token against the JwtDecoder bean below and populates the
-            // SecurityContext with a JwtAuthenticationToken, whose authorities come from the
-            // token's "scope" claim (e.g. "FULL_AUTH" -> SCOPE_FULL_AUTH) — needed for
-            // PreferenceController's class-level @PreAuthorize check to ever pass.
             .oauth2ResourceServer(oauth2 -> oauth2.jwt(Customizer.withDefaults()));
 
         return http.build();
     }
 
+    /**
+     * Supplies the HS256 decoder that verifies bearer tokens locally.
+     *
+     * <p>The key is the same base64-encoded HMAC secret auth-service signs with, injected from
+     * {@code application.security.jwt.secret-key} and supplied in production by the
+     * {@code JWT_SECRET_KEY} k8s secret. Sharing the secret is what lets this service verify a
+     * signature on its own rather than calling back to auth-service on every request; the flip side
+     * is that the two services must be rotated together, and a token signed with a rotated key fails
+     * verification here rather than being refreshed.
+     *
+     * @return a decoder accepting only {@code HS256}, so a token signed with any other algorithm is
+     *     rejected rather than trusted
+     */
     @Bean
     public JwtDecoder jwtDecoder() {
         byte[] keyBytes = Base64.getDecoder().decode(secretKey);
@@ -106,6 +125,15 @@ public class SecurityConfig {
         return NimbusJwtDecoder.withSecretKey(key).macAlgorithm(MacAlgorithm.HS256).build();
     }
 
+    /**
+     * Allows the Angular dev server to call this API cross-origin with credentials.
+     *
+     * <p>Credentialed requests are permitted so the {@code Authorization} header survives the
+     * preflight, which forbids a wildcard origin — the allowed origin list must name each origin
+     * explicitly, so a deployed frontend origin has to be added here before it can call this service.
+     *
+     * @return a source applying one policy to {@code /**}
+     */
     @Bean
     public CorsConfigurationSource corsConfigurationSource() {
         CorsConfiguration configuration = new CorsConfiguration();

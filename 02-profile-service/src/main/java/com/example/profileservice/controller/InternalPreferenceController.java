@@ -12,14 +12,19 @@ import com.example.profileservice.controller.PreferenceController.UserPreference
 import com.example.profileservice.service.PreferenceService;
 import com.example.profileservice.service.UserPreferenceResponseMapper;
 
-// The service-to-service half of PreferenceController. notification-service reads a user's alert
-// threshold (and the email address to deliver to) before every alert, and sweeps the daily-summary
-// opt-ins hourly - neither call carries an end-user token, so both have to be unauthenticated.
-//
-// They live here under /api/v1/internal/ rather than on PreferenceController because that class is
-// mapped at /api/v1/profile/alerts, which the k8s ingress now routes. An unauthenticated endpoint
-// under a routed prefix is an endpoint published to the internet - and this response carries email
-// addresses, so that mattered more than usual.
+/**
+ * Serves notification preferences to other services.
+ *
+ * <p>The service-to-service half of {@link PreferenceController}: notification-service reads a
+ * user's alert threshold and delivery address before every alert, and sweeps the daily-summary
+ * opt-ins hourly. Neither call carries an end-user token, so neither can sit behind the JWT rule;
+ * both are authorized instead by the shared token {@code InternalTokenFilter} requires.
+ *
+ * <p>These paths are declared in full here rather than added to {@link PreferenceController} because
+ * that class is mapped under {@code /api/v1/profile/alerts}, which the k8s ingress routes. An
+ * unauthenticated endpoint under a routed prefix is an endpoint published to the internet — and
+ * these responses carry email addresses.
+ */
 @RestController
 public class InternalPreferenceController {
 
@@ -32,16 +37,30 @@ public class InternalPreferenceController {
         this.responseMapper = responseMapper;
     }
 
+    /**
+     * Returns one user's notification preferences to a calling service.
+     *
+     * @param userId never {@code null}; taken from the path, so this can be pointed at any user and
+     *     must stay unreachable from the internet
+     * @return {@code 200} always; an unknown user yields the default preferences with a {@code null}
+     *     email rather than a {@code 404}, so callers need no separate "user has no preferences" path
+     */
     @GetMapping("/api/v1/internal/profiles/{userId}/preferences")
     public ResponseEntity<UserPreferenceResponse> getPreferences(@PathVariable Long userId) {
         return ResponseEntity.ok(responseMapper.toResponse(preferenceService.getPreferences(userId)));
     }
 
-    // timezone is optional: omitted, this answers with every opted-in user regardless of zone. The
-    // hourly job needs that because the send hour is now per-user, so it can no longer narrow the
-    // sweep to "the zones where it is currently 08:00" - it takes the whole opt-in list once and
-    // matches each user's own hour itself. Supplying the param still filters to that single zone,
-    // which is what notification-service's manual trigger endpoint does.
+    /**
+     * Lists the users opted in to the daily summary, optionally narrowed to one timezone.
+     *
+     * @param timezone optional: omitted, this answers with every opted-in user regardless of zone.
+     *     The hourly job needs that because the send hour is now per-user, so it can no longer narrow
+     *     the sweep to "the zones where it is currently 08:00" — it takes the whole opt-in list once
+     *     and matches each user's own hour itself. Supplying an IANA identifier still filters to that
+     *     single zone, which is what notification-service's manual trigger endpoint does
+     * @return {@code 200} with a possibly empty list; each entry carries the user's own send hour,
+     *     never {@code null}, which the caller compares against the current hour
+     */
     @GetMapping("/api/v1/internal/profiles/daily-summary-users")
     public ResponseEntity<List<UserPreferenceResponse>> getUsersForDailySummary(
             @RequestParam(required = false) String timezone) {

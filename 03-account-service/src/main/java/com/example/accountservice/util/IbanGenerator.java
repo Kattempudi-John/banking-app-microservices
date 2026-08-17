@@ -4,16 +4,33 @@ import java.math.BigInteger;
 
 import org.springframework.stereotype.Component;
 
-// Builds an IBAN out of an account's existing routing + account number, using the same ISO 7064
-// mod-97 checksum that transaction-service's IbanSwiftValidator verifies against - this is just
-// the generation side of that same math. Not shared as a library since each service here is an
-// independently-deployable module (see the project's shared-nothing pattern elsewhere).
+/**
+ * Derives an IBAN from an account's existing routing and account numbers.
+ *
+ * <p>Produces the generation side of the ISO 7064 mod-97 checksum that transaction-service's
+ * {@code IbanSwiftValidator} verifies against. Kept here rather than in a shared library because
+ * each service in this project is an independently deployable module.
+ *
+ * <p>Issues IBANs under the fictional country code {@code XB}; this is a demo bank, not a
+ * registered institution, so the values are well-formed but not routable.
+ */
 @Component
 public class IbanGenerator {
 
-    // Fictional country code - this is a demo bank, not a real financial institution.
     private static final String COUNTRY_CODE = "XB";
 
+    /**
+     * Builds the IBAN for one account.
+     *
+     * <p>Deterministic: the same inputs always yield the same IBAN, which is what lets
+     * {@code IbanBackfillRunner} fill in historical rows without changing what a re-run produces.
+     *
+     * @param routingNumber digits only, concatenated ahead of the account number to form the BBAN;
+     *     a value that differs from the one stored on the account produces an IBAN that will not
+     *     match that account
+     * @param accountNumber digits only; must be the account's raw number, not a masked form
+     * @return the full IBAN, {@code XB} plus two check digits plus the BBAN, never {@code null}
+     */
     public String generate(String routingNumber, String accountNumber) {
         String bban = routingNumber + accountNumber;
         String checkDigits = computeCheckDigits(bban);
@@ -21,8 +38,6 @@ public class IbanGenerator {
     }
 
     private String computeCheckDigits(String bban) {
-        // Standard IBAN check-digit algorithm: rearrange with placeholder "00" check digits,
-        // convert letters to numbers (A=10..Z=35), then check digits = 98 - (number mod 97).
         String rearranged = bban + COUNTRY_CODE + "00";
         StringBuilder numeric = new StringBuilder();
         for (char ch : rearranged.toCharArray()) {

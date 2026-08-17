@@ -9,10 +9,21 @@ import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 import org.springframework.web.client.RestTemplate;
 
-// SMS delivery via Textbelt (https://textbelt.com) - active when sms.provider=textbelt, mutually
-// exclusive with the other SmsProviderClient beans so Spring never sees two candidates. The free
-// "textbelt" key needs no account/signup, just 1 text/day/IP, which makes it a decent zero-setup way
-// to prove the 2FA path end-to-end. sms.provider=twilio is the real option for actual volume.
+/**
+ * Delivers SMS through Textbelt, {@code https://textbelt.com}.
+ *
+ * <p>Selected when {@code sms.provider=textbelt}, which deselects {@link LoggingSmsProviderClient}
+ * and {@link TwilioSmsProviderClient} so Spring only ever has one {@link SmsProviderClient}
+ * candidate.
+ *
+ * <p>Intended as a demonstration path, not a production one: the free key literally spelled
+ * {@code textbelt} needs no account or signup but allows one message per day per source IP, which
+ * is enough to prove the 2FA delivery path against a real handset and nothing more. Use
+ * {@code sms.provider=twilio} for any real volume.
+ *
+ * <p>Unlike the Twilio clients, the key is not validated at startup — a wrong or exhausted key
+ * surfaces as a failed send.
+ */
 @Component
 @ConditionalOnProperty(name = "sms.provider", havingValue = "textbelt")
 public class TextBeltSmsProviderClient implements SmsProviderClient {
@@ -23,10 +34,31 @@ public class TextBeltSmsProviderClient implements SmsProviderClient {
     private final RestTemplate restTemplate = new RestTemplate();
     private final String apiKey;
 
+    /**
+     * Captures the Textbelt key.
+     *
+     * @param apiKey the {@code sms.textbelt-key} value; it has no default, so selecting this
+     *     provider without setting the property fails the context at startup on the unresolved
+     *     placeholder
+     */
     public TextBeltSmsProviderClient(@Value("${sms.textbelt-key}") String apiKey) {
         this.apiKey = apiKey;
     }
 
+    /**
+     * Posts the message to Textbelt as a form submission and fails unless the body reports success.
+     *
+     * <p>The status check cannot be delegated to the HTTP code: Textbelt answers 200 even for a
+     * refusal and reports the outcome in a {@code success} field, so a quota exhaustion looks like a
+     * successful response until the body is read.
+     *
+     * @param phoneNumber E.164 form including the country code
+     * @param message plain text, sent verbatim
+     * @throws RuntimeException when Textbelt reports {@code success: false} — most often
+     *     {@code Out of quota} on the free key — or answers with no body at all; unchecked on
+     *     purpose so {@code NotificationProviderService} retries and then records a {@code FAILED}
+     *     notification
+     */
     @Override
     public void send(String phoneNumber, String message) {
         MultiValueMap<String, String> body = new LinkedMultiValueMap<>();
@@ -44,8 +76,6 @@ public class TextBeltSmsProviderClient implements SmsProviderClient {
         log.info("SUCCESS: SMS dispatched via Textbelt. To: [{}], quotaRemaining: {}", phoneNumber, response.quotaRemaining());
     }
 
-    // Textbelt's response shape: {"success": true, "quotaRemaining": 40, "textId": 12345}
-    // or {"success": false, "quotaRemaining": 0, "error": "Out of quota"}
     private record TextbeltResponse(boolean success, Integer quotaRemaining, String error, String textId) {
     }
 }

@@ -35,9 +35,17 @@ import com.example.authservice.util.PhoneNumberNormalizer;
 
 import jakarta.servlet.http.HttpServletRequest;
 
-// @RestController is @Controller + @ResponseBody combined, means every method here returns
-// its value straight as the http response body (usually as json) instead of a view name
-// @RequestMapping on the class sets a shared prefix, so every endpoint below builds on /api/v1/auth
+/**
+ * Exposes the credential lifecycle for end users: registration, the two-phase login, 2FA
+ * verification, sliding-session refresh, and logout.
+ *
+ * <p>Login is deliberately split in two. A password check alone never yields a usable token
+ * unless the caller presents a {@code Device-ID} cookie this service has seen before; otherwise
+ * it yields a {@code PRE_AUTH} token that {@code JwtAuthenticationFilter} refuses to accept
+ * anywhere except the {@code /verify-2fa} paths below. The class-level {@code /api/v1/auth}
+ * prefix is therefore part of the security model, not just tidiness: the filter matches on the
+ * request URI, so relocating these mappings changes which tokens can reach them.
+ */
 @RestController
 @RequestMapping("/api/v1/auth")
 public class AuthController {
@@ -50,8 +58,6 @@ public class AuthController {
     private final PasswordEncoder passwordEncoder;
     private final PhoneNumberNormalizer phoneNumberNormalizer;
 
-    // learned spring does not need an @Autowired annotation here since there is only one
-    // constructor, it just automatically injects all five dependencies through this one
     public AuthController(AuthenticationManager authenticationManager,
                           JwtService jwtService,
                           AuthSecurityService authSecurityService,
@@ -68,16 +74,34 @@ public class AuthController {
         this.phoneNumberNormalizer = phoneNumberNormalizer;
     }
 
-    // ==========================================
-    // 0. Registration
-    // ==========================================
-
     private static final int MIN_PASSWORD_LENGTH = 8;
 
-    // Deliberately loose - just enough to catch a typo like a missing @ before it becomes an address
-    // nothing can ever be delivered to. Real deliverability is SendGrid's problem, not a regex's.
     private static final Pattern EMAIL_PATTERN = Pattern.compile("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$");
 
+    /**
+     * Creates a user account and announces it to the rest of the platform.
+     *
+     * <p>An email address is mandatory here even though the column is nullable; the column only
+     * permits {@code null} for accounts that predate it. The format check is deliberately loose,
+     * enough to catch a missing {@code @} and no more, because real deliverability is the mail
+     * provider's answer to give, not a regex's.
+     *
+     * <p>A phone number is optional, but one that cannot be normalized to E.164 is rejected
+     * rather than stored as typed: the number travels on the 2FA event as the fallback contact
+     * and the SMS provider refuses any other shape. Uniqueness is checked on the normalized
+     * value, so the same phone typed two ways is still one phone, and it is enforced for the
+     * same reason as email, since whoever holds the number receives that account's 2FA codes.
+     *
+     * <p>On success a {@code user-events} message is published; profile-service and
+     * account-service provision their own rows from it, so this is the only way they learn the
+     * user exists.
+     *
+     * @param request must carry non-blank {@code username}, a {@code password} of at least 8
+     *     characters, and a syntactically valid {@code email};
+     *     {@code phoneNumber} is optional but must normalize to E.164 when supplied
+     * @return {@code 201} on success, {@code 400} for a missing or malformed field, {@code 409}
+     *     when the username, email, or phone number already belongs to another account
+     */
     @PostMapping("/register")
     public ResponseEntity<?> register(@RequestBody Map<String, String> request) {
         String username = request.get("username");
@@ -92,8 +116,6 @@ public class AuthController {
             return ResponseEntity.badRequest()
                     .body(Map.of("error", "Password must be at least " + MIN_PASSWORD_LENGTH + " characters"));
         }
-        // Required for new registrations even though the column is nullable: the column has to allow
-        // nulls for accounts that predate it, but there's no reason to create another one.
         if (email == null || email.isBlank()) {
             return ResponseEntity.badRequest().body(Map.of("error", "Email is required"));
         }
@@ -107,9 +129,6 @@ public class AuthController {
             return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of("error", "That email is already registered"));
         }
 
-        // Store the number in E.164 or not at all. 2FA codes go out by email now, but the number
-        // still rides along on the 2FA event as the fallback contact, and the SMS provider rejects
-        // any other format - so a number accepted here in the wrong shape is undeliverable later.
         String normalizedPhone = null;
         if (phoneNumber != null && !phoneNumber.isBlank()) {
             normalizedPhone = phoneNumberNormalizer.normalize(phoneNumber)
@@ -118,11 +137,6 @@ public class AuthController {
                 return ResponseEntity.badRequest()
                         .body(Map.of("error", "Please enter a valid phone number, e.g. 571-285-6947 or +15712856947"));
             }
-            // Checked on the normalized value, and only once normalization has succeeded - the same
-            // phone typed two different ways is still one phone, and comparing the raw input would
-            // miss it. Rejected for the same reason a duplicate email is: the number receives that
-            // account's 2FA codes, so sharing one hands a second person the keys to the first
-            // person's login.
             if (userRepository.existsByPhoneNumber(normalizedPhone)) {
                 return ResponseEntity.status(HttpStatus.CONFLICT)
                         .body(Map.of("error", "That phone number is already registered"));
@@ -143,24 +157,38 @@ public class AuthController {
                 .body(Map.of("status", "SUCCESS", "message", "Account created successfully"));
     }
 
-    // ==========================================
-    // 1. Initial Login Phase
-    // ==========================================
-
+    /**
+     * Verifies a username and password, then either completes the login or opens a 2FA challenge.
+     *
+     * <p>Which of the two happens is decided by the device cookie, not by the request body, so a
+     * caller must branch on the {@code status} field of the response: a device hash already on
+     * file for this user skips 2FA and returns a 15-minute {@code FULL_AUTH} token, while
+     * anything else returns {@code 202} and a 5-minute {@code PRE_AUTH} token that is only good
+     * against the {@code /verify-2fa} endpoints.
+     *
+     * @param request must carry {@code username} and {@code password}
+     * @param deviceCookie the raw {@code Device-ID} cookie issued by an earlier successful 2FA;
+     *     {@code null} on a first login and on any browser that dropped it, which is not an
+     *     error and simply forces the challenge
+     * @return {@code 200} with {@code access_token} plus a refreshed {@code Refresh-Token}
+     *     cookie for a recognized device, or {@code 202} with {@code pre_auth_token} and
+     *     {@code expires_in_seconds} when 2FA is required
+     * @throws org.springframework.security.core.AuthenticationException when the username is
+     *     unknown or the password does not match; the two are reported identically so a caller
+     *     cannot probe for which usernames exist
+     */
     @PostMapping("/login")
     public ResponseEntity<?> login(@RequestBody Map<String, String> request,
                                    @CookieValue(name = "Device-ID", required = false) String deviceCookie) {
-        
+
         String username = request.get("username");
         String password = request.get("password");
 
-        // 1. Verify password (Throws BadCredentialsException if wrong)
         Authentication authentication = authenticationManager.authenticate(
                 new UsernamePasswordAuthenticationToken(username, password)
         );
-        User user = (User) authentication.getPrincipal(); // Assuming custom UserDetails implementation
+        User user = (User) authentication.getPrincipal();
 
-        // 2. Check Device Fingerprint
         boolean isRecognized = authSecurityService.isDeviceRecognized(user.getId(), deviceCookie);
 
         if (isRecognized) {
@@ -171,74 +199,73 @@ public class AuthController {
     }
 
     private ResponseEntity<?> handleRecognizedDeviceLogin(User user) {
-        // Bypass 2FA - Issue Full Access
         String fullJwt = jwtService.generateToken(user, TokenType.FULL_AUTH);
         ResponseCookie refreshCookie = createRefreshTokenCookie(user.getId());
 
-        // learned you can call .header() more than once on a responseentity builder to stack
-        // multiple response headers before finally calling .body() to close it out
         return ResponseEntity.ok()
                 .header(HttpHeaders.SET_COOKIE, refreshCookie.toString())
                 .body(Map.of("status", "SUCCESS", "access_token", fullJwt));
     }
 
     private ResponseEntity<?> handleUnrecognizedDeviceLogin(User user) {
-        // Unrecognized Device - Require 2FA
         return issue2faChallenge(user);
     }
 
-    // Shared by the initial login and by /verify-2fa/resend, so the two can never drift into
-    // answering with different shapes for what is, to the client, the same "we sent you a code"
-    // state. The code itself is not in here and never comes back from the service - the body
-    // carries only the lifetime the UI counts down from.
     private ResponseEntity<?> issue2faChallenge(User user) {
         String preAuthJwt = jwtService.generateToken(user, TokenType.PRE_AUTH);
-        // Email is passed straight off the User row - auth-service owns that column, so there's no
-        // lookup to make and nothing downstream has to ask another service who this address belongs to.
         int expiresInSeconds = authSecurityService.trigger2fa(user.getId(), user.getPhoneNumber(), user.getEmail());
 
-        // Map.of, not a HashMap: no branch fills this in conditionally any more, and the value has
-        // to stay a number so the client can do arithmetic on it without parsing a string.
         return ResponseEntity.accepted().body(Map.of(
                 "status", "2FA_REQUIRED",
                 "pre_auth_token", preAuthJwt,
                 "expires_in_seconds", expiresInSeconds));
     }
 
-    // ==========================================
-    // 2. 2FA Verification Phase
-    // ==========================================
-
     private static final String NOT_AUTHENTICATED_MESSAGE = "Not authenticated. Please log in again.";
 
+    /**
+     * Verifies a 2FA code and upgrades the caller's half-authenticated session to a full one.
+     *
+     * <p>The caller is identified from the {@code PRE_AUTH} token alone; nothing in the body
+     * names a user. That token reaches this method only because the URI sits under
+     * {@code /verify-2fa}, which is the sole prefix {@code JwtAuthenticationFilter} admits a
+     * {@code PRE_AUTH} token on. The endpoint is also {@code permitAll}, since by definition the
+     * caller has no full token yet, so a request carrying no token at all still arrives here and
+     * is answered {@code 401} rather than being turned away by the filter chain.
+     *
+     * <p>Each failure gets its own status and a machine-readable {@code reason}, because the
+     * client has to act differently on each: a wrong digit means try again, a missing or expired
+     * code means press resend, and a lockout means start the login over. {@code EXPIRED} answers
+     * {@code 410} rather than {@code 401} because the credential was real and merely no longer
+     * exists, and the UI keys its "ask for another" state off that status.
+     *
+     * <p>A successful call registers this device, so the response sets a year-long
+     * {@code Device-ID} cookie alongside a fresh {@code Refresh-Token}; a later login presenting
+     * that cookie skips 2FA entirely.
+     *
+     * @param request must carry {@code code}, the six digits from the delivered message; a
+     *     missing or non-matching value is a normal {@code 401}, not a validation error
+     * @return {@code 200} with {@code access_token} on success, {@code 401} for a wrong or
+     *     absent code, {@code 410} once the code has expired, {@code 429} after three failed
+     *     attempts have burned the code
+     */
     @PostMapping("/verify-2fa/sms")
     public ResponseEntity<?> verifySms(@RequestBody Map<String, String> request) {
 
-        // Thanks to our JwtAuthenticationFilter, we ALREADY know who this user is securely!
-        // learned securitycontextholder is thread local storage spring security fills in per request,
-        // the filter runs earlier in the chain and sets this authentication before this method ever runs
         User user = currentPreAuthUser();
         if (user == null) {
             return ResponseEntity.status(401).body(Map.of("error", NOT_AUTHENTICATED_MESSAGE));
         }
         String code = request.get("code");
 
-        // 1. Verify the code
         TwoFaResult result = authSecurityService.verifySms2fa(user.getId(), code);
 
-        // Each failure gets its own status and a machine-readable reason, because the client has to
-        // react differently to each: a wrong digit means try again, an expired or missing code means
-        // press resend, and a lockout means start the login over. A flat 401 for all four left the
-        // UI guessing, and the two that used to throw came back as 500s.
         return switch (result) {
-            // 2. Success! Issue Full Access, generate new Device ID, and new Refresh Token
             case VALID -> buildSuccessfulAuthResponse(user);
             case INVALID -> ResponseEntity.status(401)
                     .body(Map.of("error", "Invalid 2FA code", "reason", "INVALID"));
             case NO_CODE -> ResponseEntity.status(401)
                     .body(Map.of("error", "No active code. Request a new one.", "reason", "NO_CODE"));
-            // 410 Gone rather than 401: the credential was real, it just no longer exists, and the
-            // frontend keys its "expired, ask for another" state off this status.
             case EXPIRED -> ResponseEntity.status(410)
                     .body(Map.of("error", "Your code has expired. Request a new one.", "reason", "EXPIRED"));
             case LOCKED -> ResponseEntity.status(429)
@@ -246,14 +273,26 @@ public class AuthController {
         };
     }
 
-    // Resending is a separate endpoint rather than a flag on login, because the user has already
-    // passed the password check and re-posting credentials to get a second code would mean the
-    // frontend holding on to the password for the length of the 2FA screen.
-    //
-    // The path is load-bearing. JwtAuthenticationFilter only lets a PRE_AUTH token through on URIs
-    // containing /api/v1/auth/verify-2fa, and SecurityConfig already permits /verify-2fa/** - so
-    // living under that prefix is what makes this reachable at all with the half-authenticated
-    // token the caller is holding. Anywhere else would be a 403 from the filter.
+    /**
+     * Issues a replacement 2FA code and a replacement {@code PRE_AUTH} token for the same session.
+     *
+     * <p>Separate from {@code /login} rather than a flag on it, because the caller has already
+     * passed the password check and re-posting credentials for a second code would mean the
+     * frontend holding the password for the length of the 2FA screen.
+     *
+     * <p>The path is load-bearing. {@code JwtAuthenticationFilter} admits a {@code PRE_AUTH}
+     * token only on URIs containing {@code /api/v1/auth/verify-2fa}; mapped anywhere else this
+     * endpoint would answer {@code 403} to the only token a caller at this stage can hold.
+     *
+     * <p>Callers must swap in the returned {@code pre_auth_token} and discard the one they hold.
+     * The original expires 5 minutes after login, so a user who resends twice would otherwise
+     * end up with a code that works and a session token that has already died.
+     *
+     * @return {@code 202} with a new {@code pre_auth_token} and {@code expires_in_seconds};
+     *     {@code 429} with {@code retry_after_seconds} while the resend cooldown is still
+     *     running, in which case no code is sent and the previous one stays valid; {@code 401}
+     *     when no {@code PRE_AUTH} token was presented
+     */
     @PostMapping("/verify-2fa/resend")
     public ResponseEntity<?> resend2fa() {
         User user = currentPreAuthUser();
@@ -261,7 +300,6 @@ public class AuthController {
             return ResponseEntity.status(401).body(Map.of("error", NOT_AUTHENTICATED_MESSAGE));
         }
 
-        // Checked before triggering, since trigger2fa's first act is to delete the row this reads.
         int retryAfterSeconds = authSecurityService.secondsUntilResendAllowed(user.getId());
         if (retryAfterSeconds > 0) {
             return ResponseEntity.status(429).body(Map.of(
@@ -269,18 +307,9 @@ public class AuthController {
                     "retry_after_seconds", retryAfterSeconds));
         }
 
-        // A fresh pre-auth token comes back with the new code on purpose. The original one is only
-        // good for 5 minutes from login, so a user who resends twice would otherwise end up holding
-        // a code that works and a session token that has already died - stranded on the 2FA screen
-        // with no way forward except starting over.
         return issue2faChallenge(user);
     }
 
-    // Both 2FA endpoints sit behind permitAll (the caller has no FULL_AUTH token yet, by
-    // definition), so a request arriving with no Authorization header at all still reaches the
-    // controller - with either a null Authentication or Spring's anonymous one, whose principal is
-    // the String "anonymousUser". Casting either straight to User is a 500. Returns null so the
-    // caller can answer 401, which is what the client can actually act on.
     private User currentPreAuthUser() {
         Authentication auth = SecurityContextHolder.getContext().getAuthentication();
         if (auth == null) {
@@ -296,10 +325,8 @@ public class AuthController {
         String fullJwt = jwtService.generateToken(user, TokenType.FULL_AUTH);
         String rawDeviceId = authSecurityService.registerNewDevice(user.getId());
 
-        // httpOnly means javascript in the browser cannot read this cookie at all, blocks a whole
-        // class of xss attacks, secure means it only ever gets sent over an actual https connection
         ResponseCookie deviceCookie = ResponseCookie.from("Device-ID", rawDeviceId)
-                .httpOnly(true).secure(true).path("/").maxAge(31536000) // 1 Year
+                .httpOnly(true).secure(true).path("/").maxAge(31536000)
                 .build();
 
         ResponseCookie refreshCookie = createRefreshTokenCookie(user.getId());
@@ -310,12 +337,25 @@ public class AuthController {
                 .body(Map.of("status", "SUCCESS", "access_token", fullJwt));
     }
 
-    // ==========================================
-    // 3. Sliding Session Refresh Phase
-    // ==========================================
-
-    // required = false on @CookieValue means this stays null instead of spring throwing a
-    // 400 automatically when the cookie is missing, lets me handle the missing case myself below
+    /**
+     * Exchanges a refresh-token cookie for a fresh 15-minute access token.
+     *
+     * <p>The cookie holds the raw token and the database holds only its SHA-256 hash, so this is
+     * a lookup by hash rather than a comparison. Nothing is rotated: the returned access token
+     * is new, but the refresh cookie is untouched and its 24-hour window still runs from when it
+     * was first issued, so a client cannot extend a session indefinitely by refreshing.
+     *
+     * <p>A cookie that was revoked by {@code /logout} or has aged out is answered {@code 401},
+     * which is the client's cue to send the user back through the full login.
+     *
+     * @param refreshToken the raw {@code Refresh-Token} cookie; declared optional so a missing
+     *     cookie arrives as {@code null} and is answered {@code 401} instead of Spring's
+     *     automatic {@code 400}
+     * @return {@code 200} carrying a new {@code access_token}, or {@code 401} when the cookie is
+     *     absent, revoked, or past its expiry
+     * @throws RuntimeException when the presented cookie matches no stored token at all, which
+     *     surfaces as a {@code 500} rather than a {@code 401}
+     */
     @PostMapping("/refresh")
     public ResponseEntity<?> refreshSession(@CookieValue(name = "Refresh-Token", required = false) String refreshToken) {
         if (refreshToken == null) {
@@ -327,8 +367,7 @@ public class AuthController {
             return ResponseEntity.status(401).body(Map.of("error", "Refresh token expired or revoked"));
         }
 
-        // Token is valid! Issue a fresh 15-minute Access Token
-        User user = getUserById(storedToken.getUserId()); // Utility to fetch user
+        User user = getUserById(storedToken.getUserId());
         String newJwt = jwtService.generateToken(user, TokenType.FULL_AUTH);
 
         return ResponseEntity.ok(Map.of("access_token", newJwt));
@@ -345,10 +384,23 @@ public class AuthController {
         return storedToken;
     }
 
-    // ==========================================
-    // 4. Explicit Logout Phase
-    // ==========================================
-
+    /**
+     * Ends the caller's session by blacklisting the presented access token and revoking every
+     * refresh token the user holds.
+     *
+     * <p>The access token's {@code jti} is blacklisted until its own expiry, which is what stops
+     * it being replayed for the rest of its 15 minutes; {@code JwtAuthenticationFilter} consults
+     * that list on every request. Revocation covers all of the user's refresh tokens, not only
+     * the one on this request, so logging out here signs the account out everywhere.
+     *
+     * <p>The {@code Device-ID} cookie is deliberately left alone. Logging out is not the same as
+     * distrusting the machine, so the next login from this browser still skips 2FA.
+     *
+     * @param request only the {@code Authorization} header is read; a missing or
+     *     non-{@code Bearer} header skips the blacklist step instead of failing the call, so a
+     *     client holding an already-dead token can still complete a logout
+     * @return always {@code 200}, with a {@code Set-Cookie} that expires the refresh cookie
+     */
     @PostMapping("/logout")
     public ResponseEntity<?> logout(HttpServletRequest request) {
         String authHeader = request.getHeader("Authorization");
@@ -358,12 +410,10 @@ public class AuthController {
                 Authentication auth = SecurityContextHolder.getContext().getAuthentication();
                 User user = (User) auth.getPrincipal();
 
-                // Blacklist the token and revoke session
                 authSecurityService.logoutUserSession(user.getId(), jwtService.extractJti(jwt), jwtService.extractExpirationDate(jwt));
             }
         }
 
-        // Destroy the cookies on the frontend
         ResponseCookie clearRefresh = ResponseCookie.from("Refresh-Token", "").maxAge(0).path("/").build();
         
         return ResponseEntity.ok()
@@ -371,23 +421,16 @@ public class AuthController {
                 .body(Map.of("message", "Logged out successfully"));
     }
 
-    // ==========================================
-    // Internal Utilities
-    // ==========================================
-
     private ResponseCookie createRefreshTokenCookie(Long userId) {
         String rawToken = UUID.randomUUID().toString();
         refreshTokenRepository.save(new RefreshToken(userId, hashString(rawToken)));
         
         return ResponseCookie.from("Refresh-Token", rawToken)
-                .httpOnly(true).secure(true).path("/") // Path "/" means it's sent on all endpoints
-                .maxAge(86400) // 24 Hours
+                .httpOnly(true).secure(true).path("/")
+                .maxAge(86400)
                 .build();
     }
 
-    // messagedigest.getinstance can throw a checked exception if the algorithm name is unknown
-    // to the jvm, sha-256 always exists so wrapping it in a runtimeexception here just avoids
-    // forcing every caller to declare a throws clause for something that in practice never happens
     private String hashString(String input) {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");

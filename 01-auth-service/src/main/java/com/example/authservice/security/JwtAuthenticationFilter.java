@@ -17,8 +17,22 @@ import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
 
-// extending onceperrequestfilter guarantees this filter's logic runs exactly once per request even
-// if the servlet container forwards or includes the request internally more than once
+/**
+ * Establishes who a request is from, and refuses tokens that are revoked or not yet fully
+ * authenticated.
+ *
+ * <p>Registered ahead of {@code UsernamePasswordAuthenticationFilter} in the chain, because it
+ * has to populate the security context before Spring's own authentication machinery decides the
+ * request is anonymous. {@code InternalTokenFilter} runs ahead of this one and passes every
+ * customer-facing path straight through, so nothing it does changes what this filter sees.
+ *
+ * <p>Two checks here have no equivalent anywhere else in the platform and cannot be moved into
+ * a config rule. The blacklist lookup is what makes logout meaningful for the remaining life of
+ * an access token, since a signed token is otherwise valid until it expires. The pre-auth
+ * boundary is what stops a token issued before 2FA from being used as a full session: it is
+ * enforced by request path, so it only holds for as long as the 2FA endpoints stay under
+ * {@code /api/v1/auth/verify-2fa}.
+ */
 @Component
 public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
@@ -34,8 +48,29 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
         this.blacklistedTokenRepository = blacklistedTokenRepository;
     }
 
-    // doFilterInternal is the one method onceperrequestfilter actually requires me to implement,
-    // it runs for literally every incoming request so has to be careful not to slow things down
+    /**
+     * Authenticates the bearer token on a request, or answers the request itself and stops the
+     * chain.
+     *
+     * <p>A request with no {@code Authorization} header, or one that is not a {@code Bearer}
+     * header, is passed along untouched rather than rejected. That is what lets the
+     * {@code permitAll} endpoints, login and register among them, work at all; authorization is
+     * decided later in the chain, not here.
+     *
+     * <p>Three outcomes end the request here instead of forwarding it: a token whose {@code jti}
+     * is blacklisted gets {@code 401}, a {@code PRE_AUTH} token presented on any path outside
+     * {@code /api/v1/auth/verify-2fa} gets {@code 403}, and any parsing or signature failure gets
+     * {@code 401}. That last catch is broad on purpose, so a malformed token can never fall
+     * through into the chain as an unauthenticated request that some other rule then permits.
+     *
+     * <p>The path check uses the request URI so it behaves identically under MockMvc and Tomcat;
+     * a servlet context path prefixed to the URI would not break it, since it matches on a
+     * substring.
+     *
+     * @param request read for its {@code Authorization} header and its URI, never modified
+     * @param response written to only on rejection, in which case the chain is not continued
+     * @param filterChain continued exactly once unless the request was rejected above
+     */
     @Override
     protected void doFilterInternal(
             @NonNull HttpServletRequest request,
@@ -47,44 +82,39 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
         final String jwt;
         final String username;
 
-        // 1. Check for the Bearer token
         if (authHeader == null) {
             filterChain.doFilter(request, response);
-            return; // Exit filter
+            return;
         }
         if (!authHeader.startsWith("Bearer ")) {
             filterChain.doFilter(request, response);
-            return; // Exit filter
+            return;
         }
 
         jwt = authHeader.substring(7);
 
         try {
-            // 2. Extract Data
             username = jwtService.extractUsername(jwt);
             String jti = jwtService.extractJti(jwt);
             TokenType tokenType = jwtService.extractTokenType(jwt);
 
             if (isBlacklisted(jti)) {
                 writeErrorResponse(response, HttpServletResponse.SC_UNAUTHORIZED, "Token has been revoked. Please log in again.");
-                return; // Short-circuit the request
+                return;
             }
 
-            // Use getRequestURI() so MockMvc and Tomcat both match correctly
             String requestPath = request.getRequestURI();
             if (violatesPreAuthBoundary(tokenType, requestPath)) {
                 writeErrorResponse(response, HttpServletResponse.SC_FORBIDDEN, "Partial authentication. 2FA verification required.");
-                return; // Short-circuit the request
+                return;
             }
 
-            // 5. Authenticate the User in Spring Security Context
             authenticateIfNeeded(request, username, jwt);
         } catch (Exception e) {
             writeErrorResponse(response, HttpServletResponse.SC_UNAUTHORIZED, "Invalid or expired token.");
             return;
         }
 
-        // Proceed to the next filter or the target Controller
         filterChain.doFilter(request, response);
     }
 
@@ -110,8 +140,6 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
         UserDetails userDetails = this.userDetailsService.loadUserByUsername(username);
 
         if (jwtService.isTokenValid(jwt, userDetails)) {
-            // second constructor argument is normally the password, null here since the jwt
-            // itself already proved identity, there is nothing left to check credentials against
             UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
                     userDetails,
                     null,

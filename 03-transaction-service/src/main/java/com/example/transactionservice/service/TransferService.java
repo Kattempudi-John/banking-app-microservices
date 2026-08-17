@@ -14,6 +14,17 @@ import org.springframework.web.server.ResponseStatusException;
 import java.math.BigDecimal;
 import java.util.UUID;
 
+/**
+ * Executes transfers between accounts that both live on this platform.
+ *
+ * <p>These are the only two paths that publish {@code FundsTransferredEvent}, and therefore the
+ * only ones that reach the {@code successful-transfers} topic; wires are handled by
+ * {@code ExternalWireService} and announce nothing there.
+ *
+ * <p>Neither path writes to this service's own transaction table. The authoritative ledger row is
+ * created by account-service, and the transaction id returned here is a confirmation reference
+ * generated locally per call — it does not identify a row in this service's database.
+ */
 @Service
 public class TransferService {
 
@@ -32,33 +43,73 @@ public class TransferService {
         this.eventPublisher = eventPublisher;
     }
 
-    // @RequiresKyc is a custom annotation, not a built in spring one, KycEnforcementAspect
-    // intercepts any call to a method carrying this and blocks it before the body even starts
-    // if the caller's kyc status is not approved, learned this is aop, aspect oriented programming
-    // No recipient-side check here on purpose: both accounts belong to the caller (account-service
-    // rejects the request otherwise), so the aspect above has already vetted the receiving user.
+    /**
+     * Moves funds between two accounts that both belong to the caller.
+     *
+     * <p>Gated on the caller's identity verification before the body starts. No recipient-side check
+     * is made or needed: account-service rejects the request unless both accounts belong to
+     * {@code userId}, so the receiving user is the sending user and has already been vetted.
+     *
+     * <p>The whole movement is one remote call that account-service applies atomically, so this
+     * method has no partially-applied state of its own. The local transaction boundary exists to
+     * hold the transfer event until commit — the announcement to Kafka is emitted after commit, and
+     * never at all if this method throws.
+     *
+     * <p>No idempotency key is passed, so a retry of a call whose response was lost transfers a
+     * second time.
+     *
+     * @param userId taken from the JWT, never client-supplied; must own both accounts
+     * @param fromAccountId debited account, must be owned by {@code userId}
+     * @param toAccountId credited account, must also be owned by {@code userId}
+     * @param amount positive; insufficient funds are refused remotely, not clamped
+     * @return confirmation carrying a freshly generated id, always status {@code COMPLETED} and
+     *     always on-us, since by definition both accounts are on this platform
+     * @throws org.springframework.web.server.ResponseStatusException relayed from account-service
+     *     for insufficient funds, a missing account, or an ownership mismatch; the transfer is
+     *     abandoned with nothing moved
+     * @throws com.example.transactionservice.aspect.KycEnforcementAspect.KycRequiredException when
+     *     the caller is not verified
+     */
     @Transactional
     @RequiresKyc
     public TransferResponseDto executeTransfer(Long userId, Long fromAccountId, Long toAccountId, BigDecimal amount) {
 
-        // account-service throws (and FeignErrorConfig's ErrorDecoder re-throws locally as a
-        // ResponseStatusException) on insufficient funds, missing accounts, or ownership mismatch -
-        // any of those propagate straight out of this call, aborting the transfer.
         accountServiceClient.transfer(new AccountServiceClient.TransferRequest(userId, fromAccountId, toAccountId, amount));
 
-        // Generate a globally unique confirmation ID
         UUID transactionId = UUID.randomUUID();
 
-        // Publish the domain event
         publishTransferEvent(userId, fromAccountId, toAccountId, amount, transactionId);
 
-        // Return confirmation payload - always on-us, both accounts are on this platform by definition
         return new TransferResponseDto(transactionId, "COMPLETED", true);
     }
 
-    // Pays an account belonging to a different user, identified by the account number the sender
-    // typed. Same KYC gate and same post-commit event as executeTransfer above - only the ownership
-    // rule on the destination differs, which is enforced over in account-service.
+    /**
+     * Pays an account belonging to another user, identified by the account number the sender typed.
+     *
+     * <p>Both parties are verified on this path. The caller-side gate runs before the body; the
+     * recipient is then checked explicitly, and deliberately before the money call, because
+     * account-service debits and credits atomically and there would be no half of it to undo
+     * afterwards. A recipient whose status cannot be established at all is refused rather than
+     * assumed good.
+     *
+     * <p>Publishes the same event as an own-accounts transfer: the recipient being a different
+     * person does not change what downstream consumers need.
+     *
+     * <p>No idempotency key is passed, so a retry of a call whose response was lost pays twice.
+     *
+     * @param userId taken from the JWT, never client-supplied; must own {@code fromAccountId}
+     * @param fromAccountId debited account, must be owned by {@code userId}
+     * @param recipientAccountNumber full account number as typed, never blank; resolved to an
+     *     internal id remotely
+     * @param amount positive; insufficient funds are refused remotely
+     * @return confirmation carrying a freshly generated id, always status {@code COMPLETED} and
+     *     always on-us
+     * @throws org.springframework.web.server.ResponseStatusException with {@code NOT_FOUND} when no
+     *     account holds that number, or relayed from account-service for funds and ownership
+     *     failures
+     * @throws com.example.transactionservice.aspect.KycEnforcementAspect.KycRequiredException when
+     *     either the sender or the recipient is unverified
+     */
     @Transactional
     @RequiresKyc
     public TransferResponseDto executeTransferToRecipient(Long userId, Long fromAccountId,
@@ -66,10 +117,6 @@ public class TransferService {
 
         AccountServiceClient.RecipientLookupResponse recipient = resolveRecipient(recipientAccountNumber);
 
-        // @RequiresKyc above only vouches for the sender. This is the one transfer path where the
-        // money lands on someone else's account, so the receiving side gets checked too - and
-        // before the transfer call below, since account-service debits and credits atomically and
-        // there is no half of that to undo afterwards.
         recipientKycValidator.requireApprovedRecipient(recipient.ownerUserId());
 
         accountServiceClient.transferToRecipient(new AccountServiceClient.TransferRequest(
@@ -77,17 +124,25 @@ public class TransferService {
 
         UUID transactionId = UUID.randomUUID();
 
-        // The destination account id is what the notification/alert path cares about, same as an
-        // own-accounts transfer - the recipient being a different person doesn't change the event.
         publishTransferEvent(userId, fromAccountId, recipient.accountId(), amount, transactionId);
 
         return new TransferResponseDto(transactionId, "COMPLETED", true);
     }
 
-    // Shared by the transfer itself and by the frontend's pre-send confirmation lookup, so both agree
-    // on what counts as a valid recipient. The ErrorDecoder turns account-service's 404 into a
-    // ResponseStatusException; rewriting it here gives the sender a message about the number they
-    // typed rather than an internal "account not found".
+    /**
+     * Resolves a typed account number to the recipient account it names.
+     *
+     * <p>Shared by the transfer itself and by the pre-send confirmation lookup so both agree on what
+     * counts as a valid recipient. A remote 404 is rewritten into a message about the number the
+     * sender typed rather than passed on as an internal "account not found"; every other failure is
+     * rethrown unchanged.
+     *
+     * @param recipientAccountNumber full account number as typed, never blank
+     * @return the resolved account, never {@code null}; carries a masked number only, never the
+     *     full one
+     * @throws org.springframework.web.server.ResponseStatusException with {@code NOT_FOUND} when no
+     *     account holds that number
+     */
     public AccountServiceClient.RecipientLookupResponse resolveRecipient(String recipientAccountNumber) {
         try {
             return accountServiceClient.lookupByAccountNumber(recipientAccountNumber);
@@ -100,8 +155,16 @@ public class TransferService {
         }
     }
 
-    // Best-effort: a recipient whose name can't be resolved is still payable, the sender just sees the
-    // masked account number alone rather than a name to confirm against.
+    /**
+     * Returns a recipient's display name for the sender to confirm against.
+     *
+     * <p>Best effort by design: a name that cannot be resolved never blocks a payment, the sender
+     * simply confirms against the masked account number alone.
+     *
+     * @param ownerUserId owner id from an account lookup, never client-supplied
+     * @return the name, or {@code null} when auth-service has none or cannot be reached — callers
+     *     must handle the absent case rather than treat it as a failure
+     */
     public String resolveRecipientName(Long ownerUserId) {
         try {
             AuthServiceClient.DisplayNameResponse response = authServiceClient.getDisplayName(ownerUserId);
@@ -111,18 +174,22 @@ public class TransferService {
         }
     }
 
-    // Lets the pre-send confirmation lookup show the same verdict the transfer itself will reach,
-    // as a flag instead of an exception - the sender finds out before typing an amount rather than
-    // after pressing send.
+    /**
+     * Reports whether a recipient could currently be paid.
+     *
+     * <p>Answers the same question {@link #executeTransferToRecipient} enforces, but as a flag
+     * rather than an exception, so the pre-send lookup can warn the sender before they type an
+     * amount. The verdict is not held: a recipient verified here can still be refused at send time,
+     * and an outage reports as unverified.
+     *
+     * @param ownerUserId owner id from an account lookup, never client-supplied
+     * @return {@code true} only when the recipient is approved right now
+     */
     public boolean isRecipientVerified(Long ownerUserId) {
         return recipientKycValidator.isApproved(ownerUserId);
     }
 
     private void publishTransferEvent(Long userId, Long fromAccountId, Long toAccountId, BigDecimal amount, UUID transactionId) {
-        // A @TransactionalEventListener will catch this and send it to Kafka strictly AFTER the commit
-        // learned applicationeventpublisher.publishevent is spring's own in process event bus,
-        // completely separate from kafka, this just hands the event off inside the jvm, some other
-        // listener method elsewhere is the one that actually forwards it out to kafka afterward
         FundsTransferredEvent event = new FundsTransferredEvent(userId, fromAccountId, toAccountId, amount, transactionId);
         eventPublisher.publishEvent(event);
     }

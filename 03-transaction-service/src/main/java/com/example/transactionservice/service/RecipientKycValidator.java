@@ -6,11 +6,17 @@ import org.springframework.stereotype.Component;
 
 import java.util.Map;
 
-// The receiving half of the KYC gate. KycEnforcementAspect can only ever check the caller - it
-// resolves the user from the JWT, and the recipient has no session here - so a transfer's
-// destination needs this explicit call from the services that know who the recipient is.
-// Deliberately a plain @Component rather than a second aspect: the recipient's id only exists
-// after an account lookup inside the method body, which an @Before advice cannot see.
+/**
+ * Checks the receiving half of the KYC gate, which the caller-side aspect structurally cannot.
+ *
+ * <p>{@code KycEnforcementAspect} resolves its subject from the JWT, and a recipient has no session
+ * here, so every path that credits somebody else's account has to call this explicitly. It is a
+ * plain component rather than a second aspect because the recipient's id only comes into existence
+ * partway through the method body, after an account lookup, which {@code @Before} advice cannot
+ * see.
+ *
+ * <p>Both methods fail closed and neither distinguishes "not approved" from "could not ask".
+ */
 @Component
 public class RecipientKycValidator {
 
@@ -20,24 +26,46 @@ public class RecipientKycValidator {
         this.profileServiceClient = profileServiceClient;
     }
 
-    // Reuses the aspect's own exception type so GlobalExceptionHandler's existing 403 mapping
-    // covers this too, no new handler needed.
+    /**
+     * Aborts the caller unless the recipient's verification is approved.
+     *
+     * <p>Must be called before the money movement, not after: account-service debits and credits
+     * atomically, so there is no half of a completed transfer to undo once it has returned.
+     *
+     * <p>Throws the same type the caller-side gate uses, so the existing 403 mapping covers this
+     * with no second handler. The message is deliberately generic — the sender is entitled to know
+     * that they cannot pay this person and nothing more, since naming the actual status would leak
+     * a stranger's standing with the bank to anyone who guesses their account number.
+     *
+     * @param recipientUserId owner id resolved from an account lookup; a {@code null} or unknown id
+     *     is a refusal, not a pass
+     * @throws com.example.transactionservice.aspect.KycEnforcementAspect.KycRequiredException when
+     *     the recipient is not approved, including when profile-service could not be reached at all
+     */
     public void requireApprovedRecipient(Long recipientUserId) {
         if (!isApproved(recipientUserId)) {
-            // The message stays generic on purpose. The sender is not entitled to know anything
-            // about someone else's verification file beyond "you can't pay them yet" - naming the
-            // actual status (REJECTED vs PENDING_VERIFICATION) would leak the recipient's standing
-            // with the bank to whoever guesses their account number.
             throw new KycEnforcementAspect.KycRequiredException(
                     "This recipient can't receive transfers yet - their identity verification isn't complete.");
         }
     }
 
-    // Fails closed on every non-APPROVED answer, including no answer at all: a null body, a body
-    // without the status key, or profile-service being unreachable all count as not approved.
-    // Rejected the alternative of rethrowing the way KycEnforcementAspect does (it turns an
-    // unreachable profile-service into a 500) because this same check backs the read-only recipient
-    // preview, which has to keep answering rather than blow up - there it just reports unverified.
+    /**
+     * Reports whether a recipient's verification is approved, without throwing.
+     *
+     * <p>The non-throwing form exists for the read-only recipient preview, which has to keep
+     * answering when profile-service is down rather than fail the page; there an outage shows as
+     * "unverified". Money-moving callers should prefer {@link #requireApprovedRecipient} so a
+     * refusal cannot be forgotten.
+     *
+     * <p>Treats every answer that is not a positive {@code APPROVED} as false: a {@code null} body,
+     * a body without the {@code status} key, and any exception from profile-service all collapse to
+     * the same result. That deliberately differs from the caller-side aspect, which reports an
+     * outage as a distinct 503.
+     *
+     * @param recipientUserId owner id resolved from an account lookup; never trusted from client
+     *     input
+     * @return {@code true} only for a literal {@code APPROVED} status
+     */
     public boolean isApproved(Long recipientUserId) {
         try {
             Map<String, String> response = profileServiceClient.getKycStatus(recipientUserId);

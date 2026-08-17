@@ -11,9 +11,28 @@ import org.springframework.web.server.ResponseStatusException;
 import java.io.IOException;
 import java.util.Map;
 
+/**
+ * Turns non-2xx Feign responses into local Spring exceptions.
+ *
+ * <p>Not named in any {@code @FeignClient(configuration = ...)} attribute, so it is picked up from
+ * the application context and applies to every Feign client in this module at once.
+ */
 @Configuration
 public class FeignErrorConfig {
 
+    /**
+     * Builds the decoder that rethrows a downstream failure as a {@link ResponseStatusException}.
+     *
+     * <p>The remote status is preserved so a 400 from account-service stays a 400 to the customer
+     * rather than becoming a 500; an unrecognised status code degrades to 500. The remote
+     * explanation is lifted from the {@code message} key of Spring Boot's default error body, which
+     * only exists while account-service keeps {@code server.error.include-message=always} set — with
+     * that turned off, or a body that is absent or not JSON, the response falls back to the bare
+     * HTTP reason phrase instead of failing. {@code GlobalExceptionHandler} then relays whichever
+     * of the two reached it, so the original reason survives to the caller.
+     *
+     * @return a decoder that never returns a retryable exception, so Feign does not retry
+     */
     @Bean
     public ErrorDecoder errorDecoder() {
         return (methodKey, response) -> {
@@ -25,9 +44,6 @@ public class FeignErrorConfig {
         };
     }
 
-    // account-service returns Spring Boot's default error body ({"message": "...", ...}) as long
-    // as server.error.include-message=always is set there - fall back to the raw HTTP reason
-    // phrase if the body is missing or isn't in that shape.
     private String extractMessage(Response response) {
         if (response.body() == null) {
             return response.reason();

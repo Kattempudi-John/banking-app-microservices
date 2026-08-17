@@ -22,6 +22,16 @@ import com.example.notificationservice.model.NotificationStatus;
 import com.example.notificationservice.model.NotificationType;
 import com.example.notificationservice.repository.NotificationRecordRepository;
 
+/**
+ * Emails a user an alert when one of their transfers meets or exceeds their configured alert
+ * threshold.
+ *
+ * <p>Account references in the alert are masked to their last four digits and stay masked in the
+ * stored record, which is served back by {@code GET /api/v1/notifications} indefinitely.
+ * Counterparty name resolution is best effort: every lookup failure degrades to the masked account
+ * alone and the alert still goes out, because a large-transaction warning must never be lost to an
+ * unavailable downstream.
+ */
 @Service
 public class TransactionAlertListener {
 
@@ -45,12 +55,26 @@ public class TransactionAlertListener {
         this.notificationRecordRepository = notificationRecordRepository;
     }
 
+    /**
+     * Consumes a completed transfer and sends an alert if it meets the user's threshold.
+     *
+     * <p>An alert is raised when the amount is greater than or equal to the threshold, not strictly
+     * greater, so a transfer landing exactly on the configured figure does alert. Below-threshold
+     * transfers produce no email and no record at all.
+     *
+     * <p>Never throws. Any failure — a missing preferences record, an unavailable downstream, a
+     * malformed payload — is logged and the message treated as consumed, because an exception
+     * escaping a Kafka listener redelivers the same message forever and blocks the partition behind
+     * it.
+     *
+     * @param event must carry a {@code userId} that owns the debited account; {@code fromAccountId}
+     *     comes from a different id sequence and would resolve another user's preferences
+     */
     @KafkaListener(topics = "successful-transfers", groupId = "notification-service-group")
     public void consumeTransferEvent(FundsTransferredEvent event) {
         log.debug("Received transfer event for Transaction ID: {}", event.transactionId());
 
         try {
-            // 1. Perform sub-millisecond lookup via Cached Feign Client
             ProfileServiceClient.UserPreferenceResponse preferences =
                     profileServiceClient.getUserPreferences(event.userId());
 
@@ -59,12 +83,9 @@ public class TransactionAlertListener {
                 return;
             }
 
-            // 2-4. Evaluate the transaction against the alert threshold and dispatch if it qualifies
             evaluateAndDispatchAlert(event, preferences);
 
         } catch (Exception e) {
-            // We catch generic exceptions here so the Kafka Consumer doesn't crash
-            // and get stuck in an infinite loop for a single bad message.
             log.error("Failed to process Kafka event for Transaction ID: {}", event.transactionId(), e);
         }
     }
@@ -75,15 +96,9 @@ public class TransactionAlertListener {
             log.info("Transaction {} (Amount: ${}) exceeded threshold (${}). Dispatching alert.",
                     event.transactionId(), event.amount(), preferences.alertThresholdAmount());
 
-            // Format the alert message. The counterparty lookups sit inside this branch on purpose -
-            // most transfers never cross the threshold, and resolving a name for an alert that is not
-            // going to be sent would be two HTTP calls per transfer for nothing.
             String subject = "Bank Alert: Large Debit Transaction";
             String htmlMessage = buildHtmlMessage(event, resolveCounterparty(event));
 
-            // The real address, carried on the same preferences response the threshold above came
-            // from. A user without one can't be alerted by email at all, so record the miss and stop
-            // rather than dispatching to an address that would silently bounce.
             String userEmail = preferences.email();
             if (userEmail == null || userEmail.isBlank()) {
                 log.warn("User {} has no email address on file - skipping the alert for transaction {}",
@@ -92,7 +107,6 @@ public class TransactionAlertListener {
                 return;
             }
 
-            // Delegate to the provider service (which handles its own external retries)
             boolean dispatched = notificationProviderService.dispatchEmail(userEmail, subject, htmlMessage);
 
             persistRecord(event.userId(), subject, htmlMessage, dispatched ? NotificationStatus.SENT : NotificationStatus.FAILED);
@@ -103,15 +117,8 @@ public class TransactionAlertListener {
         }
     }
 
-    // Who the money went to, as far as we could find out. ownAccount means the destination belongs to
-    // the same user being alerted - a transfer between their own checking and savings, which must not
-    // be described as money leaving for someone else.
     private record Counterparty(String maskedAccount, String displayName, boolean ownAccount) {}
 
-    // Best-effort, exactly like transaction-service's TransferService.resolveRecipientName: the alert
-    // itself is the thing that matters, and a name is a nicety layered on top of it. Every failure
-    // here degrades to the masked account number alone and the alert still goes out - a real
-    // large-transaction warning must never be lost because a downstream lookup was unavailable.
     private Counterparty resolveCounterparty(FundsTransferredEvent event) {
         String maskedAccount = maskAccountReference(event.toAccountId());
 
@@ -120,8 +127,6 @@ public class TransactionAlertListener {
             return new Counterparty(maskedAccount, null, false);
         }
         if (ownerUserId.equals(event.userId())) {
-            // Their own account. Naming them as the recipient of their own money would read as if a
-            // stranger who happens to share their name had been paid.
             return new Counterparty(maskedAccount, null, true);
         }
 
@@ -150,9 +155,6 @@ public class TransactionAlertListener {
         }
     }
 
-    // The one-line version of the alert: what moved, out of which account, into whose. The alert used
-    // to say only the amount and a transaction id, which left the reader unable to tell a payment they
-    // made from one they did not - the exact question a fraud alert exists to answer.
     private String buildSummaryLine(FundsTransferredEvent event, Counterparty counterparty, Instant sentAt) {
         String amount = formatAmount(event.amount());
         String from = maskAccountReference(event.fromAccountId());
@@ -170,8 +172,6 @@ public class TransactionAlertListener {
                 .formatted(amount, from, destination, date, event.transactionId());
     }
 
-    // learned java text blocks (triple quoted strings) let multi line html sit here without
-    // escaping every single quote or concatenating a bunch of separate strings together
     private String buildHtmlMessage(FundsTransferredEvent event, Counterparty counterparty) {
         Instant sentAt = Instant.now();
         String recipientLine = counterparty.ownAccount()
@@ -208,16 +208,6 @@ public class TransactionAlertListener {
         return "%s (%s)".formatted(counterparty.displayName(), counterparty.maskedAccount());
     }
 
-    // "........5570", the same last-four-behind-dots shape account-service's AccountMapper produces
-    // and the frontend already renders everywhere else, so one account reads the same in an alert as
-    // it does on the dashboard.
-    //
-    // Masking an account IDENTIFIER rather than an account number, because an identifier is all a
-    // transfer event carries - and it stays masked deliberately: this string is persisted and served
-    // back by GET /api/v1/notifications, so an unmasked account reference would sit in the feed
-    // indefinitely. The dot prefix is a fixed width rather than "length minus four" (AccountMapper's
-    // rule): the id's length is not the account number's length, so reproducing it would only invent
-    // a digit count that means nothing.
     private String maskAccountReference(Long accountId) {
         if (accountId == null) {
             return "........";
@@ -227,8 +217,6 @@ public class TransactionAlertListener {
         return "........" + lastFour;
     }
 
-    // "$1,000.00" rather than the raw BigDecimal's "1000.00" - the amount is the first thing read on
-    // an alert, and a misread magnitude is the whole failure mode this notification guards against.
     private String formatAmount(BigDecimal amount) {
         return NumberFormat.getCurrencyInstance(Locale.US).format(amount);
     }

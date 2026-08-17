@@ -9,32 +9,46 @@ import jakarta.validation.constraints.Past;
 import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 
+/**
+ * Carries an identity submission: the contact fields plus the name and date of birth that make it a
+ * verification rather than a contact update.
+ *
+ * <p>A name and date of birth checked against an address is roughly what a real KYC vendor is given,
+ * and submitting this form is what triggers approval — which is why the identity fields are required
+ * rather than optional. A partially completed identity is not something that could ever be approved.
+ *
+ * <p>Field constraints, all enforced only when the controller parameter is also marked
+ * {@code @Valid}:
+ *
+ * <ul>
+ *   <li>{@code legalName} — required, max 255 characters
+ *   <li>{@code dateOfBirth} — required, {@code yyyy-MM-dd}, strictly in the past so today is
+ *       rejected. The 18+ rule is <em>not</em> checked here; {@code ProfileManagementService}
+ *       enforces it, because bean validation cannot express "at least 18 years ago" without a custom
+ *       validator
+ *   <li>{@code phoneNumber} — required. The pattern admits the separators a person actually types
+ *       ({@code (571) 285-6947}, {@code 571-285-6947}, {@code +1 571 285 6947}) and only rejects
+ *       input that is plainly not a phone number. It is forwarded to auth-service exactly as typed;
+ *       auth-service converts it to E.164, checks nobody else holds it, and its error is passed back
+ *       when no single unambiguous number can be resolved
+ *   <li>{@code addressLine1} — required, max 255 characters
+ *   <li>{@code addressLine2} — optional, max 255 characters
+ *   <li>{@code city} — required, max 100 characters
+ *   <li>{@code state} — required, max 50 characters
+ *   <li>{@code zipCode} — required, max 20 characters
+ * </ul>
+ */
 public class UpdateContactInfoRequestDto {
 
-    // Identity fields. These are what make submitting this form a verification rather than a contact
-    // update - a name and date of birth checked against an address is roughly what a real KYC vendor
-    // is given. Required, because a partially completed identity is not something that could ever be
-    // approved, and completing this form is exactly what triggers approval.
     @NotBlank(message = "Full legal name is required")
     @Size(max = 255, message = "Full legal name cannot exceed 255 characters")
     private String legalName;
 
-    // ISO yyyy-MM-dd, which is what the browser's native <input type="date"> submits, so the form
-    // needs no date parsing of its own. @Past rejects today and the future; the 18+ rule is enforced
-    // in ProfileManagementService rather than here because a bean-validation annotation cannot
-    // express "at least 18 years before now" without a custom validator.
     @NotNull(message = "Date of birth is required")
     @Past(message = "Date of birth must be in the past")
     @JsonFormat(pattern = "yyyy-MM-dd")
     private LocalDate dateOfBirth;
 
-    // Accepts the separators a person actually types - "(571) 285-6947", "571-285-6947",
-    // "+1 571 285 6947" - and is forwarded to auth-service exactly as typed, which converts it to
-    // E.164 and checks nobody else already holds it. This pattern only rejects input that clearly
-    // isn't a phone number at all; auth-service makes the real call, and ProfileManagementService
-    // passes its error back if it can't resolve one unambiguous number.
-    // learned all these jakarta validation annotations only actually run when the controller
-    // method parameter is also marked @Valid, the annotation alone on the dto does nothing by itself
     @NotBlank(message = "Phone number is required")
     @Pattern(regexp = "^[+()\\-.\\s0-9]{7,20}$", message = "Phone number must be a valid phone number")
     private String phoneNumber;
@@ -43,7 +57,6 @@ public class UpdateContactInfoRequestDto {
     @Size(max = 255, message = "Address line 1 cannot exceed 255 characters")
     private String addressLine1;
 
-    // Optional field, so no @NotBlank constraint
     @Size(max = 255, message = "Address line 2 cannot exceed 255 characters")
     private String addressLine2;
 
@@ -58,8 +71,6 @@ public class UpdateContactInfoRequestDto {
     @NotBlank(message = "Zip/Postal code is required")
     @Size(max = 20, message = "Zip/Postal code cannot exceed 20 characters")
     private String zipCode;
-
-    // --- Getters and Setters ---
 
     public String getLegalName() { return legalName; }
     public void setLegalName(String legalName) { this.legalName = legalName; }

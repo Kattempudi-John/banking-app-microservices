@@ -3,6 +3,19 @@ package com.example.profileservice.model;
 import jakarta.persistence.*;
 import java.math.BigDecimal;
 
+/**
+ * A customer's notification preferences: the large-transaction alert threshold and the daily-summary
+ * opt-in with its delivery timezone and hour.
+ *
+ * <p>{@code dailySummaryHour} is a whole hour {@code 0}-{@code 23} in {@code timezone}, not a
+ * {@code LocalTime}: the notification-service job wakes once an hour, so finer precision would be a
+ * promise the sender cannot keep. The range is validated at the API edge
+ * ({@code UpdateDailySummaryRequestDto}) rather than on this entity, because a constraint here would
+ * surface as a 500 from the persistence layer instead of a 400.
+ *
+ * <p>The row is keyed by its own generated id with {@code userId} as a separate column, so lookups
+ * by user go through {@code PreferenceRepository.findByUserId}.
+ */
 @Entity
 @Table(name = "user_preferences")
 public class UserPreferenceEntity {
@@ -16,11 +29,6 @@ public class UserPreferenceEntity {
     private Boolean dailySummaryEnabled;
     private String timezone;
 
-    // The hour of the day, 0-23 in the user's own timezone above, that the daily summary goes out.
-    // Integer rather than a LocalTime or a minute-precision field: the notification-service job wakes
-    // up once an hour, so anything finer than whole hours would be a promise the sender cannot keep.
-    // The 0..23 range is validated at the API edge (UpdateDailySummaryRequestDto), not here - a
-    // @Min/@Max on the entity would surface as a 500 from the persistence layer rather than a 400.
     private Integer dailySummaryHour;
 
     public Long getId() { return id; }

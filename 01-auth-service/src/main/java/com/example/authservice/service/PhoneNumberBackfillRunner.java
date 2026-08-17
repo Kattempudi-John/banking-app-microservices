@@ -14,13 +14,18 @@ import com.example.authservice.model.User;
 import com.example.authservice.repository.UserRepository;
 import com.example.authservice.util.PhoneNumberNormalizer;
 
-// Registration normalizes phone numbers to E.164 from here on, but rows created before that was
-// enforced hold whatever was typed - "571-285-6947" and the like. Those numbers are the destination
-// for 2FA codes, and the SMS provider rejects anything that isn't E.164, so an un-normalized row is
-// an account that can never finish logging in from a new device.
-//
-// Same shape as account-service's IbanBackfillRunner: idempotent, best-effort, and it reuses the
-// single normalizer the registration path uses rather than reimplementing the rules in SQL.
+/**
+ * Rewrites phone numbers stored before E.164 normalization was enforced at registration.
+ *
+ * <p>Rows created earlier hold whatever was typed, {@code 571-285-6947} and the like. Those
+ * numbers are where 2FA codes are sent and the SMS provider refuses anything that is not E.164,
+ * so an un-normalized row is an account that can never finish logging in from a new device.
+ *
+ * <p>Idempotent and best-effort, the same shape as account-service's IBAN backfill: it runs on
+ * every boot, rewrites only rows that actually differ, and reuses the one normalizer the
+ * registration path uses rather than reimplementing the rules in SQL, so the two can never
+ * disagree about what a number means.
+ */
 @Component
 public class PhoneNumberBackfillRunner implements ApplicationRunner {
 
@@ -34,8 +39,16 @@ public class PhoneNumberBackfillRunner implements ApplicationRunner {
         this.phoneNumberNormalizer = phoneNumberNormalizer;
     }
 
-    // Wrapped so a failure can never stop the service booting - this is housekeeping on historical
-    // rows, not part of serving any request. Logged at error level so a real failure stays visible.
+    /**
+     * Runs the backfill once at startup, swallowing any failure so the service still boots.
+     *
+     * <p>This is housekeeping on historical rows, not part of serving a request, and a database
+     * that will not cooperate at boot is not a reason to take the whole service down. The failure
+     * is logged at error level instead, because until it succeeds the affected users cannot
+     * receive 2FA codes.
+     *
+     * @param args ignored; the backfill takes no parameters and always processes every user
+     */
     @Override
     public void run(ApplicationArguments args) {
         try {
@@ -46,6 +59,17 @@ public class PhoneNumberBackfillRunner implements ApplicationRunner {
         }
     }
 
+    /**
+     * Normalizes every stored phone number that is not already in E.164, in a single transaction.
+     *
+     * <p>All rows are read and rewritten together so the table is never left half-converted by a
+     * failure partway through; nothing here is incremental, so a rollback simply means the next
+     * boot tries again from the same starting point.
+     *
+     * <p>A number that cannot be resolved to one unambiguous value is left exactly as it is and
+     * named in a warning, never guessed at. Guessing would point that account's 2FA codes at
+     * somebody else's phone, so the number stays broken until a human corrects it.
+     */
     @Transactional
     public void backfillPhoneNumbers() {
         List<User> updated = new ArrayList<>();
@@ -60,9 +84,6 @@ public class PhoneNumberBackfillRunner implements ApplicationRunner {
             String normalized = phoneNumberNormalizer.normalize(stored).orElse(null);
 
             if (normalized == null) {
-                // Can't be resolved to one unambiguous number, and guessing would point 2FA codes at
-                // somebody else's phone. Leave the row exactly as it is and name it in the log so it
-                // can be corrected by hand.
                 unfixable.add(user.getUsername());
                 continue;
             }

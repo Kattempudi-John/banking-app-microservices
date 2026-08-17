@@ -13,22 +13,23 @@ import com.example.accountservice.model.AccountEntity;
 import com.example.accountservice.repository.AccountRepository;
 import com.example.accountservice.util.IbanGenerator;
 
-// V6__Add_Iban_To_Accounts.sql added the iban column as nullable and deliberately left existing rows
-// alone, so every account opened before that migration has none. That isn't cosmetic: an account
-// without an IBAN can't be handed out to receive money on the Transfer page's External Wire tab, and
-// the Profile page's "Receive Money" panel had nothing to show for it.
-//
-// Done here in Java rather than as a follow-up migration so the ISO 7064 mod-97 checksum comes from
-// the one implementation that already exists and is covered by tests (IbanGenerator), instead of
-// being written a second time in SQL where the two could drift apart.
+/**
+ * Fills in IBANs on startup for accounts that predate the {@code iban} column.
+ *
+ * <p>{@code V6__Add_Iban_To_Accounts.sql} added the column as nullable and left existing rows
+ * alone, so every account opened before that migration has none. That is not cosmetic: an account
+ * without an IBAN cannot be handed out to receive money on the Transfer page's External Wire tab,
+ * and the Profile page's Receive Money panel has nothing to show for it.
+ *
+ * <p>Written in Java rather than as a follow-up migration so the ISO 7064 mod-97 checksum comes
+ * from the one tested implementation, {@code IbanGenerator}, instead of being restated in SQL where
+ * the two could drift apart.
+ */
 @Component
 public class IbanBackfillRunner implements ApplicationRunner {
 
     private static final Logger logger = LoggerFactory.getLogger(IbanBackfillRunner.class);
 
-    // Same value AccountService and UserRegisteredListener assign to new accounts - a backfilled IBAN
-    // has to be built from the same routing number the account itself carries, or it wouldn't match
-    // the account it belongs to.
     private static final String DEFAULT_ROUTING_NUMBER = "021000021";
 
     private final AccountRepository accountRepository;
@@ -39,13 +40,16 @@ public class IbanBackfillRunner implements ApplicationRunner {
         this.ibanGenerator = ibanGenerator;
     }
 
-    // Idempotent by construction: it only ever selects rows where iban is null, so the second and
-    // every later startup finds nothing and does nothing.
-    //
-    // Wrapped so a failure can never stop the service booting. This is opportunistic housekeeping on
-    // historical rows, not part of serving any request - a context with no accounts table at all
-    // (the slice used by AccountServiceApplicationTests) must still start cleanly. Logged at error
-    // level so a genuine failure is still loud.
+    /**
+     * Runs the backfill once at startup, absorbing any failure so the service still boots.
+     *
+     * <p>This is opportunistic housekeeping on historical rows, not part of serving any request, so
+     * it must never be able to keep the context from starting — a slice with no {@code accounts}
+     * table at all still has to come up cleanly. A genuine failure is logged at error level and the
+     * affected accounts simply keep showing no IBAN until a later startup succeeds.
+     *
+     * @param args the standard Boot arguments, unused
+     */
     @Override
     public void run(ApplicationArguments args) {
         try {
@@ -56,6 +60,18 @@ public class IbanBackfillRunner implements ApplicationRunner {
         }
     }
 
+    /**
+     * Assigns an IBAN to every account that currently has none.
+     *
+     * <p>Idempotent by construction: it selects only rows where {@code iban} is null, so the second
+     * and every later run finds nothing and writes nothing. Existing IBANs are never recomputed.
+     *
+     * <p>The whole sweep commits as one transaction, so either every eligible account gains an IBAN
+     * or none does. An account with no account number is skipped and counted rather than given an
+     * invented identifier that would not correspond to the account. The routing number stored on
+     * the account is used where present, falling back to the platform default, because an IBAN
+     * built from a different routing number would not match the account it belongs to.
+     */
     @Transactional
     public void backfillMissingIbans() {
         List<AccountEntity> missing = accountRepository.findByIbanIsNull();
@@ -66,9 +82,6 @@ public class IbanBackfillRunner implements ApplicationRunner {
 
         int skipped = 0;
         for (AccountEntity account : missing) {
-            // An account with no account number can't produce a meaningful IBAN, and inventing one
-            // would create an identifier that doesn't correspond to the account. Leave it alone and
-            // say so rather than writing something wrong.
             if (account.getAccountNumber() == null || account.getAccountNumber().isBlank()) {
                 skipped++;
                 continue;

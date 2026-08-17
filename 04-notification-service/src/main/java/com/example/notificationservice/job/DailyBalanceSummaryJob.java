@@ -22,6 +22,18 @@ import com.example.notificationservice.model.NotificationType;
 import com.example.notificationservice.repository.NotificationRecordRepository;
 import com.example.notificationservice.service.NotificationProviderService;
 
+/**
+ * Emails each opted-in user an aggregate balance summary at the hour they chose, in their own
+ * timezone.
+ *
+ * <p>The sweep runs hourly rather than once a day because the summary hour is a per-user setting;
+ * each run mails only the roughly one twenty-fourth of the population whose local clock currently
+ * reads their chosen hour.
+ *
+ * <p>Nothing here fires unless {@code @EnableScheduling} is present on the application class. The
+ * cron expression alone is inert, and the failure is silent — no summary is ever sent and no error
+ * is logged.
+ */
 @Component
 public class DailyBalanceSummaryJob {
 
@@ -35,8 +47,12 @@ public class DailyBalanceSummaryJob {
     private final NotificationRecordRepository notificationRecordRepository;
     private final Clock clock;
 
-    // injecting a plain java.time.Clock instead of calling Instant.now() directly everywhere,
-    // learned this is what actually let the test suite freeze time and stub a fixed 8am instant
+    /**
+     * Creates the job.
+     *
+     * @param clock read on every sweep instead of calling {@code Instant.now()} directly, so a test
+     *     can freeze time at a chosen instant and assert which users come out due
+     */
     public DailyBalanceSummaryJob(ProfileServiceClient profileServiceClient,
                                   AccountServiceClient accountServiceClient,
                                   NotificationProviderService notificationProviderService,
@@ -49,21 +65,25 @@ public class DailyBalanceSummaryJob {
         this.clock = clock;
     }
 
-    // Each user picks their own summary hour, so this sweep fetches the whole opted-in population
-    // once and decides user by user whether their local clock currently reads the hour they asked for.
-    //
-    // The old shape - "find the timezones that are at 08:00, then ask profile-service for the users in
-    // each" - only worked because the hour was one global value, which made most of the world
-    // irrelevant on any given run. With a per-user hour every zone is potentially a target, so that
-    // narrowing narrows nothing, and querying zone by zone would mean roughly 600 HTTP calls an hour
-    // to answer a question one call answers.
-    //
-    // Being honest about the cost of the shape that replaced it: this pulls every opted-in user across
-    // the bank into memory once an hour, including the ~23/24 of them who aren't due anything. That is
-    // one small round trip at this scale and far cheaper than what it replaced, but it does grow with
-    // the customer base rather than with the work actually being done - at a size where the list stops
-    // fitting comfortably in memory this wants a server-side filter (profile-service returning only
-    // the users whose local hour is now) rather than a bigger heap here.
+    /**
+     * Runs the hourly sweep, mailing every opted-in user whose local clock currently reads their
+     * chosen summary hour.
+     *
+     * <p>Fetches the whole opted-in population in one call and filters in memory. Querying zone by
+     * zone instead would mean roughly 600 HTTP calls an hour: with a per-user hour every zone is
+     * potentially a target, so narrowing by zone narrows nothing. The cost of this shape is that it
+     * grows with the customer base rather than with the work being done — at a size where the list
+     * stops fitting comfortably in memory this wants profile-service returning only the users whose
+     * local hour is now, rather than a bigger heap here.
+     *
+     * <p>Never throws. A failed population fetch abandons the sweep, and a failure mailing one user
+     * is logged and skipped so it cannot cost everyone else their summary; an exception escaping
+     * into the scheduler thread would show up only as a cron that stopped running.
+     *
+     * <p>Each mailed user gets a {@code NotificationRecord}, {@code SENT} or {@code FAILED}. A user
+     * who is due but missing from the batch balance response is skipped with no record at all, so
+     * their absence from the feed is the only trace.
+     */
     @Scheduled(cron = "0 0 * * * *")
     public void processDailySummaries() {
         Instant now = Instant.now(clock);
@@ -73,9 +93,6 @@ public class DailyBalanceSummaryJob {
         try {
             optedInUsers = profileServiceClient.getAllUsersForDailySummary();
         } catch (Exception e) {
-            // The fetch is the whole sweep now, so there is nothing to isolate a failure from - but it
-            // still must not escape into the scheduler thread, which would leave the failure visible
-            // only as a dead cron.
             log.error("Could not fetch the opted-in users. Skipping this sweep.", e);
             return;
         }
@@ -103,29 +120,13 @@ public class DailyBalanceSummaryJob {
             try {
                 dispatchSummary(user, balanceMap.get(user.userId()));
             } catch (Exception e) {
-                // Isolation per user, where the old code isolated per timezone - the unit of work in
-                // this loop is now one user, so that is the granularity a failure has to stop at. One
-                // undeliverable address cannot cost everybody else their summary.
                 log.error("Failed to send the daily summary for user {}", user.userId(), e);
             }
         }
     }
 
-    // Whether this user's chosen hour is the hour it currently is where they live.
-    //
-    // ZonedDateTime rather than a stored UTC offset: an offset is only correct until the zone's next
-    // DST transition, and "08:00 local" has to stay 08:00 local across it. Resolving the instant
-    // through the zone's rules on every run is what makes the summary land at the same local time in
-    // March as it did in February.
-    //
-    // Every rejection is a skip with a log line rather than a throw. A single row with a null hour or
-    // a timezone string that isn't a zone id is a data problem for one user; letting it out of here
-    // would make it an outage for everyone.
     private boolean isDueThisHour(ProfileServiceClient.UserPreferenceResponse user, Instant now) {
         try {
-            // profile-service only returns opted-in users, so this is belt and braces - but the flag is
-            // right here on the record, and mailing someone who explicitly turned summaries off is the
-            // one failure in this job a customer would actually complain about.
             if (!Boolean.TRUE.equals(user.dailySummaryEnabled())) {
                 return false;
             }
@@ -145,17 +146,27 @@ public class DailyBalanceSummaryJob {
             ZonedDateTime localNow = ZonedDateTime.ofInstant(now, ZoneId.of(timezone));
             return localNow.getHour() == chosenHour;
         } catch (Exception e) {
-            // ZoneId.of throws on anything that isn't a known zone id, which is the realistic way a
-            // stored timezone goes bad - a client sending an abbreviation or a UTC offset string.
             log.warn("Skipping user {} in the daily summary sweep - could not resolve their local hour",
                     user.userId(), e);
             return false;
         }
     }
 
-    // Public rather than private so InternalNotificationController can run a single zone on demand,
-    // skipping the hour check entirely - that bypass is the whole point of the manual trigger, since
-    // otherwise testing a summary means waiting for somebody's chosen hour to come round.
+    /**
+     * Mails every opted-in user in one timezone immediately, whatever hour they chose.
+     *
+     * <p>The hour check is skipped entirely — that bypass is the reason this is public rather than
+     * private, since it is what makes an on-demand end-to-end check possible instead of waiting for
+     * somebody's chosen hour to come round. Calling it outside a manual trigger sends users a
+     * summary at a time they did not ask for.
+     *
+     * <p>Unlike the scheduled sweep this does not isolate failures: a downstream outage or an
+     * undeliverable address propagates to the caller, who asked about one specific zone and needs to
+     * be told it did not work. {@code InternalNotificationController} turns that into a 502.
+     *
+     * @param timezone must be a valid IANA zone id; the caller is expected to have validated it,
+     *     since an unknown value reaches profile-service as-is
+     */
     public void processUsersForTimezone(String timezone) {
         List<ProfileServiceClient.UserPreferenceResponse> users =
                 profileServiceClient.getUsersForDailySummary(timezone);
@@ -171,15 +182,11 @@ public class DailyBalanceSummaryJob {
 
         Map<Long, AccountServiceClient.UserAggregateBalanceResponse> balanceMap = fetchBalanceMap(users);
 
-        // No per-user try/catch on this path on purpose: the caller asked for one specific zone and
-        // needs to be told when it didn't work, which is what the controller turns into a 502.
         for (ProfileServiceClient.UserPreferenceResponse user : users) {
             dispatchSummary(user, balanceMap.get(user.userId()));
         }
     }
 
-    // One batch call for everyone being mailed this run, rather than a balance lookup per user -
-    // the N+1 this job exists to avoid.
     private Map<Long, AccountServiceClient.UserAggregateBalanceResponse> fetchBalanceMap(
             List<ProfileServiceClient.UserPreferenceResponse> users) {
         List<Long> userIds = users.stream()
@@ -189,9 +196,6 @@ public class DailyBalanceSummaryJob {
         List<AccountServiceClient.UserAggregateBalanceResponse> balances =
                 accountServiceClient.getAggregateBalancesBatch(userIds);
 
-        // Convert balance list into a Map for O(1) instantaneous lookup during the loop
-        // learned collectors.tomap needs a key function and a value function, here the value
-        // function is just identity, keeping the whole record as the map's value unchanged
         return balances.stream()
                 .collect(Collectors.toMap(
                         AccountServiceClient.UserAggregateBalanceResponse::userId,
@@ -199,7 +203,6 @@ public class DailyBalanceSummaryJob {
                 ));
     }
 
-    // The in-memory join of one user against the batch of balances, then the send.
     private void dispatchSummary(ProfileServiceClient.UserPreferenceResponse user,
                                  AccountServiceClient.UserAggregateBalanceResponse userBalance) {
         if (userBalance == null) {
@@ -208,12 +211,6 @@ public class DailyBalanceSummaryJob {
 
         String emailHtml = buildHtmlSummary(userBalance);
 
-        // The address arrives on the same preferences record that selected this user for a
-        // summary in the first place. Users registered before the email field existed have none;
-        // skip them rather than dispatching to a fabricated address that can never be delivered.
-        // Recorded as FAILED rather than passed over silently, the same way TransactionAlertListener
-        // treats this case - "we owed you a summary and could not send it" is exactly the kind of
-        // thing the notification feed exists to show.
         String userEmail = user.email();
         if (userEmail == null || userEmail.isBlank()) {
             log.warn("Skipping the daily summary for user {} - no email address on file", user.userId());
@@ -226,8 +223,6 @@ public class DailyBalanceSummaryJob {
         persistRecord(user.userId(), emailHtml, dispatched ? NotificationStatus.SENT : NotificationStatus.FAILED);
     }
 
-    // Same shape as TransactionAlertListener.persistRecord - this job was the one dispatcher that
-    // never left a durable trace, so its emails were invisible in GET /api/v1/notifications.
     private void persistRecord(Long userId, String message, NotificationStatus status) {
         NotificationRecord record = new NotificationRecord();
         record.setUserId(userId);

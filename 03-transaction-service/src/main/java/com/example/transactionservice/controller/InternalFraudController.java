@@ -17,8 +17,19 @@ import org.springframework.web.server.ResponseStatusException;
 
 import java.util.UUID;
 
-// no @PreAuthorize on this one unlike the customer facing controllers, learned this is meant
-// to only ever be reachable from inside the cluster network, not directly from an end user
+/**
+ * Settles wires that were held for fraud review, either releasing or refunding the money.
+ *
+ * <p>Carries no {@code @PreAuthorize}, unlike the customer-facing controllers: it is protected by
+ * being unreachable from outside the cluster rather than by an authority check, so anything that
+ * can reach the {@code /api/v1/internal/} prefix can resolve any held wire. Exposing that prefix
+ * through the ingress would hand an outsider the ability to release or reverse other people's
+ * money.
+ *
+ * <p>Nothing in this repository calls this endpoint. It is the only way a wire ever leaves
+ * {@code PENDING_APPROVAL}, so until an external reviewer or operator drives it, every wire above
+ * the review threshold stays held indefinitely with the sender already debited.
+ */
 @RestController
 @RequestMapping("/api/v1/internal/transfers")
 public class InternalFraudController {
@@ -29,42 +40,60 @@ public class InternalFraudController {
         this.fraudResolutionService = fraudResolutionService;
     }
 
+    /**
+     * A reviewer's verdict on a held wire.
+     *
+     * @param status required, and only {@code APPROVED} or {@code REJECTED} are accepted; anything
+     *     else is rejected as 400 before the transfer is touched
+     * @param reviewerNotes optional free text, appended verbatim to the transaction description
+     *     that the customer can read, so it must not carry anything internal
+     */
     public record FraudReviewUpdateDto(
             @NotBlank(message = "Status is required")
             @Pattern(regexp = "^(APPROVED|REJECTED)$", message = "Status must be APPROVED or REJECTED")
             String status,
-            
+
             String reviewerNotes
     ) {}
 
+    /**
+     * Resolves a held wire, releasing the funds to the destination or refunding the sender.
+     *
+     * <p>{@code APPROVED} completes the wire: for a genuinely external one the money already left at
+     * initiation and only the record changes, while for an on-us one the destination is credited
+     * now. The recipient's identity verification is re-checked at this moment rather than trusted
+     * from initiation, because a held wire can sit for days and a verification can be revoked in the
+     * meantime; a recipient who no longer qualifies gets the wire refunded instead, recorded under
+     * its own reason so the audit trail does not file it as a fraud rejection the reviewer never
+     * made. That re-check fails closed — an unreachable account-service or profile-service also
+     * refunds.
+     *
+     * <p>{@code REJECTED} refunds the sender the amount held at initiation.
+     *
+     * <p>Safe to retry. Both money movements carry idempotency keys derived from the wire id, so a
+     * call whose response was lost can be repeated without refunding or crediting twice.
+     *
+     * @param transactionId must name a wire currently in {@code PENDING_APPROVAL}; any other state
+     *     is refused rather than re-resolved
+     * @param payload the verdict; notes are shown to the customer
+     * @return 200 with a plain-text confirmation naming the transaction and its new status
+     * @throws org.springframework.web.server.ResponseStatusException with {@code NOT_FOUND} for an
+     *     unknown transaction, or {@code BAD_REQUEST} when it is not awaiting review
+     */
     @PatchMapping("/{transactionId}/fraud-status")
     public ResponseEntity<String> updateFraudStatus(
             @PathVariable UUID transactionId,
             @RequestBody @Valid FraudReviewUpdateDto payload) {
-        
+
         fraudResolutionService.resolvePendingTransfer(transactionId, payload);
-        
+
         return ResponseEntity.ok("Transaction " + transactionId + " successfully updated to " + payload.status());
     }
 }
 
-// learned a top level class does not have to be public, and a file can hold more than one
-// top level class as long as only one of them (the one matching the filename) is public,
-// this service is only ever used by the controller right above it so package private is enough
 @Service
 class FraudResolutionService {
 
-    // Both money movements below happen inside a local @Transactional method, so the remote call can
-    // succeed and the commit that records it can still fail afterwards - leaving the row in
-    // PENDING_APPROVAL and the resolution re-runnable, which is a second real refund or a second
-    // real credit. These keys make account-service apply each effect at most once no matter how
-    // many times we ask.
-    //
-    // They MUST stay distinct. The destination credit and the sender refund are two different
-    // effects on the same wire, so a single key derived from the transaction id alone would make
-    // whichever ran second look like a duplicate of the first and be swallowed - money that should
-    // have moved silently not moving, which is worse than the bug being fixed because nothing fails
-    // loudly. Suffixing by purpose keeps them stable across retries and different from each other.
     private static final String DESTINATION_CREDIT_PURPOSE = "destination-credit";
     private static final String SENDER_REFUND_PURPOSE = "sender-refund";
 
@@ -80,6 +109,24 @@ class FraudResolutionService {
         this.recipientKycValidator = recipientKycValidator;
     }
 
+    /**
+     * Applies a reviewer's verdict to a held wire and records the outcome.
+     *
+     * <p>The transaction boundary covers only the local status and audit write. The credit or
+     * refund is a remote call that commits in account-service independently, so a failure of this
+     * commit afterwards leaves the money moved and the wire still in {@code PENDING_APPROVAL},
+     * re-runnable. The two money movements therefore carry idempotency keys, and the keys must stay
+     * distinct per purpose: a destination credit and a sender refund are different effects on the
+     * same wire, and a single key derived from the wire id alone would make whichever ran second
+     * look like a duplicate and be silently swallowed — money that should have moved not moving,
+     * with nothing failing loudly.
+     *
+     * @param transactionId must name a wire in {@code PENDING_APPROVAL}
+     * @param payload {@code status} already constrained to {@code APPROVED} or {@code REJECTED} by
+     *     bean validation; any other value silently resolves nothing
+     * @throws org.springframework.web.server.ResponseStatusException with {@code NOT_FOUND} for an
+     *     unknown transaction or {@code BAD_REQUEST} when it is not awaiting review
+     */
     @Transactional
     public void resolvePendingTransfer(UUID transactionId, InternalFraudController.FraudReviewUpdateDto payload) {
 
@@ -98,16 +145,7 @@ class FraudResolutionService {
     }
 
     private void finalizeTransaction(TransactionEntity transaction, String reviewerNotes) {
-        // Funds were already deducted during initiation. For a genuinely external wire that's all
-        // that's needed - the money conceptually left the platform. For an on-us wire that was
-        // held for review, the destination account never got its half of the transfer yet - credit
-        // it now, completing the second leg (same account-service call the immediate-complete path
-        // in ExternalWireService already makes for on-us wires that don't need review).
         if (transaction.getDestinationAccountId() != null) {
-            // ExternalWireService vetted the recipient at initiation, but a held wire can sit here
-            // for days and a verification can be revoked or reversed in the meantime. The rule has
-            // to hold at the till as well as at the door, so re-check it against the recipient's
-            // status right now rather than trusting the initiation-time verdict.
             if (!destinationOwnerMayReceive(transaction.getDestinationAccountId())) {
                 reverseUnreceivableTransaction(transaction, reviewerNotes);
                 return;
@@ -124,12 +162,6 @@ class FraudResolutionService {
         transactionRepository.save(transaction);
     }
 
-    // Fails closed on every answer that isn't a positive "this user is approved": no owner on the
-    // response, account-service 404ing the account, or account-service being unreachable all count
-    // as "cannot establish that the recipient may receive this money". Rejected the alternative of
-    // letting the lookup failure propagate - that aborts the whole @Transactional resolution and
-    // leaves the wire in PENDING_APPROVAL with the sender's money still reserved, which is the one
-    // outcome worse than either crediting or refunding.
     private boolean destinationOwnerMayReceive(Long destinationAccountId) {
         Long ownerUserId;
         try {
@@ -141,15 +173,9 @@ class FraudResolutionService {
         } catch (RuntimeException e) {
             return false;
         }
-        // isApproved rather than requireApprovedRecipient: the thrown form would 403 the reviewer's
-        // own request and roll this resolution back, when what's wanted is a decided outcome here.
         return recipientKycValidator.isApproved(ownerUserId);
     }
 
-    // Same refund as a fraud rejection, deliberately a different audit trail. The reviewer said
-    // APPROVED and it would be a false record to file this under their rejection - what stopped the
-    // money was the receiving side, after the review, so the description says both: the reviewer's
-    // actual verdict, then the separate reason the funds went back.
     private void reverseUnreceivableTransaction(TransactionEntity transaction, String reviewerNotes) {
         reverseTransaction(transaction,
                 " [Fraud Review: APPROVED. Notes: " + reviewerNotes + "]"
@@ -164,17 +190,10 @@ class FraudResolutionService {
                 "Wire reversed - fraud review rejected");
     }
 
-    // The refund itself, shared by both reversal reasons above - only the audit wording differs, so
-    // the money movement lives in exactly one place.
     private void reverseTransaction(TransactionEntity transaction, String auditSuffix, String refundDescription) {
-        // Atomic Reversal Logic: Return the reserved funds to the user.
         transaction.setStatus(TransactionStatus.REJECTED);
         transaction.setDescription(transaction.getDescription() + auditSuffix);
 
-        // account-service locks the row and adds the amount back atomically, same as the
-        // original debit did - it's the sole owner of the accounts table now.
-        // Both reversal reasons share this one key on purpose: a wire is reversed for exactly one
-        // of them, and either way it is the same single refund of the same held amount.
         accountServiceClient.credit(transaction.getAccountId(), new AccountServiceClient.CreditRequest(
                 transaction.getAmount(), refundDescription,
                 idempotencyKeyFor(transaction, SENDER_REFUND_PURPOSE)));
@@ -182,10 +201,6 @@ class FraudResolutionService {
         transactionRepository.save(transaction);
     }
 
-    // The wire's own id is the stable part - it is the same on every retry of the same resolution
-    // and different for every other wire - and the purpose is what keeps the two effects on that one
-    // wire from colliding. Rejected a fresh UUID per call, which would be unique but not stable, so
-    // a retry would look like a new effect and refund twice: exactly the bug this is here to close.
     private static String idempotencyKeyFor(TransactionEntity transaction, String purpose) {
         return transaction.getTransactionId() + ":" + purpose;
     }

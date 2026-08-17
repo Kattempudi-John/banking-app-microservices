@@ -25,12 +25,31 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletRequestWrapper;
 import jakarta.servlet.http.HttpServletResponse;
 
-// same onceperrequestfilter base class as the jwt filter in auth-service, but this one only
-// cares about a single specific endpoint instead of gatekeeping the whole api
+/**
+ * Authenticates the identity vendor's KYC callback by HMAC-SHA256 over the raw request body.
+ *
+ * <p>This filter is what makes {@code POST /api/v1/webhooks/kyc-update} safe to leave outside the
+ * JWT rule: the vendor holds no end-user token, so a valid signature over the exact bytes sent is
+ * the only proof of origin. Everything the webhook can do — promoting a user to {@code APPROVED} and
+ * thereby letting money move — rests on this check, so an unsigned or mis-signed request is answered
+ * {@code 401} and never reaches the controller.
+ *
+ * <p>Unlike {@link InternalTokenFilter}, which gates a whole prefix, this filter examines only the
+ * one webhook path and passes every other request through untouched.
+ *
+ * <p>The request is wrapped so its body can be read twice. A servlet body is normally consumable
+ * once, and the signature must be computed over the raw bytes before the controller parses the same
+ * bytes as JSON; the wrapper caches them so both reads succeed. The wrapped request — not the
+ * original — is what continues down the chain, so removing the wrapper would leave the controller
+ * reading an exhausted stream.
+ */
 @Component
 public class KycWebhookFilter extends OncePerRequestFilter {
 
-    // In a real app, this secret is provided by the vendor and securely injected
+    /**
+     * Shared secret the vendor signs with; supplied by the vendor and injected securely in a real
+     * deployment, defaulted only so local runs work with no config.
+     */
     @Value("${kyc.vendor.webhook.secret:SuperSecretVendorKey123!}")
     private String webhookSecret;
 
@@ -38,6 +57,19 @@ public class KycWebhookFilter extends OncePerRequestFilter {
     private static final String SIGNATURE_HEADER = "X-Signature";
     private static final String HMAC_ALGORITHM = "HmacSHA256";
 
+    /**
+     * Verifies the {@code X-Signature} header on the KYC webhook and rejects anything that fails.
+     *
+     * <p>Signature comparison is constant-time: {@code String.equals} stops at the first mismatched
+     * byte, so its timing would leak how much of a forged signature was correct.
+     *
+     * @param request only URIs containing {@code /api/v1/webhooks/kyc-update} are inspected; all
+     *     others continue unmodified
+     * @param response written with {@code 401} and a JSON {@code error} when the signature header is
+     *     absent, blank, or does not match, in which case the chain is not continued
+     * @param filterChain continued with a body-caching wrapper around {@code request}, never the
+     *     original, so the controller can still read the payload
+     */
     @Override
     protected void doFilterInternal(
             @NonNull HttpServletRequest request,
@@ -45,31 +77,23 @@ public class KycWebhookFilter extends OncePerRequestFilter {
             @NonNull FilterChain filterChain
     ) throws ServletException, IOException {
 
-        // 1. Only intercept the specific webhook path
         if (!request.getRequestURI().contains(WEBHOOK_PATH)) {
             filterChain.doFilter(request, response);
             return;
         }
 
-        // 2. Wrap the request to cache the input stream
-        // learned a servlet request body can normally only be read once, since verifying the
-        // signature here has to read the raw body, but the controller needs to read the same
-        // body again later to parse the json, this wrapper caches it so both reads work
         CachedBodyHttpServletRequest wrappedRequest = new CachedBodyHttpServletRequest(request);
 
-        // 3-5. Extract the vendor's signature, compute our own, and compare them
         String signatureError = verifySignature(wrappedRequest);
         if (signatureError != null) {
             rejectRequest(response, signatureError);
             return;
         }
 
-        // 6. Signature is valid! Pass the WRAPPED request to the Controller so it can read the body again
         filterChain.doFilter(wrappedRequest, response);
     }
 
     private String verifySignature(CachedBodyHttpServletRequest wrappedRequest) {
-        // 3. Extract the signature provided by the vendor
         String vendorSignature = wrappedRequest.getHeader(SIGNATURE_HEADER);
         if (vendorSignature == null) {
             return "Missing X-Signature header";
@@ -78,11 +102,9 @@ public class KycWebhookFilter extends OncePerRequestFilter {
             return "Missing X-Signature header";
         }
 
-        // 4. Calculate our own HMAC signature based on the raw payload
         String body = new String(wrappedRequest.getCachedBody(), StandardCharsets.UTF_8);
         String calculatedSignature = calculateHmac(body, webhookSecret);
 
-        // 5. Securely compare the signatures
         if (!isSignatureValid(vendorSignature, calculatedSignature)) {
             return "Invalid webhook signature";
         }
@@ -101,13 +123,9 @@ public class KycWebhookFilter extends OncePerRequestFilter {
         }
     }
 
-    // learned a normal string.equals() bails out on the very first mismatched character, which
-    // means the response time subtly leaks how many characters matched, messagedigest.isequal
-    // always compares every byte no matter what so an attacker cannot time their way to the secret
     private boolean isSignatureValid(String expected, String actual) {
         if (expected == null) return false;
         if (actual == null) return false;
-        // MessageDigest.isEqual performs a cryptographic constant-time comparison
         return MessageDigest.isEqual(expected.getBytes(StandardCharsets.UTF_8), actual.getBytes(StandardCharsets.UTF_8));
     }
 
@@ -117,9 +135,6 @@ public class KycWebhookFilter extends OncePerRequestFilter {
         response.getWriter().write("{\"error\": \"" + message + "\"}");
     }
 
-    // =========================================================================================
-    // Inner Class: Custom Request Wrapper to cache the InputStream
-    // =========================================================================================
     private static class CachedBodyHttpServletRequest extends HttpServletRequestWrapper {
         private final byte[] cachedBody;
 
@@ -153,7 +168,7 @@ public class KycWebhookFilter extends OncePerRequestFilter {
 
             @Override
             public boolean isFinished() {
-                try { return cachedBodyInputStream.available() == 0; } 
+                try { return cachedBodyInputStream.available() == 0; }
                 catch (IOException e) { return true; }
             }
 

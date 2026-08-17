@@ -28,8 +28,14 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 
-// @Service marks this as a spring managed bean in the business logic layer, functionally almost
-// the same as @Component, just a more specific name so the intent of the class is clear at a glance
+/**
+ * Holds the secrets side of authentication: device fingerprints, 2FA code issue and verification,
+ * session revocation, and the registration fan-out.
+ *
+ * <p>Every secret this class handles is stored as a SHA-256 hash and compared as a hash. Device
+ * cookies, refresh tokens, and 2FA codes are all returned raw exactly once, at the moment they
+ * are minted, and never recoverable afterwards.
+ */
 @Service
 public class AuthSecurityService {
 
@@ -40,23 +46,21 @@ public class AuthSecurityService {
     private final KafkaTemplate<String, String> kafkaTemplate;
     private final ObjectMapper objectMapper;
 
-    // The one place the code's lifetime is decided. It sets expires_at on the row, it is what the
-    // login/resend responses report as expires_in_seconds, and it rides on the Kafka event so the
-    // email text matches the on-screen countdown. Inline :180 fallback so tests and a fresh
-    // checkout need no configuration.
     @Value("${application.security.two-factor.code-ttl-seconds:180}")
     private int codeTtlSeconds;
 
-    // How long a user has to wait before asking for another code. Deliberately much shorter than
-    // the TTL: long enough that a held-down button can't fan out a mailbox worth of codes, short
-    // enough that someone whose first email never arrived isn't stuck staring at a dead form.
     private static final long RESEND_COOLDOWN_SECONDS = 30;
 
-    // Returned by verifySms2fa instead of a bare boolean. The method is @Transactional and used to
-    // throw for the expired/locked cases, which rolled back the very delete that was supposed to
-    // burn the code - so an expired code stayed in the table and a locked-out account never got
-    // its row cleared. Returning a value lets the transaction commit and still tells the
-    // controller which of the four failures it was, which is what picks the status code.
+    /**
+     * Distinguishes the one success from the four distinct ways verifying a 2FA code can fail.
+     *
+     * <p>Exists so {@link #verifySms2fa} can return rather than throw. Verification runs in a
+     * transaction that also deletes the code row, and throwing for the expired and locked cases
+     * rolled back the very delete that was meant to burn the code, leaving dead rows in the table
+     * and handing the caller a blanket {@code 500}. Each constant maps to a different HTTP status
+     * and a different thing the client must do next: {@code INVALID} retry, {@code NO_CODE} and
+     * {@code EXPIRED} resend, {@code LOCKED} restart the login.
+     */
     public enum TwoFaResult { VALID, INVALID, EXPIRED, LOCKED, NO_CODE }
 
     public AuthSecurityService(RecognizedDeviceRepository deviceRepository,
@@ -73,10 +77,18 @@ public class AuthSecurityService {
         this.objectMapper = objectMapper;
     }
 
-    // ==========================================
-    // 1. Device Fingerprinting
-    // ==========================================
-
+    /**
+     * Reports whether a device cookie belongs to a device this user has already cleared 2FA on.
+     *
+     * <p>This is the check that decides whether a login skips 2FA, so a {@code false} is always
+     * the safe answer: a {@code null} or blank cookie is treated as an unknown device rather than
+     * as an error. The cookie is matched by hash, since only the hash was ever stored.
+     *
+     * @param userId must reference an existing user; an unknown id simply matches nothing
+     * @param rawDeviceCookie the raw {@code Device-ID} cookie value, not its hash; {@code null}
+     *     and blank are both normal and yield {@code false}
+     * @return {@code true} only when this exact cookie is on file for this user
+     */
     public boolean isDeviceRecognized(Long userId, String rawDeviceCookie) {
         if (rawDeviceCookie == null) return false;
         if (rawDeviceCookie.isBlank()) return false;
@@ -84,26 +96,48 @@ public class AuthSecurityService {
         return deviceRepository.findByUserIdAndDeviceHash(userId, hashedCookie).isPresent();
     }
 
-    // @Transactional wraps this whole method in one database transaction, if anything after the
-    // save throws, the save gets rolled back too, so the db never ends up in a half done state
+    /**
+     * Mints a new device identifier for a user who has just cleared 2FA and records its hash.
+     *
+     * <p>The raw identifier is returned exactly once, for the caller to set as the
+     * {@code Device-ID} cookie; only its hash is stored, so it cannot be recovered afterwards.
+     * Call this only after a code has actually been verified: a device registered here skips 2FA
+     * on every subsequent login for as long as the cookie lives.
+     *
+     * @param userId must reference an existing user; the row is written without checking
+     * @return the raw device identifier, never {@code null}
+     */
     @Transactional
     public String registerNewDevice(Long userId) {
         String rawDeviceId = UUID.randomUUID().toString();
         String hashedId = hashString(rawDeviceId);
         deviceRepository.save(new RecognizedDevice(userId, hashedId));
-        return rawDeviceId; // Return raw so the Controller can send it as a Set-Cookie header
+        return rawDeviceId;
     }
 
-    // ==========================================
-    // 2. 2FA Orchestration
-    // ==========================================
-
-    // Named for the step rather than the channel now that delivery has moved from SMS to email -
-    // auth-service's job is only to mint the code and announce it, whichever transport
-    // notification-service ends up picking is none of this method's business.
-    // Returns the code's lifetime in seconds, never the code itself. The raw code leaving this
-    // method was how it ended up on the login response body - the caller needs a number to count
-    // down from, not the secret, so that is all it gets.
+    /**
+     * Replaces any live 2FA code for this user with a fresh one and announces it for delivery.
+     *
+     * <p>Named for the step rather than the channel: this service mints the code and publishes
+     * the event, and which transport notification-service picks is not its business. The raw
+     * code never comes back, because returning it was how it once ended up in a login response
+     * body; the caller gets only the lifetime it needs to count down from.
+     *
+     * <p>The store and the Kafka publish share one transaction, so a broker that will not accept
+     * the event rolls the new code back rather than leaving a code in the table that nobody was
+     * ever told. Note that this destroys the existing code row first, which is why
+     * {@link #secondsUntilResendAllowed} has to be consulted before this method and not after.
+     *
+     * @param userId must reference an existing user
+     * @param phoneNumber E.164 or {@code null}; carried on the event as the fallback contact
+     *     rather than used here, since delivery is by email today
+     * @param email the address the code is actually sent to; {@code null} leaves the message
+     *     undeliverable, as auth-service is the only holder of this value
+     * @return the code's lifetime in seconds, the same figure that reaches the notification text,
+     *     so the on-screen countdown and the email agree
+     * @throws RuntimeException when the event cannot be published, which rolls back the stored
+     *     code
+     */
     @Transactional
     public int trigger2fa(Long userId, String phoneNumber, String email) {
         String code = generateAndStoreCode(userId);
@@ -111,10 +145,24 @@ public class AuthSecurityService {
         return codeTtlSeconds;
     }
 
-    // How long the caller must wait before another code may be requested - 0 when it may go now.
-    // Measured off the existing row's created_at rather than a separate rate-limit table, because
-    // there is exactly one live code per user and that row already records when it was minted.
-    // Read this BEFORE trigger2fa: the first thing it does is delete the row this looks at.
+    /**
+     * Reports how many seconds remain before this user may request another 2FA code.
+     *
+     * <p>Must be called <em>before</em> {@link #trigger2fa}, which deletes the very row this
+     * reads and would therefore always report zero afterwards. The window is measured from the
+     * existing code's creation time rather than from a separate rate-limit table, because there
+     * is only ever one live code per user and that row already records when it was minted.
+     *
+     * <p>The cooldown is 30 seconds, far shorter than the code's own lifetime: long enough that
+     * a held-down button cannot fan out a mailbox worth of codes, short enough that someone whose
+     * first email never arrived is not left staring at a dead form.
+     *
+     * @param userId must reference an existing user; a user with no code on file has nothing to
+     *     wait on and yields {@code 0}
+     * @return seconds still to wait, {@code 0} when a resend may go immediately, and never more
+     *     than the 30-second window even if the stored timestamp is in the future because of
+     *     clock skew between instances
+     */
     public int secondsUntilResendAllowed(Long userId) {
         return twoFactorCodeRepository.findByUserId(userId)
                 .map(existing -> {
@@ -122,19 +170,14 @@ public class AuthSecurityService {
                     if (elapsed >= RESEND_COOLDOWN_SECONDS) {
                         return 0;
                     }
-                    // Clamped at the full cooldown so a created_at somehow sitting in the future
-                    // (clock skew between app instances) can't hand back a retry-after larger than
-                    // the window itself, which would strand the user for longer than 30 seconds.
                     return (int) Math.min(RESEND_COOLDOWN_SECONDS, RESEND_COOLDOWN_SECONDS - elapsed);
                 })
-                .orElse(0); // No code on file at all - nothing to wait on
+                .orElse(0);
     }
 
     private String generateAndStoreCode(Long userId) {
-        // 1. Clear out any old codes stuck in the database
         twoFactorCodeRepository.deleteByUserId(userId);
 
-        // 2. Generate a highly secure 6-digit random code
         SecureRandom random = new SecureRandom();
         String code = String.format("%06d", random.nextInt(999999));
 
@@ -144,35 +187,39 @@ public class AuthSecurityService {
     }
 
     private void publish2faEvent(Long userId, String phoneNumber, String email, String code) {
-        // 4. Fire the Kafka Event
         try {
             Map<String, String> event = new HashMap<>();
-            // Renamed from SMS_2FA_REQUESTED because the action is no longer tied to one transport -
-            // notification-service reads this to decide it has a 2FA code to deliver, not how to send it.
             event.put("action", "TWO_FA_REQUESTED");
-            event.put("userId", userId.toString()); // notification-service needs this to record who the code went to
-            // Both contact details ride along. Email is what actually gets used today, but auth-service
-            // owns the User row and is the only place either value lives, so dropping the number here
-            // would mean nothing downstream could fall back to SMS without a call back into this service.
+            event.put("userId", userId.toString());
             event.put("phoneNumber", phoneNumber);
             event.put("email", email);
-            event.put("code", code); // The notification service needs the raw code to put in the message
-            // So the email can say how long the code lasts without hardcoding its own number. The
-            // map is Map<String,String>, hence the toString - notification-service parses it back
-            // and falls back to 180 if it is missing, so the two services can deploy in either order.
+            event.put("code", code);
             event.put("expiresInSeconds", String.valueOf(codeTtlSeconds));
 
             kafkaTemplate.send("notification-events", objectMapper.writeValueAsString(event));
         } catch (Exception e) {
-            // Because of @Transactional, throwing an exception here instantly rolls back the DB save!
             throw new RuntimeException("Failed to publish 2FA event to Kafka", e);
         }
     }
 
-    // Every exit is a return, never a throw. Under @Transactional an exception rolls the whole
-    // method back, so the old expired/locked branches deleted the row and then immediately threw
-    // the delete away again - the dead code stayed in the table and the caller got a blanket 500
-    // instead of a status that told it what happened.
+    /**
+     * Checks a submitted 2FA code against the one on file and consumes the code either way.
+     *
+     * <p>A code is single-use: a correct one is deleted so it cannot be replayed, and an expired
+     * or locked-out one is deleted so it cannot linger. Every path returns rather than throws,
+     * precisely so those deletes commit; an exception here would roll back the cleanup it just
+     * performed.
+     *
+     * <p>Three wrong attempts burn the code permanently. There is no way back from
+     * {@code LOCKED} except a fresh login, since the row the resend endpoint would extend no
+     * longer exists.
+     *
+     * @param userId must reference the user the {@code PRE_AUTH} token was issued for; the code
+     *     is looked up by this id alone, so passing another user's id checks another user's code
+     * @param providedCode the six digits as typed; must not be {@code null}, which faults rather
+     *     than counting as a failed attempt, and a wrong value spends one of the three attempts
+     * @return which of the five outcomes occurred, never {@code null}
+     */
     @Transactional
     public TwoFaResult verifySms2fa(Long userId, String providedCode) {
         TwoFactorCode storedCode = twoFactorCodeRepository.findByUserId(userId).orElse(null);
@@ -196,27 +243,35 @@ public class AuthSecurityService {
             return TwoFaResult.INVALID;
         }
 
-        // Success! Clean up the code so it cannot be reused.
         twoFactorCodeRepository.delete(storedCode);
         return TwoFaResult.VALID;
     }
 
-    // ==========================================
-    // 2b. Registration Provisioning Fan-out
-    // ==========================================
-
-    // profile-service and account-service each own their own slice of "user" data (KYC/contact
-    // info, accounts) and provision it themselves by consuming this event - auth-service only
-    // owns credentials, so this is the only way those other services learn a new user exists.
+    /**
+     * Announces a newly registered user so the other services can provision their own rows.
+     *
+     * <p>auth-service owns only credentials. profile-service and account-service each hold their
+     * own slice of a user, contact and KYC data on one side and accounts on the other, and this
+     * event is the only way either of them learns the user exists, so a user whose event is never
+     * published has no profile and no account.
+     *
+     * <p>Not transactional and not retried: call it after the user row is committed, because a
+     * publish failure here throws and the caller sees a failed registration for an account that
+     * now exists.
+     *
+     * @param userId must reference the just-saved user
+     * @param username the login name, the only place any other service can get one
+     * @param phoneNumber E.164 or {@code null}
+     * @param email a real, deliverable address; downstream services address balance summaries and
+     *     transaction alerts to it
+     * @throws RuntimeException when the event cannot be serialized or published
+     */
     public void publishUserRegisteredEvent(Long userId, String username, String phoneNumber, String email) {
         try {
             Map<String, String> event = new HashMap<>();
             event.put("userId", String.valueOf(userId));
             event.put("username", username);
             event.put("phoneNumber", phoneNumber);
-            // profile-service stores this so notification-service has somewhere real to send balance
-            // summaries and transaction alerts - before this, those were addressed to a fabricated
-            // "user_<id>@bank.com" that could never receive anything.
             event.put("email", email);
 
             kafkaTemplate.send("user-events", objectMapper.writeValueAsString(event));
@@ -225,35 +280,50 @@ public class AuthSecurityService {
         }
     }
 
-    // ==========================================
-    // 3. Session Revocation & Blacklisting
-    // ==========================================
-
+    /**
+     * Revokes every refresh token a user holds and blacklists the access token they logged out with.
+     *
+     * <p>Both halves are needed and both happen in one transaction: revoking refresh tokens alone
+     * would leave the current access token usable for the rest of its 15 minutes, and blacklisting
+     * the access token alone would let the caller mint a new one from the refresh cookie. Because
+     * the revocation is user-wide rather than session-wide, this signs the account out of every
+     * device, not just the one that called.
+     *
+     * <p>The blacklist row is kept only until the token would have expired anyway; a scheduled
+     * purge clears it after that, so the table stays proportional to live sessions.
+     *
+     * @param userId must reference the user the token belongs to; nothing cross-checks the two,
+     *     so a mismatched pair revokes one user's sessions and blacklists another's token
+     * @param jwtJti the {@code jti} claim of the access token being retired, the value the
+     *     request filter looks up on every subsequent call
+     * @param jwtExpiration that token's own expiry, interpreted in the JVM's default zone; a
+     *     value in the past leaves the entry immediately eligible for purging
+     */
     @Transactional
     public void logoutUserSession(Long userId, String jwtJti, Date jwtExpiration) {
-        // 1. Revoke the long-lived refresh tokens in the DB
         refreshTokenRepository.revokeAllUserTokens(userId);
 
-        // 2. Add the current short-lived JWT to the blacklist so it cannot be reused
         LocalDateTime expiresAt = LocalDateTime.ofInstant(jwtExpiration.toInstant(), ZoneId.systemDefault());
         blacklistedTokenRepository.save(new BlacklistedToken(jwtJti, expiresAt));
     }
 
-    // ==========================================
-    // 4. Automated Maintenance
-    // ==========================================
-
-    // learned @Scheduled just needs spring's scheduling support turned on somewhere with
-    // @EnableScheduling, then it runs this method automatically on its own background thread
+    /**
+     * Drops blacklist entries whose tokens have expired on their own.
+     *
+     * <p>Runs hourly rather than continuously because nothing depends on the timing: an entry
+     * past its expiry is already harmless, since the filter that consults the list would reject
+     * the expired token anyway. The schedule exists only to keep the table proportional to live
+     * sessions instead of to every logout ever performed.
+     *
+     * <p>Runs on the scheduler's own thread on every instance, so in a multi-replica deployment
+     * several replicas execute it at the same hour; the delete is idempotent, so that is
+     * wasteful rather than wrong.
+     */
     @Scheduled(cron = "0 0 * * * *")
     @Transactional
     public void purgeExpiredBlacklistTokens() {
         blacklistedTokenRepository.deleteAllExpiredTokensSince(LocalDateTime.now());
     }
-
-    // ==========================================
-    // Internal Cryptography Helpers
-    // ==========================================
 
     private String hashString(String input) {
         try {

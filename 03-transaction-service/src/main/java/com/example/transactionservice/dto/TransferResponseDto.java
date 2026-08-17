@@ -2,17 +2,23 @@ package com.example.transactionservice.dto;
 
 import java.util.UUID;
 
+/**
+ * Confirms the outcome of a transfer to the client.
+ *
+ * @param transactionId the confirmation id and the stored row's primary key, unique per transfer and
+ *     safe to quote back to the customer
+ * @param status the name of a {@code TransactionStatus} constant, carried as text; a wire over the
+ *     fraud threshold returns {@code PENDING_APPROVAL} here, meaning accepted but not yet settled
+ * @param onUsTransfer {@code true} when funds landed on another account on this platform, whether
+ *     an internal transfer or an external wire whose IBAN resolved on-platform; {@code false} when
+ *     the money genuinely leaves the network
+ */
 public record TransferResponseDto(
 
-        // A globally unique identifier generated specifically for this transfer event
         UUID transactionId,
 
-        // The final state of the transaction (e.g., "COMPLETED")
         String status,
 
-        // True when the funds moved to another real account on this platform (an internal
-        // transfer, or an external wire whose IBAN resolved on-platform); false for a genuinely
-        // external wire that leaves the network.
         boolean onUsTransfer
 
 ) {}

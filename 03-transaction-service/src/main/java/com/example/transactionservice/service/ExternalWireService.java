@@ -19,6 +19,18 @@ import org.springframework.web.server.ResponseStatusException;
 import java.math.BigDecimal;
 import java.util.UUID;
 
+/**
+ * Initiates outgoing wire transfers, including ones that turn out to land back on this platform.
+ *
+ * <p>This is the only path that writes a row to this service's transaction table, and the only one
+ * that can leave money in an unfinished state: a wire above the review threshold is debited from
+ * the sender immediately and held until {@code FraudResolutionService} either credits the
+ * destination or refunds it.
+ *
+ * <p>Wires publish nothing to the {@code successful-transfers} topic, even when the destination
+ * turns out to be an account on this platform. Only the ledger transfer paths in
+ * {@code TransferService} do.
+ */
 @Service
 public class ExternalWireService {
 
@@ -28,9 +40,6 @@ public class ExternalWireService {
     private final RecipientKycValidator recipientKycValidator;
     private final KafkaTemplate<String, LargeTransferRequestedEvent> kafkaTemplate;
 
-    // bigdecimal even for a constant threshold, comparing it later with compareTo instead of ==
-    // or .equals(), learned bigdecimal.equals cares about scale too so 5000.00 vs 5000.0 would
-    // not be equal even though they represent the same value, compareTo avoids that trap
     private static final BigDecimal FRAUD_THRESHOLD = new BigDecimal("5000.00");
     private static final String FRAUD_TOPIC = "large-transfers-review";
 
@@ -43,82 +52,95 @@ public class ExternalWireService {
         this.transactionRepository = transactionRepository;
         this.validator = validator;
         this.recipientKycValidator = recipientKycValidator;
-        this.kafkaTemplate = kafkaTemplate; // Injected to publish high-value transfer events
+        this.kafkaTemplate = kafkaTemplate;
     }
 
+    /**
+     * Debits the sender and records an outgoing wire, holding it for review above the threshold.
+     *
+     * <p>The review threshold is a compile-time constant of {@code 5000.00} — not configurable, not
+     * per-customer — and the comparison is strictly greater-than, so a wire of exactly
+     * {@code 5000.00} clears immediately and {@code 5000.01} does not. Anything held is published to
+     * {@code large-transfers-review} and stays in {@code PENDING_APPROVAL}, with the sender's funds
+     * already gone, until a reviewer resolves it.
+     *
+     * <p>The IBAN is first tested against this platform's own accounts. When it resolves, the wire
+     * is really an on-us payment: the submitted BIC must match the bank actually holding that IBAN
+     * (checked here because a BIC has no check digit and format validation alone cannot catch a
+     * wrong one), and the receiving user's identity verification is checked before any money moves.
+     * When the IBAN resolves nowhere the wire is treated as genuinely external and neither check
+     * applies — there is no directory to verify a foreign BIC against and another bank's customer is
+     * not ours to vet. A lookup that fails for any reason other than "not found" refuses the wire
+     * rather than guessing.
+     *
+     * <p>The transaction boundary covers only the local row write. The debit, and the on-us credit
+     * that may follow it, are remote calls to account-service that commit there independently and
+     * are not rolled back when this method's transaction is: a failure after the debit — including
+     * a failure of the local commit itself — leaves the sender debited with no compensating credit
+     * and no record of the wire. No idempotency key is supplied on either call, so retrying a wire
+     * whose outcome is unknown debits a second time. Resolving that state today is a manual
+     * operation.
+     *
+     * @param userId taken from the JWT, never client-supplied; must own {@code fromAccountId}
+     * @param fromAccountId debited account, must be owned by {@code userId}
+     * @param request IBAN must pass mod-97 and the BIC must be 8 or 11 characters, both rejected as
+     *     400 before anything moves; {@code amount} positive, and compared against the threshold
+     *     with {@code BigDecimal.compareTo} so trailing-zero scale differences do not affect the
+     *     verdict
+     * @return the generated wire id, the resulting status — {@code COMPLETED} or
+     *     {@code PENDING_APPROVAL}, never anything else — and whether the wire actually stayed on
+     *     this platform
+     * @throws org.springframework.web.server.ResponseStatusException with {@code BAD_REQUEST} for a
+     *     malformed IBAN or BIC, or for a BIC that does not match the bank holding an on-us IBAN;
+     *     also relayed from account-service for insufficient funds or ownership failures
+     * @throws com.example.transactionservice.aspect.KycEnforcementAspect.KycRequiredException when
+     *     the sender is unverified, or when an on-us destination's owner is
+     * @throws com.example.transactionservice.aspect.KycEnforcementAspect.KycStatusUnavailableException
+     *     when the destination lookup cannot be completed, meaning nothing moved and the caller
+     *     should retry
+     */
     @Transactional
     @RequiresKyc
     public TransferResponseDto initiateWire(Long userId, Long fromAccountId, ExternalWireRequestDto request) {
 
-        // 1. Validate format
         validateFormat(request);
 
-        // 2. Check whether this IBAN actually belongs to an account on this platform - if so,
-        // this is really a peer-to-peer transfer between two real accounts, not money leaving to
-        // a correspondent bank. A genuinely unresolved IBAN keeps today's simulated-external
-        // behavior below untouched.
         Long destinationAccountId = resolveOnUsDestination(request.iban(), request.swiftCode());
         boolean onUsTransfer = destinationAccountId != null;
 
         UUID transactionId = UUID.randomUUID();
 
-        // 3-4. Pre-reserve the funds: account-service locks the row, verifies ownership/funds,
-        // debits it, and records the DEBIT transaction-history row, all atomically.
         accountServiceClient.debit(fromAccountId, new AccountServiceClient.DebitRequest(
                 userId, request.amount(), "External Wire to " + request.beneficiaryName()));
 
-        // 5. Threshold Check Logic
         TransactionStatus finalStatus = determineTransactionStatus(request.amount());
 
-        // 6. An on-us wire that clears immediately completes its second leg right now; one that's
-        // held for fraud review only gets credited to the destination later, once
-        // FraudResolutionService approves it - mirroring how a held wire's reversal already works.
         if (onUsTransfer && finalStatus == TransactionStatus.COMPLETED) {
             accountServiceClient.credit(destinationAccountId, new AccountServiceClient.CreditRequest(
                     request.amount(), "Incoming transfer from account " + fromAccountId + " (wire " + transactionId + ")"));
         }
 
-        // 7. Record the transaction state
         recordTransaction(transactionId, fromAccountId, request, finalStatus, destinationAccountId);
 
-        // 8. Publish to Kafka if flagged for Fraud Review
         publishFraudReviewIfNeeded(transactionId, fromAccountId, request, finalStatus);
 
-        // 9. Return the UUID, the resulting status (either COMPLETED or PENDING_APPROVAL), and
-        // whether this actually stayed on-platform
         return new TransferResponseDto(transactionId, finalStatus.name(), onUsTransfer);
     }
 
-    // Wording the caller sees when the lookup below can't be completed. Deliberately names no
-    // internal service - which of our components was unreachable is our problem, not theirs, and
-    // "try again" is the only action available to them. Same shape as the sender-side KYC gate's
-    // message, for the same reason.
     private static final String WIRE_UNAVAILABLE_MESSAGE =
             "We couldn't complete your wire transfer right now. Please try again in a moment.";
 
-    // Runs before the debit in step 3 above, so a wire aimed at an unverified account holder is
-    // refused with nothing reserved.
     private Long resolveOnUsDestination(String iban, String submittedSwiftCode) {
         AccountServiceClient.AccountLookupResponse account;
 
-        // The try scope is the lookup call and nothing else, deliberately. requireApprovedRecipient
-        // below throws KycRequiredException for an unverified recipient, which has to surface as a
-        // 403 - pulling it inside a catch of RuntimeException here would rewrite that verdict as a
-        // 503 outage and quietly turn the recipient-KYC rule off while still looking like it ran.
         try {
             account = accountServiceClient.lookupByIban(iban);
         } catch (ResponseStatusException e) {
             if (e.getStatusCode() == HttpStatus.NOT_FOUND) {
-                return null; // No account on this platform has this IBAN - a genuinely external wire
+                return null;
             }
-            // Any other status account-service answered with is it failing, not it saying "no such
-            // IBAN" - we still don't know whether this wire is on-us, so we can't proceed.
             throw wireUnavailable(e);
         } catch (RuntimeException e) {
-            // A connection failure never reaches FeignErrorConfig's ErrorDecoder at all (there is no
-            // response to decode), so it arrives here as a raw Feign exception rather than a
-            // ResponseStatusException. Left unhandled it became an HTTP 500, which reads as this
-            // service crashing when in fact it correctly declined to guess at the destination.
             throw wireUnavailable(e);
         }
 
@@ -126,43 +148,17 @@ public class ExternalWireService {
             return null;
         }
 
-        // An IBAN and a BIC on the same wire are supposed to name the same bank, and until now
-        // nothing ever compared them: isValidIban runs a real mod-97 checksum, but isValidSwift is
-        // a format regex and a BIC carries no check digit at all, so any well-formed string passed.
-        // "XBUSUS33" is as valid a shape as "XBUSUS31" - a wire addressed to a bank that isn't this
-        // one was landing in one of our accounts anyway, because the destination was resolved from
-        // the IBAN alone and the BIC was never looked at again.
-        // Checked before the KYC gate below on purpose: a wire naming the wrong bank is the
-        // sender's own input error, and answering it with a 403 about the recipient would both
-        // mis-describe the problem and disclose that person's verification state to someone who
-        // addressed the wire incorrectly in the first place.
         requireSwiftMatchesIbanHolder(submittedSwiftCode, account.swiftCode());
 
-        // The IBAN resolved, so this wire really lands on a platform user's account and the
-        // receiving side is ours to vet - same rule as a transfer by account number.
-        // The 404 branch above is the opposite case and stays deliberately unchecked: there is
-        // no user here to look up, and another bank's customer is not ours to KYC.
         recipientKycValidator.requireApprovedRecipient(account.userId());
         return account.accountId();
     }
 
-    // Reuses the sender-side gate's exception rather than introducing a second one: it already means
-    // exactly "a dependency we needed an answer from didn't give us one, nothing moved", and
-    // GlobalExceptionHandler already maps it to a 503 with the two-key body every client reads.
-    // A parallel exception type plus a parallel handler would be two ways to say one thing, and the
-    // next such failure would have to pick between them.
     private static KycEnforcementAspect.KycStatusUnavailableException wireUnavailable(RuntimeException cause) {
         return new KycEnforcementAspect.KycStatusUnavailableException(WIRE_UNAVAILABLE_MESSAGE, cause);
     }
 
-    // Normalized the same way IbanSwiftValidator.isValidSwift normalizes before its regex - trimmed
-    // and upper-cased - so a sender who types the right BIC in lower case is not refused for it.
-    // Only reachable for an on-us IBAN: for a genuinely external one there is no directory to check
-    // the pairing against, and refusing a correct BIC we simply cannot verify would be worse than
-    // accepting it. That limitation is deliberate and documented rather than silently papered over.
     private void requireSwiftMatchesIbanHolder(String submittedSwiftCode, String expectedSwiftCode) {
-        // No expected value means account-service answered without one - fail closed rather than
-        // treat "we don't know this account's bank" as agreement with whatever the sender typed.
         if (expectedSwiftCode == null || submittedSwiftCode == null
                 || !expectedSwiftCode.trim().equalsIgnoreCase(submittedSwiftCode.trim())) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
@@ -172,7 +168,6 @@ public class ExternalWireService {
     }
 
     private void validateFormat(ExternalWireRequestDto request) {
-        // Strict Formatting Validation
         if (!validator.isValidIban(request.iban())) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid IBAN or SWIFT code format.");
         }
@@ -181,11 +176,9 @@ public class ExternalWireService {
         }
     }
 
-    // compareTo returning greater than zero means amount is strictly bigger than the threshold,
-    // so exactly 5000.00 itself does not trigger review, only amounts that go over it
     private TransactionStatus determineTransactionStatus(BigDecimal amount) {
         if (amount.compareTo(FRAUD_THRESHOLD) > 0) {
-            return TransactionStatus.PENDING_APPROVAL; // Requires manual or automated review
+            return TransactionStatus.PENDING_APPROVAL;
         }
         return TransactionStatus.COMPLETED;
     }
@@ -217,7 +210,6 @@ public class ExternalWireService {
                 request.swiftCode(),
                 request.beneficiaryName()
         );
-        // Fire the event to the Fraud Detection Service
         kafkaTemplate.send(FRAUD_TOPIC, transactionId.toString(), event);
     }
 }

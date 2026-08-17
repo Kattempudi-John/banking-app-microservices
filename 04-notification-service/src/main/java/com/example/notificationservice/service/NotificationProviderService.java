@@ -9,6 +9,17 @@ import org.springframework.retry.annotation.Recover;
 import org.springframework.retry.annotation.Retryable;
 import org.springframework.stereotype.Service;
 
+/**
+ * Sends email and SMS through the external providers, retrying transient provider failures.
+ *
+ * <p>Every dispatch method here reports its outcome as a {@code boolean} and never throws on
+ * failure: once retries are exhausted the recovery path swallows the exception. Callers must branch
+ * on the returned value — a caller relying on {@code try}/{@code catch} records every exhausted
+ * dispatch as a success.
+ *
+ * <p>Retry is only active because {@code @EnableRetry} is present on the application class; without
+ * it the first provider failure propagates immediately.
+ */
 @Service
 public class NotificationProviderService {
 
@@ -22,12 +33,30 @@ public class NotificationProviderService {
         this.smsProviderClient = smsProviderClient;
     }
 
-    // learned @retryable needs @enablescheduling's cousin @enableretry turned on somewhere in the
-    // app, otherwise this annotation just sits here doing nothing and a failure throws immediately
-    // Returns whether the dispatch ultimately succeeded, so callers can record a real
-    // NotificationRecord status - @Recover swallows the exception after exhausting retries (its
-    // own return type has to match this method's), so a caller can't tell success from failure by
-    // catching alone; the boolean is what actually carries that signal back out.
+    /**
+     * Sends one HTML email through the provider, retrying a failed attempt twice more.
+     *
+     * <p><strong>The returned boolean is the only success signal.</strong> After three attempts the
+     * recovery path logs and returns {@code false} rather than rethrowing, so this method does not
+     * throw on a failed send. A caller that ignores the return value records a {@code SENT}
+     * notification for mail that was never delivered.
+     *
+     * <p>Three attempts at 1s doubling to 2s bounds the whole call at roughly three seconds. That
+     * ceiling is chosen against the 2FA code lifetime — codes are valid for minutes, so a longer
+     * backoff would deliver a code the user watches expire, and it also keeps a Kafka listener
+     * thread from being held long enough to stall the partition behind it.
+     *
+     * <p>The failure log claims the payload was written to a dead-letter queue. It was not: no queue
+     * or {@code failed_notifications} table exists, so a failed send is lost beyond the
+     * {@code FAILED} record the caller writes. Do not treat an exhausted dispatch as recoverable.
+     *
+     * @param userEmail must be a real, non-blank address; callers check for a missing address and
+     *     record a failure rather than calling with a blank recipient
+     * @param subject the mail subject line
+     * @param htmlContent the full HTML body; not the string that should be persisted, since the body
+     *     may carry a live credential
+     * @return {@code true} only if an attempt succeeded; {@code false} once all three are exhausted
+     */
     @Retryable(
             retryFor = { RuntimeException.class },
             maxAttempts = 3,
@@ -39,21 +68,42 @@ public class NotificationProviderService {
         return true;
     }
 
-    // learned @recover has a strict signature rule, the first parameter has to be the same
-    // exception type @retryable is watching for, and the rest of the parameters have to match
-    // the original method's parameters in order, spring uses that shape to match them up
+    /**
+     * Absorbs an email dispatch failure once all attempts are exhausted, converting it into a
+     * {@code false} return from {@link #dispatchEmail}.
+     *
+     * <p>Invoked by Spring Retry, never called directly. Its signature is dictated: the exception
+     * first, then the retried method's parameters in order, and the same return type — a mismatch
+     * leaves the original exception propagating instead.
+     *
+     * <p>This path only logs. A production system would write the payload to a dead-letter queue or
+     * a {@code failed_notifications} table for later retry; neither exists, and the log line saying
+     * otherwise is aspirational. What rides on it matters more since 2FA moved to email: an
+     * exhausted retry is a login nobody can finish, and a time-limited code is not something
+     * "retry tomorrow" would recover anyway.
+     *
+     * @param e the last failure seen, logged by message only
+     * @return always {@code false}, which is what the caller reads as the dispatch outcome
+     */
     @Recover
     public boolean recoverDispatchFailure(RuntimeException e, String userEmail, String subject, String htmlContent) {
-        // In a production system, this would write the failed payload to a Dead Letter Queue (DLQ)
-        // or a failed_notifications database table for a cron job to retry tomorrow. Worth noting
-        // what now rides on this path: 2FA codes deliver by email, so an exhausted retry here is a
-        // login nobody can finish, not only an alert nobody reads - and a code is time-sensitive
-        // enough that "retry tomorrow" is not a real recovery for it.
         log.error("CRITICAL FAILURE: Exhausted all retries for email to [{}]. Reason: {}", userEmail, e.getMessage());
         log.error("Payload saved to Dead Letter Queue for manual review.");
         return false;
     }
 
+    /**
+     * Sends one SMS through the provider, under the same retry and reporting contract as
+     * {@link #dispatchEmail}.
+     *
+     * <p>Dormant: nothing in this service dispatches SMS since 2FA moved to email. It stays because
+     * the SMS provider clients do.
+     *
+     * @param phoneNumber the recipient in whatever format the configured provider accepts
+     * @param message the plain-text body
+     * @return {@code true} only if an attempt succeeded; {@code false} once all three are exhausted,
+     *     never an exception
+     */
     @Retryable(
             retryFor = { RuntimeException.class },
             maxAttempts = 3,
@@ -65,11 +115,17 @@ public class NotificationProviderService {
         return true;
     }
 
+    /**
+     * Absorbs an SMS dispatch failure once all attempts are exhausted.
+     *
+     * <p>Invoked by Spring Retry, never called directly. As with the email recovery, the dead-letter
+     * queue named in the log line does not exist — the payload is dropped.
+     *
+     * @param e the last failure seen, logged by message only
+     * @return always {@code false}
+     */
     @Recover
     public boolean recoverSmsDispatchFailure(RuntimeException e, String phoneNumber, String message) {
-        // Same DLQ story as recoverDispatchFailure. Nothing dispatches SMS since 2FA moved to email,
-        // so this path is dormant rather than hot - it stays because the SMS clients do, and a
-        // swallowed failure here still beats one that crashes a consumer.
         log.error("CRITICAL FAILURE: Exhausted all retries for SMS to [{}]. Reason: {}", phoneNumber, e.getMessage());
         log.error("Payload saved to Dead Letter Queue for manual review.");
         return false;

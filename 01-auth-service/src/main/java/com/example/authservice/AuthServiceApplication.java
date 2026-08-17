@@ -4,18 +4,18 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.scheduling.annotation.EnableScheduling;
 
-// @SpringBootApplication bundles three annotations into one, @Configuration, @EnableAutoConfiguration,
-// and @ComponentScan, this single line is what turns on all of spring boot's autoconfiguration magic
-//
-// @EnableScheduling is what AuthSecurityService.purgeExpiredBlacklistTokens' comment was referring to
-// when it said @Scheduled "just needs spring's scheduling support turned on somewhere" - it was never
-// actually turned on, so that hourly purge had never run and the blacklist table only ever grew.
+/**
+ * Boots the auth service and enables the scheduler its background jobs depend on.
+ *
+ * <p>Scheduling is switched on here and nowhere else, so removing {@code @EnableScheduling} from
+ * this class silently disables every {@code @Scheduled} method in the service rather than failing
+ * at startup. {@code AuthSecurityService.purgeExpiredBlacklistTokens} is the one that matters: with
+ * the scheduler off, the revoked-JWT blacklist table is never trimmed and grows without bound.
+ */
 @SpringBootApplication
 @EnableScheduling
 public class AuthServiceApplication {
 
-	// this is the actual java entry point, SpringApplication.run boots up the whole embedded
-	// tomcat server and the entire application context before this method even returns
 	public static void main(String[] args) {
 		SpringApplication.run(AuthServiceApplication.class, args);
 	}

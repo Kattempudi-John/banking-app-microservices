@@ -12,35 +12,68 @@ import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 
-// Second layer in front of /api/v1/internal/**, which is permitAll at the authorize layer because
-// there is no end-user JWT on a service-to-service call. Until now the only thing keeping those
-// endpoints private was the k8s ingress not routing that path prefix - so anything that could reach
-// this pod's port could POST to /credit and mint money into any account with no credential at all.
-// The same shared-secret check exists in the other four services, header and property names included;
-// they are a contract, so do not rename one of them here alone.
-//
-// Same OncePerRequestFilter base class as profile-service's KycWebhookFilter, but deliberately much
-// simpler: that one signs the request BODY with an HMAC because the payload comes from an outside
-// vendor and its contents are what must be trusted. Here both ends are our own services on our own
-// network, so a shared bearer-style secret is the right weight - no body caching, no HMAC.
+/**
+ * Gates {@code /api/v1/internal/**} on a shared secret carried in the {@code X-Internal-Token} header.
+ *
+ * <p>Those paths are {@code permitAll} at the authorization layer because a service-to-service call
+ * carries no end-user JWT, so this filter is the only credential check standing in front of them.
+ * Without it, anything able to reach this pod's port could {@code POST} to {@code /credit} and mint
+ * money into any account with no credential at all — the k8s ingress declining to route the prefix is
+ * a routing decision, not a security boundary.
+ *
+ * <p>The header name, the property name, and the check itself are duplicated in the other four
+ * services and form a cross-service contract. Renaming either name in one service alone breaks every
+ * caller of that service.
+ *
+ * <p>Deliberately lighter than profile-service's {@code KycWebhookFilter}, which HMAC-signs the
+ * request body: that one accepts payloads from an outside vendor, where the body contents are what
+ * must be trusted. Here both ends are our own services on our own network, so a bearer-style shared
+ * secret is the right weight — no body caching, no HMAC.
+ *
+ * <p>Instantiate this by hand inside the security chain rather than declaring it a
+ * {@code @Component}; as a bean, Boot also auto-registers it across the whole servlet chain and it
+ * runs twice per request.
+ */
 public class InternalTokenFilter extends OncePerRequestFilter {
 
     static final String TOKEN_HEADER = "X-Internal-Token";
 
     private static final String INTERNAL_PATH_PREFIX = "/api/v1/internal/";
 
-    // One message for the missing case and the wrong case alike. Telling a caller WHICH of the two
-    // it got turns this into an oracle that confirms when a guessed token is at least well-formed,
-    // and naming the header or the property here would hand an attacker the shape of the mechanism
-    // they are probing. Callers that legitimately belong here already know what to send.
     private static final String REJECTION_MESSAGE = "Unauthorized internal service request";
 
     private final byte[] expectedToken;
 
+    /**
+     * Creates a filter that admits only callers presenting exactly {@code internalToken}.
+     *
+     * @param internalToken never {@code null}; the raw shared secret, compared as UTF-8 bytes, and
+     *     expected to be identical to the value every peer service sends
+     */
     public InternalTokenFilter(String internalToken) {
         this.expectedToken = internalToken.getBytes(StandardCharsets.UTF_8);
     }
 
+    /**
+     * Admits a request under the internal prefix only when its token matches, and passes every other
+     * request through untouched.
+     *
+     * <p>Requests outside {@code /api/v1/internal/} — the whole customer-facing JWT API — are none of
+     * this filter's business. Inverting that test would demand a service secret from every logged-in
+     * user's browser.
+     *
+     * <p>A rejection is a {@code 401} carrying one fixed message for the missing-token and
+     * wrong-token cases alike, naming neither the header nor the property. Distinguishing them would
+     * make this an oracle confirming when a guessed token is at least well-formed; callers that
+     * legitimately belong here already know what to send. The comparison itself is constant time, so
+     * response latency does not leak how many leading bytes of the secret were guessed correctly.
+     *
+     * @param request never {@code null}; matched on the path with any context path stripped first
+     * @param response never {@code null}; written to directly, and the chain stopped, on rejection
+     * @param filterChain never {@code null}; invoked only when the request is admitted
+     * @throws ServletException when a downstream filter fails
+     * @throws IOException when the rejection body cannot be written
+     */
     @Override
     protected void doFilterInternal(
             @NonNull HttpServletRequest request,
@@ -48,9 +81,6 @@ public class InternalTokenFilter extends OncePerRequestFilter {
             @NonNull FilterChain filterChain
     ) throws ServletException, IOException {
 
-        // Everything outside the internal prefix - the whole customer-facing JWT API - is none of
-        // this filter's business and passes straight through untouched. Getting this backwards would
-        // demand a service secret from every logged-in user's browser.
         if (!isInternalRequest(request)) {
             filterChain.doFilter(request, response);
             return;
@@ -64,9 +94,6 @@ public class InternalTokenFilter extends OncePerRequestFilter {
         filterChain.doFilter(request, response);
     }
 
-    // Strips the context path before matching so the check keeps working if this service is ever
-    // deployed under one - getRequestURI() includes it, so a bare startsWith would silently stop
-    // matching and leave every internal endpoint ungated again, failing OPEN rather than closed.
     private boolean isInternalRequest(HttpServletRequest request) {
         String uri = request.getRequestURI();
         String contextPath = request.getContextPath();
@@ -76,9 +103,6 @@ public class InternalTokenFilter extends OncePerRequestFilter {
         return path.startsWith(INTERNAL_PATH_PREFIX);
     }
 
-    // MessageDigest.isEqual, never String.equals: equals() returns on the first differing byte, so
-    // how long the comparison took leaks how many leading bytes were right, and an attacker can walk
-    // the secret out one byte at a time. isEqual always reads every byte regardless.
     private boolean isTokenValid(String presentedToken) {
         if (presentedToken == null) {
             return false;
@@ -90,8 +114,6 @@ public class InternalTokenFilter extends OncePerRequestFilter {
         response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
         response.setContentType("application/json");
         response.setCharacterEncoding(StandardCharsets.UTF_8.name());
-        // Both keys carry the same text, matching GlobalExceptionHandler and the other services:
-        // the frontend's extractApiError reads "error", the service-to-service clients read "message".
         response.getWriter().write("{\"error\":\"" + REJECTION_MESSAGE + "\",\"message\":\"" + REJECTION_MESSAGE + "\"}");
     }
 }

@@ -14,6 +14,19 @@ import jakarta.persistence.PrePersist;
 import jakarta.persistence.PreUpdate;
 import jakarta.persistence.Table;
 
+/**
+ * Maps a row of the {@code accounts} table — one bank account belonging to one user.
+ *
+ * <p>Balances are {@link BigDecimal} at precision 19, scale 4, never a floating-point type; the
+ * column definition and this field must stay in step or rounding silently changes at the boundary.
+ *
+ * <p>{@code accountNumber} and {@code iban} are both unique across the table and are how other
+ * services and the Transfer page address an account. {@code iban} is nullable: accounts created
+ * before the column existed have none until {@code IbanBackfillRunner} fills them in at startup.
+ *
+ * <p>{@code createdAt} and {@code updatedAt} are maintained by the JPA lifecycle hooks below, so no
+ * service method should ever set them by hand.
+ */
 @Entity
 @Table(name = "accounts")
 public class AccountEntity {
@@ -29,7 +42,6 @@ public class AccountEntity {
     @Column(name = "account_type", nullable = false)
     private AccountType accountType;
 
-    // BigDecimal is mandatory for handling financial data precision
     @Column(name = "available_balance", nullable = false, precision = 19, scale = 4)
     private BigDecimal availableBalance;
 
@@ -54,21 +66,28 @@ public class AccountEntity {
 
     public AccountEntity() {}
 
-    // learned @prepersist and @preupdate are jpa lifecycle hooks, hibernate calls these
-    // automatically right before insert/update so createdAt and updatedAt never have to be
-    // set manually anywhere else in the codebase, one less thing to forget in a service method
+    /**
+     * Stamps both timestamps at insert time.
+     *
+     * <p>Called by the persistence provider, never directly; both values are taken from the
+     * application clock, not the database clock.
+     */
     @PrePersist
     protected void onCreate() {
         this.createdAt = LocalDateTime.now();
         this.updatedAt = LocalDateTime.now();
     }
 
+    /**
+     * Refreshes {@code updatedAt} on every flush of a dirty row.
+     *
+     * <p>Called by the persistence provider, never directly.
+     */
     @PreUpdate
     protected void onUpdate() {
         this.updatedAt = LocalDateTime.now();
     }
 
-    // --- Getters and Setters ---
     public Long getId() { return id; }
     public void setId(Long id) { this.id = id; }
     public Long getUserId() { return userId; }

@@ -17,15 +17,20 @@ import com.example.notificationservice.model.NotificationStatus;
 import com.example.notificationservice.model.NotificationType;
 import com.example.notificationservice.repository.NotificationRecordRepository;
 
+/**
+ * Emails a user a security alert naming what changed whenever their profile is updated.
+ *
+ * <p>The stored message names each field that moved, in the order a person reads a contact form. The
+ * phone number is masked on both sides of the change because this string is persisted and served
+ * back by {@code GET /api/v1/notifications} on every reopen — the row should say which field moved,
+ * not republish the contact details. Other fields are shown in full, being the user's own data rather
+ * than a credential.
+ */
 @Service
 public class ProfileNotificationListener {
 
     private static final Logger logger = LoggerFactory.getLogger(ProfileNotificationListener.class);
 
-    // The human label for each field profile-service can report, in the order a person reads a
-    // contact form. A LinkedHashMap rather than a switch so the ordering and the labels live in one
-    // place - the message is a sentence, and "phone number changed ..., city changed ..." reading in
-    // form order is the difference between a line that scans and a line that has to be parsed.
     private static final Map<String, String> FIELD_LABELS = buildFieldLabels();
 
     private static Map<String, String> buildFieldLabels() {
@@ -53,10 +58,22 @@ public class ProfileNotificationListener {
         this.profileServiceClient = profileServiceClient;
     }
 
-    // learned groupId matters a lot here, every service listening with the same group id shares
-    // the messages between them like a queue, a different group id (like audit-service uses)
-    // gets its own full independent copy of every message instead, that is how both services
-    // can react to the exact same profile-events topic without stepping on each other
+    /**
+     * Consumes a {@code profile-events} message and emails the affected user a security alert.
+     *
+     * <p>Never throws. Any failure is logged and the message is treated as consumed, because an
+     * exception escaping a Kafka listener redelivers the same message indefinitely and stalls the
+     * partition behind it. The cost is that a lost alert is lost, visible only in the log or as a
+     * {@code FAILED} record.
+     *
+     * <p>The consumer group is shared with this service's other listeners, so each message is handled
+     * once here. Services that need their own copy of the same topic — audit-service does — must use
+     * a different group id rather than joining this one.
+     *
+     * @param eventPayload must carry a numeric {@code userId} and a {@code eventType}; the
+     *     {@code changes} entry is optional and a missing or malformed one degrades the message to
+     *     generic wording rather than failing
+     */
     @KafkaListener(topics = "profile-events", groupId = "notification-service-group")
     public void consumeProfileUpdate(Map<String, Object> eventPayload) {
         try {
@@ -78,9 +95,6 @@ public class ProfileNotificationListener {
         String subject = "Security Alert: Your profile was recently updated";
         String body = describeChanges(changes, eventType);
 
-        // Unlike TransactionAlertListener, this listener has no preferences object already in hand,
-        // so it fetches one purely for the address - the call is @Cacheable, so repeated profile
-        // updates for the same user don't each cost a round trip.
         String userEmail = resolveEmail(userId);
         if (userEmail == null || userEmail.isBlank()) {
             logger.warn("User {} has no email address on file - skipping the profile security alert", userId);
@@ -93,15 +107,6 @@ public class ProfileNotificationListener {
         persistRecord(userId, subject, body, dispatched ? NotificationStatus.SENT : NotificationStatus.FAILED);
     }
 
-    // The message this whole class exists to produce. profile-service has always published a
-    // "changes" map alongside the event type (ProfileManagementService.publishContactInfoChangedEvent
-    // sends Map.of("old", oldState, "new", dto)) and this listener used to throw it away, so the
-    // stored notice could only name the event type - "an update of type 'CONTACT_INFO_CHANGE' was
-    // made to your profile" tells the reader nothing about what actually moved.
-    //
-    // Every failure mode here falls back to that old generic wording rather than throwing. This runs
-    // on a Kafka listener: an exception escaping into consumeProfileUpdate's catch block would lose
-    // the notification entirely, and a vague notice is strictly better than no notice at all.
     private String describeChanges(Object changes, String eventType) {
         try {
             List<String> descriptions = collectFieldDescriptions(changes);
@@ -127,12 +132,6 @@ public class ProfileNotificationListener {
         for (Map.Entry<String, String> field : FIELD_LABELS.entrySet()) {
             String key = field.getKey();
 
-            // Absent from the before-state is NOT the same as "was empty". profile-service's
-            // captureOldContactState only snapshots some of the form's fields, so for the rest we
-            // know the submitted value and nothing to compare it against. Announcing those as
-            // "legal name set to ..." would claim a change on every resubmission of an unedited
-            // form, which is exactly the noise this message is meant to replace - so a field with
-            // no before-value recorded is passed over in silence.
             if (!oldState.containsKey(key)) {
                 continue;
             }
@@ -149,28 +148,16 @@ public class ProfileNotificationListener {
     }
 
     private String describeField(String label, String key, String oldValue, String newValue) {
-        // The phone number is masked on BOTH sides. This string is persisted and served back by
-        // GET /api/v1/notifications every time the user reopens the page, which is the same reason
-        // V3 scrubbed 2FA codes out of stored records - the row should say which field moved, not
-        // republish the contact details themselves. The last four digits are enough for the reader
-        // to recognise their own number, and the other fields (name, address, city) are not masked
-        // because they are the user's own data being shown back to them, not a credential.
         boolean maskValue = "phoneNumber".equals(key);
         String from = maskValue ? maskPhoneNumber(oldValue) : oldValue;
         String to = maskValue ? maskPhoneNumber(newValue) : newValue;
 
         if (isBlank(oldValue)) {
-            // "changed from null to Reston" is what the naive version of this reads like for a field
-            // the user is filling in for the first time.
             return label + " set to " + to;
         }
         return label + " changed from " + from + " to " + to;
     }
 
-    // The old and new sides arrive as JSON objects, so Jackson hands them over as maps whatever they
-    // were on the publishing side (a HashMap for "old", a serialized DTO for "new"). Anything else -
-    // a missing key, a null, a string where an object was expected - is a malformed payload and
-    // answers null so the caller can fall back.
     @SuppressWarnings("unchecked")
     private Map<String, Object> extractSide(Object changes, String side) {
         if (!(changes instanceof Map<?, ?> changesMap)) {
@@ -184,9 +171,6 @@ public class ProfileNotificationListener {
         return value == null ? null : value.toString().trim();
     }
 
-    // Null and "" are the same thing to a reader, and profile-service stores optional fields (address
-    // line 2 in particular) as either depending on how the form was submitted - comparing them
-    // literally would report a change nobody made.
     private boolean unchanged(String oldValue, String newValue) {
         if (isBlank(oldValue) && isBlank(newValue)) {
             return true;
@@ -198,9 +182,6 @@ public class ProfileNotificationListener {
         return value == null || value.isBlank();
     }
 
-    // The "***4567" shape 2FA records carried while codes went out by SMS, and that
-    // TwoFactorEmailListener still follows for the address it masks instead - so a user reading their
-    // feed sees one masking style rather than two.
     private String maskPhoneNumber(String phoneNumber) {
         if (isBlank(phoneNumber)) {
             return "the number on file";
@@ -208,7 +189,6 @@ public class ProfileNotificationListener {
         String digitsOnly = phoneNumber.replaceAll("\\D", "");
         String source = digitsOnly.isEmpty() ? phoneNumber : digitsOnly;
         if (source.length() <= 4) {
-            // Too short to mask meaningfully, and printing it whole would defeat the point.
             return "***";
         }
         return "***" + source.substring(source.length() - 4);

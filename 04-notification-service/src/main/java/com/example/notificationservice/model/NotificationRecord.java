@@ -15,9 +15,26 @@ import jakarta.persistence.Table;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
 
-// The durable trace of a dispatched (or failed) notification - this service used to only log what
-// it sent, with nothing queryable afterward. Written by each Kafka listener right after it calls
-// NotificationProviderService, success or failure both recorded.
+/**
+ * The durable trace of a dispatched or failed notification, and the sole backing of
+ * {@code GET /api/v1/notifications}.
+ *
+ * <p>Written by each Kafka listener and by the daily summary job immediately after calling
+ * {@code NotificationProviderService}, recording success and failure alike.
+ *
+ * <p>{@code type}, {@code channel} and {@code status} map to real PostgreSQL enum types declared in
+ * {@code V1__Create_Notification_Records_Table.sql}, not varchar columns. {@code @Enumerated(STRING)}
+ * alone makes Hibernate bind a plain varchar, which Postgres refuses to compare against an enum
+ * column; {@code @JdbcTypeCode(SqlTypes.NAMED_ENUM)} is what binds the value as the named enum type
+ * instead. That is also why the filtered feed uses a {@code Specification} rather than an
+ * "IS NULL OR" query — there is no meaningful cast for an unused enum-typed bind.
+ *
+ * <p>{@code message} is a {@code TEXT} column rather than the default {@code varchar(255)} because
+ * alert and summary bodies are full HTML documents. It is served straight back to the user, which is
+ * why the 2FA listener stores a masked line here instead of the mail it actually sent.
+ *
+ * <p>{@code createdAt} is set on first persist if unset and is never updated afterwards.
+ */
 @Entity
 @Table(name = "notification_records")
 public class NotificationRecord {
@@ -29,10 +46,6 @@ public class NotificationRecord {
     @Column(name = "user_id", nullable = false)
     private Long userId;
 
-    // V1__Create_Notification_Records_Table.sql declares these three as real PostgreSQL enum types
-    // (notification_type_enum and friends), not varchar. @Enumerated(STRING) alone makes Hibernate
-    // bind a plain varchar, which Postgres refuses to compare against an enum column - NAMED_ENUM is
-    // what tells it to bind the value as the named enum type instead.
     @Enumerated(EnumType.STRING)
     @JdbcTypeCode(SqlTypes.NAMED_ENUM)
     @Column(nullable = false)
@@ -46,8 +59,6 @@ public class NotificationRecord {
     @Column
     private String subject;
 
-    // TEXT, not the default varchar(255): the transaction alert's body is a full HTML document built
-    // by TransactionAlertListener.buildHtmlMessage, comfortably longer than 255 characters.
     @Column(nullable = false, columnDefinition = "TEXT")
     private String message;
 
@@ -61,6 +72,12 @@ public class NotificationRecord {
 
     public NotificationRecord() {}
 
+    /**
+     * Stamps the creation time before the first insert.
+     *
+     * <p>Only fills in a {@code null} value, so a caller that set {@code createdAt} explicitly — a
+     * backfill or a test asserting on ordering — keeps the instant it chose.
+     */
     @PrePersist
     protected void onCreate() {
         if (this.createdAt == null) {

@@ -10,8 +10,13 @@ import org.springframework.stereotype.Component;
 
 import java.util.Map;
 
-// @Aspect plus @Component is what turns this class into actual aop advice instead of just a
-// plain bean, spring wraps any method carrying @RequiresKyc in a proxy that calls this class first
+/**
+ * Refuses any {@code @RequiresKyc} call whose authenticated caller is not identity-verified.
+ *
+ * <p>Registered as advice rather than as a plain bean, so the gate attaches to a method by
+ * annotation alone and cannot drift apart between the transfer and wire paths. Only calls routed
+ * through the Spring proxy are advised; a self-invocation inside a bean runs ungated.
+ */
 @Aspect
 @Component
 public class KycEnforcementAspect {
@@ -22,28 +27,35 @@ public class KycEnforcementAspect {
         this.profileServiceClient = profileServiceClient;
     }
 
-    // @Before with this pointcut expression means run before any method anywhere in the app
-    // carrying @RequiresKyc, learned this is why executeTransfer and initiateWire both got this
-    // check for free just by adding the annotation, no code duplicated between the two services
+    /**
+     * Aborts the intercepted call unless the caller's KYC status is exactly {@code APPROVED}.
+     *
+     * <p>Advises every method carrying {@code @RequiresKyc} anywhere in the application. It runs
+     * before the target body and therefore before the target's transaction is opened, so a refused
+     * call leaves nothing partially done and nothing to roll back.
+     *
+     * <p>Vets the caller only. The user is resolved from the JWT and a recipient has no session
+     * here, so a path that credits somebody else's account must check the receiving side itself.
+     *
+     * <p>Fails closed in both directions: an unknown status and an unreachable profile-service are
+     * both refusals, never approvals. The cost is one synchronous profile-service call on the
+     * critical path of every money movement.
+     *
+     * @throws KycRequiredException when the status is known and is anything other than
+     *     {@code APPROVED}; surfaces as 403 and the message reaches the user verbatim, so it must
+     *     stand on its own and must not name the specific status — "complete your verification" is
+     *     false for a rejected applicant, who cannot clear it by resubmitting
+     * @throws KycStatusUnavailableException when profile-service returns no usable answer;
+     *     surfaces as 503 so the caller can tell "retry shortly" from "finish your verification"
+     * @throws SecurityException when there is no authenticated principal on the request at all
+     */
     @Before("@annotation(com.example.transactionservice.annotation.RequiresKyc)")
     public void enforceKycStatus() {
-        // 1. Securely extract the user ID from the active JWT session
         Long userId = resolveAuthenticatedUserId();
 
-        // 2. Make the synchronous network call to the Profile Service
         String kycStatus = fetchKycStatus(userId);
 
         if (!"APPROVED".equals(kycStatus)) {
-            // Throwing this custom exception instantly aborts the intercepted transaction method.
-            // A @RestControllerAdvice class will catch this and translate it into a 403 Forbidden HTTP response.
-            // Worded for the person reading it, because it is shown to them verbatim. The frontend
-            // used to replace every 403 on this path with one hardcoded line about the sender's own
-            // identity - which became wrong the moment a second 403 existed, since a transfer is
-            // also refused when the RECIPIENT isn't verified, and that told the sender to go and
-            // verify themselves when they already were. The frontend now shows whatever reason
-            // arrives, so this text has to stand on its own.
-            // Deliberately not naming PENDING_VERIFICATION vs REJECTED: "complete your verification"
-            // would be false for a rejected applicant, who cannot clear it by resubmitting.
             throw new KycRequiredException(
                     "Transfers are disabled until your identity is verified. "
                             + "Check your Profile page for your verification status.");
@@ -58,15 +70,10 @@ public class KycEnforcementAspect {
         if (!authentication.isAuthenticated()) {
             throw new SecurityException("User is not authenticated.");
         }
-        // The JWT subject holds the username, not the id — auth-service puts the numeric
-        // userId in its own claim instead, since this service has no User table to resolve it from.
         Jwt jwt = (Jwt) authentication.getPrincipal();
         return jwt.getClaim("userId");
     }
 
-    // Wording the caller sees. Deliberately says nothing about which dependency broke - that the
-    // profile service exists at all is our problem, not theirs, and "try again in a moment" is the
-    // only action available to them.
     private static final String STATUS_UNAVAILABLE_MESSAGE =
             "We couldn't confirm your identity verification right now. Please try again in a moment.";
 
@@ -75,9 +82,6 @@ public class KycEnforcementAspect {
         try {
             response = profileServiceClient.getKycStatus(userId);
         } catch (RuntimeException e) {
-            // profile-service unreachable, timing out, or answering with an error status (the
-            // ErrorDecoder re-throws those locally). Left unhandled this became an HTTP 500, which
-            // reads as this service crashing when in fact it correctly refused to proceed.
             throw new KycStatusUnavailableException(STATUS_UNAVAILABLE_MESSAGE, e);
         }
 
@@ -91,21 +95,34 @@ public class KycEnforcementAspect {
         return response.get("status");
     }
 
-    // =========================================================================
-    // Inner Exception Classes for clarity (usually kept in a separate file)
-    // =========================================================================
+    /**
+     * Signals a refusal because an identity verification is known not to be approved.
+     *
+     * <p>Raised for the caller by this aspect and for the payee by
+     * {@code RecipientKycValidator}, deliberately sharing one type so a single 403 mapping in
+     * {@code GlobalExceptionHandler} covers both. Because two different subjects can trigger it and
+     * the frontend now displays whichever message arrives, the message must say <em>whose</em>
+     * verification is at issue and must disclose nothing about a third party's standing beyond
+     * "you can't pay them yet".
+     */
     public static class KycRequiredException extends RuntimeException {
         public KycRequiredException(String message) {
             super(message);
         }
     }
 
-    // "We know the answer and it's no" (KycRequiredException, 403) versus "we couldn't get an
-    // answer" (this one, 503) are genuinely different facts and the caller should be able to tell
-    // them apart - one means finish your verification, the other means retry shortly.
-    // Deliberately NOT a subclass of KycRequiredException: the behaviour is identical (nothing moves
-    // either way, an unreachable dependency is never read as approval) but inheriting would let the
-    // existing 403 handler swallow it and put us back at reporting the wrong thing.
+    /**
+     * Signals that no verification answer could be obtained, as opposed to a negative one.
+     *
+     * <p>Deliberately not a subclass of {@link KycRequiredException}. The behaviour is identical —
+     * nothing moves either way, and an unreachable dependency is never read as approval — but
+     * inheriting would let the 403 handler swallow it and report a verification problem to a user
+     * who has none. As a separate type it maps to 503, telling the caller to retry rather than to
+     * go and fix their profile.
+     *
+     * <p>Also reused by the wire path for a failed destination lookup, which means the same thing:
+     * a dependency owed us an answer, did not give one, and nothing moved.
+     */
     public static class KycStatusUnavailableException extends RuntimeException {
         public KycStatusUnavailableException(String message) {
             super(message);

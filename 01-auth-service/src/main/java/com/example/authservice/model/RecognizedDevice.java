@@ -9,6 +9,16 @@ import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
 
+/**
+ * Marks a device a given user has already completed 2FA on, so a later login can skip the challenge.
+ *
+ * <p>The owner is held as a bare {@code userId} rather than a mapped {@code User} association on
+ * purpose: recognizing a device is a hot path on every login, and a plain column means the check is
+ * a single indexed lookup with no join or entity load behind it.
+ *
+ * <p>Only the hash of the device cookie is stored, never the raw {@code HttpOnly} value, so a
+ * database dump cannot be replayed as a recognized device.
+ */
 @Entity
 @Table(name = "recognized_devices")
 public class RecognizedDevice {
@@ -17,14 +27,9 @@ public class RecognizedDevice {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    // We do not map the entire User object here to keep the Auth Service lightweight.
-    // We only need the userId to associate the device.
-    // learned this is different from a real @manytoone relationship, storing a plain long
-    // means jpa never tries to join or load a full user entity just to check a device hash
     @Column(name = "user_id", nullable = false)
     private Long userId;
 
-    // Storing the hash, never the raw HttpOnly cookie value
     @Column(name = "device_hash", nullable = false, unique = true)
     private String deviceHash;
 
@@ -34,13 +39,25 @@ public class RecognizedDevice {
     @Column(name = "last_login", nullable = false)
     private LocalDateTime lastLogin;
 
-    // --- Constructors ---
-    
+    /**
+     * Creates an entry timestamped as of now with no owner or device hash set.
+     *
+     * <p>Exists for JPA. Both {@code userId} and {@code deviceHash} must be assigned before
+     * persisting; the columns are non-null.
+     */
     public RecognizedDevice() {
         this.createdAt = LocalDateTime.now();
         this.lastLogin = LocalDateTime.now();
     }
 
+    /**
+     * Registers a device as recognized for a user, as of now.
+     *
+     * @param userId the owner; not validated against the users table, so a stale id creates an
+     *     entry no login will ever match
+     * @param deviceHash the hash of the device cookie, never the raw cookie value; unique across
+     *     all users, so the same hash cannot be recognized for two accounts
+     */
     public RecognizedDevice(Long userId, String deviceHash) {
         this.userId = userId;
         this.deviceHash = deviceHash;
@@ -48,10 +65,7 @@ public class RecognizedDevice {
         this.lastLogin = LocalDateTime.now();
     }
 
-    // --- Getters and Setters ---
-
     public Long getId() { return id; }
-    // No setId() required; database handles generation.
 
     public Long getUserId() { return userId; }
     public void setUserId(Long userId) { this.userId = userId; }
@@ -60,7 +74,6 @@ public class RecognizedDevice {
     public void setDeviceHash(String deviceHash) { this.deviceHash = deviceHash; }
 
     public LocalDateTime getCreatedAt() { return createdAt; }
-    // No setCreatedAt() required; it should be immutable after creation.
 
     public LocalDateTime getLastLogin() { return lastLogin; }
     public void setLastLogin(LocalDateTime lastLogin) { this.lastLogin = lastLogin; }

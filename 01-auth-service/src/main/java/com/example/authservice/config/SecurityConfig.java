@@ -19,8 +19,10 @@ import java.util.List;
 import com.example.authservice.security.InternalTokenFilter;
 import com.example.authservice.security.JwtAuthenticationFilter;
 
-// @Configuration marks this as a class spring reads at startup to build beans from, @EnableWebSecurity
-// turns on spring security's web support at all, without it none of this filter chain setup would matter
+/**
+ * Defines the HTTP security rules for the auth service: which endpoints are reachable without a
+ * token, and in what order the custom filters run.
+ */
 @Configuration
 @EnableWebSecurity
 public class SecurityConfig {
@@ -37,76 +39,91 @@ public class SecurityConfig {
         this.authenticationProvider = authenticationProvider;
     }
 
-    // @Bean here means spring calls this method once at startup and keeps the returned
-    // securityfilterchain object around as a managed bean, this is what actually wires the rules below
+    /**
+     * Builds the single filter chain that authorizes every request this service serves.
+     *
+     * <p>Everything is denied by default; the {@code permitAll} entries are the deliberate holes.
+     * {@code /login}, {@code /register}, {@code /verify-2fa/**}, and {@code /refresh} must be open
+     * because a caller has no access token yet at those points, and {@code /logout} is
+     * authenticated because it needs the token's {@code jti} to blacklist. The {@code ERROR}
+     * dispatch is permitted separately: Spring re-dispatches internally to {@code /error} to render
+     * an error body, and without that rule the re-dispatch is authorized as a fresh anonymous
+     * request, turning every 400 and 404 into a bodyless 401 with the real reason lost. Matching on
+     * the dispatch type rather than the path keeps {@code /error} itself unreachable from outside.
+     *
+     * <p>{@code /api/v1/internal/**} is permitted at this layer but is not unauthenticated:
+     * {@code InternalTokenFilter} is its gate. Those routes are service-to-service only (for
+     * example transaction-service resolving a transfer recipient's display name) and are not
+     * published through the ingress, so no end-user token exists for them. Marking them
+     * {@code authenticated()} would demand a user JWT the calling service cannot produce and would
+     * break every internal call rather than protect it.
+     *
+     * <p>Filter order is load-bearing. {@code JwtAuthenticationFilter} runs before
+     * {@code UsernamePasswordAuthenticationFilter} so a bearer token populates the security context
+     * before form login would look at the request. {@code InternalTokenFilter} is then anchored
+     * ahead of the JWT filter so an unauthorized internal call is rejected before any other work
+     * happens; anchoring it to the JWT filter rather than to
+     * {@code UsernamePasswordAuthenticationFilter} avoids the two landing on the same order value,
+     * where the winner would come down to list order. That registration must stay after the JWT
+     * filter's, because a filter can only be positioned relative to one already in the chain. The
+     * internal filter ignores every path outside its prefix, so customer requests reach the JWT
+     * filter unchanged.
+     *
+     * <p>Sessions are stateless: no {@code HttpSession} is created or read, so every request must
+     * carry its own proof of identity and nothing survives on the server between calls. CSRF is
+     * disabled on the same reasoning — the attack depends on a browser attaching an ambient session
+     * cookie, and authorization here comes from an explicit bearer header.
+     *
+     * @param http the builder for this chain; each rule is applied in the order written above
+     * @return the built chain, never {@code null}
+     * @throws Exception if a rule cannot be applied, which fails startup rather than serving an
+     *     unsecured application
+     */
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
         http
-            // 1. Disable CSRF as we are using a stateless REST API with JWTs
-            // learned csrf protection exists for cookie based browser sessions, a jwt bearer
-            // token api like this one is not vulnerable the same way so it is safe to turn off here
             .csrf(csrf -> csrf.disable())
 
-            // Allow the Angular dev server (and later, its deployed origin) to call this API
-            // cross-origin, including sending the httpOnly Device-ID/Refresh-Token cookies.
             .cors(cors -> cors.configurationSource(corsConfigurationSource()))
 
-            // 2. Configure endpoint routing rules
             .authorizeHttpRequests(auth -> auth
-                // Spring re-dispatches internally to /error to render an error body. Without this,
-                // that dispatch is authorized as if it were a fresh request, so every 400/404 comes
-                // back as a bodyless 401 and the real reason never reaches the caller. Matching on
-                // the ERROR dispatch type keeps /error itself from being publicly reachable.
                 .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
-                // Public endpoints that do not require an Access Token
                 .requestMatchers("/api/v1/auth/login").permitAll()
                 .requestMatchers("/api/v1/auth/register").permitAll()
                 .requestMatchers("/api/v1/auth/verify-2fa/**").permitAll()
                 .requestMatchers("/api/v1/auth/refresh").permitAll()
-                // Swagger/OpenAPI UI - documentation, not application data
                 .requestMatchers("/swagger-ui/**", "/swagger-ui.html", "/v3/api-docs/**").permitAll()
-                // Internal, service-to-service only (transaction-service resolves a transfer
-                // recipient's display name here) - not exposed through the k8s ingress, so there is
-                // no end-user token available to authenticate it. Same rule account-service already
-                // applies to its own /api/v1/internal/** endpoints.
-                //
-                // Still permitAll at this layer, but no longer unauthenticated: InternalTokenFilter
-                // below is now the gate. Making this .authenticated() instead would demand a user
-                // JWT that a service-to-service caller has no way to produce, which would break
-                // every internal call rather than protect it.
                 .requestMatchers("/api/v1/internal/**").permitAll()
                 .requestMatchers("/api/v1/auth/logout").authenticated()
-                
-                // Any other backend endpoints require authentication
+
                 .anyRequest().authenticated()
             )
-            
-            // 3. Enforce stateless session management
-            // stateless means spring never creates or reads an httpsession for these requests,
-            // every request has to prove who it is with the jwt on its own, nothing remembered server side
+
             .sessionManagement(session -> session
                 .sessionCreationPolicy(SessionCreationPolicy.STATELESS)
             )
-            
-            // 4. Register our AuthenticationProvider (handles password hashing checks)
+
             .authenticationProvider(authenticationProvider)
-            
-            // 5. Inject our custom JWT filter BEFORE the default Spring Security filter
+
             .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class)
 
-            // 6. Shared-secret gate for /api/v1/internal/**, placed ahead of the JWT filter so an
-            // unauthorized internal call is turned away before any other work happens. Registering
-            // it relative to jwtAuthFilter (rather than to UsernamePasswordAuthenticationFilter,
-            // where the two would land on the same order value and the winner would come down to
-            // list order) makes "before the JWT filter" explicit. This must stay AFTER the line
-            // above: addFilterBefore can only anchor to a filter already registered in the chain.
-            // The filter ignores every path outside the internal prefix, so JwtAuthenticationFilter
-            // still sees customer requests exactly as it did, PRE_AUTH boundary checks included.
             .addFilterBefore(internalTokenFilter, JwtAuthenticationFilter.class);
 
         return http.build();
     }
 
+    /**
+     * Allows the Angular front end to call this API cross-origin with credentials attached.
+     *
+     * <p>Credentials are enabled because the device-recognition and refresh-token cookies are
+     * {@code HttpOnly} and the browser will not send them on a cross-origin request otherwise. That
+     * is also why the origin is listed explicitly instead of as {@code *}: browsers reject a
+     * wildcard origin whenever credentials are allowed. Only the local dev origin is listed, so a
+     * deployed front end must be added here or its requests are blocked by the browser before
+     * reaching any filter.
+     *
+     * @return a source applying the same policy to every path, never {@code null}
+     */
     @Bean
     public CorsConfigurationSource corsConfigurationSource() {
         CorsConfiguration configuration = new CorsConfiguration();

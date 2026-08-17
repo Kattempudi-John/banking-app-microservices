@@ -17,16 +17,24 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestTemplate;
 
-// Real email delivery via Twilio Email - active when email.provider=twilio, mutually exclusive with
-// the logging and SendGrid clients so Spring only ever has one candidate bean. Carries every
-// notification this service sends, 2FA codes included since they moved off SMS.
-//
-// This is Twilio's own email API (POST https://comms.twilio.com/v1/Emails), NOT the classic SendGrid
-// v3 mail/send that SendGridEmailProviderClient targets. The practical difference that matters here:
-// it authenticates with the same account SID / auth token pair the SMS client already uses, so
-// switching email on needs no new credential - only a verified sender address. There is no Twilio
-// Java helper for this endpoint yet, so it goes over a plain RestTemplate the way
-// TextBeltSmsProviderClient does.
+/**
+ * Delivers email through Twilio's own Email API, {@code POST https://comms.twilio.com/v1/Emails}.
+ *
+ * <p>Selected when {@code email.provider=twilio}, which deselects
+ * {@link LoggingEmailProviderClient} and {@link SendGridEmailProviderClient} so Spring only ever has
+ * one {@link EmailProviderClient} candidate. This carries every notification the service sends, 2FA
+ * codes included since those moved off SMS.
+ *
+ * <p>This is not the classic SendGrid v3 {@code mail/send} endpoint that
+ * {@link SendGridEmailProviderClient} targets. The difference that matters operationally: it
+ * authenticates with the same {@code sms.twilio.account-sid} / {@code sms.twilio.auth-token} pair
+ * the SMS client already uses, so turning email on adds no new secret — only a verified sender
+ * address under {@code email.twilio.from-email}. There is no Twilio Java helper for this endpoint,
+ * so the call goes over a plain {@link RestTemplate}.
+ *
+ * <p>Selecting this provider makes the application refuse to start unless those three properties
+ * are set; see {@link #initialiseClient()}.
+ */
 @Component
 @ConditionalOnProperty(name = "email.provider", havingValue = "twilio")
 public class TwilioEmailProviderClient implements EmailProviderClient {
@@ -40,9 +48,25 @@ public class TwilioEmailProviderClient implements EmailProviderClient {
     private final String fromName;
     private final RestTemplate restTemplate;
 
-    // The credentials deliberately read from sms.twilio.* rather than a duplicate pair under
-    // email.twilio.*: it is one Twilio account with one SID/token, and two copies of the same secret
-    // in config is two places to rotate and one of them to forget.
+    /**
+     * Captures the Twilio credentials and sender identity, and builds the default
+     * {@link RestTemplate}.
+     *
+     * <p>The account credentials are read from {@code sms.twilio.*} rather than a duplicate pair
+     * under {@code email.twilio.*} on purpose: it is one Twilio account with one SID and token, and
+     * a second copy in config is a second place to rotate and one of the two to forget. Only the
+     * sender identity is email-specific.
+     *
+     * <p>All four properties default to the empty string so a missing value is reported by name in
+     * {@link #initialiseClient()} rather than failing as an unresolved placeholder.
+     *
+     * @param accountSid the {@code sms.twilio.account-sid} value, shared with
+     *     {@link TwilioSmsProviderClient}; doubles as the HTTP Basic username
+     * @param authToken the {@code sms.twilio.auth-token} value, shared with the SMS client
+     * @param fromEmail the {@code email.twilio.from-email} value; must be verified as a sender on
+     *     the Twilio account or every send is rejected
+     * @param fromName optional display name; blank or {@code null} sends the address alone
+     */
     public TwilioEmailProviderClient(@Value("${sms.twilio.account-sid:}") String accountSid,
                                      @Value("${sms.twilio.auth-token:}") String authToken,
                                      @Value("${email.twilio.from-email:}") String fromEmail,
@@ -50,8 +74,6 @@ public class TwilioEmailProviderClient implements EmailProviderClient {
         this(accountSid, authToken, fromEmail, fromName, new RestTemplate());
     }
 
-    // Package-private so the test suite can hand in a RestTemplate that MockRestServiceServer is
-    // bound to - TextBeltSmsProviderClient builds its own inline and is untestable without a network.
     TwilioEmailProviderClient(String accountSid, String authToken, String fromEmail, String fromName,
                               RestTemplate restTemplate) {
         this.accountSid = accountSid;
@@ -61,9 +83,16 @@ public class TwilioEmailProviderClient implements EmailProviderClient {
         this.restTemplate = restTemplate;
     }
 
-    // Same reasoning as TwilioSmsProviderClient and SendGridEmailProviderClient: fail at boot with a
-    // message naming the missing property, rather than discovering it inside a Kafka listener where
-    // it becomes a silently undelivered alert.
+    /**
+     * Verifies the shared Twilio credentials and the sender address are present.
+     *
+     * <p>Runs during context refresh, so a blank property brings the application down at boot with a
+     * message naming it, rather than surfacing inside a Kafka listener as a notification that is
+     * silently never delivered. {@code email.twilio.from-name} is optional and is not checked.
+     *
+     * @throws IllegalStateException when {@code sms.twilio.account-sid},
+     *     {@code sms.twilio.auth-token} or {@code email.twilio.from-email} is missing or blank
+     */
     @PostConstruct
     void initialiseClient() {
         requireConfigured(accountSid, "sms.twilio.account-sid");
@@ -81,17 +110,30 @@ public class TwilioEmailProviderClient implements EmailProviderClient {
         }
     }
 
+    /**
+     * Posts the message to Twilio Email over HTTP Basic auth and treats any non-2xx as a failure.
+     *
+     * <p>A success is 202 Accepted: Twilio queues the message and sends it asynchronously, so a
+     * normal return means accepted-for-delivery, not delivered. The {@code operationId} from the
+     * response is logged because it is the only handle for looking a send up in the Twilio console
+     * afterwards — without it a "the email never arrived" report cannot be traced.
+     *
+     * <p>Only an HTML body is sent; the plain-text alternative is deliberately omitted rather than
+     * generated, so there is no stripped-down duplicate to drift out of sync.
+     *
+     * @param userEmail the recipient address, passed through unvalidated for Twilio to reject
+     * @param subject plain text; markup here is rejected by the provider
+     * @param htmlContent an HTML document, JSON-escaped by Jackson before transport
+     * @throws RuntimeException when Twilio answers outside 2xx or the call fails in transport;
+     *     unchecked on purpose so {@code NotificationProviderService} retries it and, once the
+     *     attempts are spent, records a {@code FAILED} notification
+     */
     @Override
     public void send(String userEmail, String subject, String htmlContent) {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
-        // Twilio Email uses plain HTTP Basic with the account SID as the username, exactly like the
-        // rest of the Twilio REST API.
         headers.setBasicAuth(accountSid, authToken);
 
-        // Every caller builds an HTML body (see the text blocks in TransactionAlertListener and
-        // DailyBalanceSummaryJob), so the text alternative is left null rather than shipping a
-        // stripped-down duplicate that would drift from the HTML.
         SendEmailRequest body = new SendEmailRequest(
                 new Address(fromEmail, fromName),
                 List.of(new Address(userEmail, null)),
@@ -101,10 +143,6 @@ public class TwilioEmailProviderClient implements EmailProviderClient {
             ResponseEntity<SendEmailResponse> response =
                     restTemplate.postForEntity(SEND_ENDPOINT, new HttpEntity<>(body, headers), SendEmailResponse.class);
 
-            // Twilio Email answers 202 Accepted and then processes the send asynchronously, so a 2xx
-            // means accepted-for-delivery rather than delivered. The operationId is the handle for
-            // looking the outcome up later in the console; logging it is what makes a "the email
-            // never arrived" report traceable.
             if (!response.getStatusCode().is2xxSuccessful()) {
                 throw new RuntimeException("Twilio Email rejected the message with status " + response.getStatusCode());
             }
@@ -114,20 +152,10 @@ public class TwilioEmailProviderClient implements EmailProviderClient {
                     userEmail, subject, response.getStatusCode().value(),
                     accepted != null ? accepted.operationId() : "unknown");
         } catch (RestClientException e) {
-            // Rethrown unchecked so NotificationProviderService's @Retryable retries it and its
-            // @Recover records a FAILED NotificationRecord once the attempts are exhausted. Non-2xx
-            // responses land here too - RestTemplate's default error handler throws on them.
             throw new RuntimeException("Twilio Email send failed: " + e.getMessage(), e);
         }
     }
 
-    // Request/response shapes for POST /v1/Emails. Records rather than hand-built JSON strings so
-    // Jackson handles escaping - the HTML bodies are full documents full of quotes and angle brackets.
-    //
-    // NON_NULL matters here: the optional fields below (a recipient display name, the plain-text
-    // alternative) are left null, and Twilio's API is stricter about an explicit "text": null than
-    // about the key being absent. Package-private rather than private so Jackson can reach the
-    // canonical constructor when deserialising the response without relying on setAccessible.
     @JsonInclude(JsonInclude.Include.NON_NULL)
     record SendEmailRequest(Address from, List<Address> to, Content content) {}
 
@@ -137,10 +165,6 @@ public class TwilioEmailProviderClient implements EmailProviderClient {
     @JsonInclude(JsonInclude.Include.NON_NULL)
     record Content(String subject, String html, String text) {}
 
-    // Twilio's 202 body: {"operationId": "comms_operation_...", "operationLocation": "https://..."}
-    // Polling operationLocation for the final delivery outcome is deliberately not done here.
-    // Ignoring unknown fields so a future addition to Twilio's response body can't break a send that
-    // actually succeeded.
     @JsonIgnoreProperties(ignoreUnknown = true)
     record SendEmailResponse(String operationId, String operationLocation) {}
 }

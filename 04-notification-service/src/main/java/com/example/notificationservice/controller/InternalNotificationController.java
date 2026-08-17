@@ -12,17 +12,20 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.example.notificationservice.job.DailyBalanceSummaryJob;
 
-// An operator handle on DailyBalanceSummaryJob, which is otherwise only reachable by waiting for its
-// hourly cron to line up with some user's chosen summary hour in their own timezone - a slow way to
-// find out whether email delivery actually works. Since the summary hour became a per-user setting
-// there is no configuration that can bring that moment forward, so this endpoint is the only way to
-// exercise the job on demand.
-//
-// Lives under /api/v1/internal/ for the same reason profile-service's InternalPreferenceController
-// does: it is unauthenticated, and that is the ONE prefix k8s/08-ingress-routes.yaml does not route,
-// so it is unreachable from outside the cluster. Do not move it, and do not add /api/v1/internal to
-// the ingress - this endpoint sends real email, so a routed version of it would be an open relay for
-// anyone who could reach the load balancer.
+/**
+ * Exposes an operator handle on {@code DailyBalanceSummaryJob}.
+ *
+ * <p>The job is otherwise only reachable by waiting for its hourly cron to line up with some user's
+ * chosen summary hour in their own timezone. Since that hour became a per-user setting there is no
+ * configuration that brings the moment forward, so this endpoint is the only way to exercise the job
+ * on demand.
+ *
+ * <p>The path sits under {@code /api/v1/internal/} because that is the one prefix
+ * {@code k8s/08-ingress-routes.yaml} does not route, leaving it unreachable from outside the
+ * cluster; it carries no user authentication and is gated only by {@code InternalTokenFilter}. Do
+ * not move it and do not add the prefix to the ingress — this endpoint sends real email, so a routed
+ * version is an open relay for anyone who can reach the load balancer.
+ */
 @RestController
 public class InternalNotificationController {
 
@@ -34,9 +37,25 @@ public class InternalNotificationController {
         this.dailyBalanceSummaryJob = dailyBalanceSummaryJob;
     }
 
-    // With a timezone, runs that one zone immediately and unconditionally - the hour check is skipped,
-    // which is what makes this useful for a same-minute end-to-end check. Without one, runs the exact
-    // sweep the cron would have run, so the scheduled path itself can be exercised on demand.
+    /**
+     * Triggers the daily balance summary immediately, and sends real email as a result.
+     *
+     * <p>With a timezone, that one zone runs unconditionally: the per-user hour check is skipped
+     * entirely, which is what makes a same-minute end-to-end check possible. Without one, the exact
+     * sweep the cron would have run executes instead, so the scheduled path itself can be exercised
+     * — meaning users who are not due this hour receive nothing.
+     *
+     * <p>The two modes also differ in how failure surfaces. The full sweep isolates each user and
+     * always reports 200; the single-zone path deliberately does not swallow failures, because a
+     * caller naming one zone needs to be told it did not work, so a downstream outage comes back as
+     * 502 naming the unreachable service rather than as a silent success.
+     *
+     * @param timezone optional; when present must be an IANA zone id such as
+     *     {@code America/New_York} — anything else is rejected with 400 naming the bad value rather
+     *     than surfacing as a {@code ZoneRulesException} from inside the job
+     * @return 200 on a completed run, 400 for an unknown zone id, or 502 when a downstream lookup
+     *     failed during a single-zone run
+     */
     @PostMapping("/api/v1/internal/notifications/daily-summary/run")
     public ResponseEntity<String> runDailySummary(@RequestParam(required = false) String timezone) {
         if (timezone == null || timezone.isBlank()) {
@@ -45,8 +64,6 @@ public class InternalNotificationController {
             return ResponseEntity.ok("Daily summary sweep triggered for every user whose chosen hour is now.");
         }
 
-        // Validated up front so a typo comes back as a 400 naming the bad zone, rather than surfacing
-        // as a ZoneRulesException from somewhere inside the job.
         if (!ZoneId.getAvailableZoneIds().contains(timezone)) {
             return ResponseEntity.badRequest().body("Unknown timezone: " + timezone
                     + ". Expected an IANA zone id, e.g. America/New_York.");
@@ -54,12 +71,6 @@ public class InternalNotificationController {
 
         log.info("Manual trigger: running the daily summary for timezone {}, bypassing the hour check.", timezone);
 
-        // processUsersForTimezone deliberately does NOT swallow failures - the scheduled sweep wraps
-        // each zone in its own try/catch so one region's outage can't abort the rest, but a caller
-        // asking for one specific zone needs to be told it didn't work. Translated here rather than
-        // left to propagate, because a raw Feign exception surfaces as a bodyless 500 that says
-        // nothing about which downstream was unreachable - and "profile-service isn't running yet"
-        // is by far the most likely reason this endpoint fails in local use.
         try {
             dailyBalanceSummaryJob.processUsersForTimezone(timezone);
         } catch (Exception e) {

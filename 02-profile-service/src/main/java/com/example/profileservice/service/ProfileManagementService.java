@@ -23,6 +23,20 @@ import java.time.Period;
 import java.util.HashMap;
 import java.util.Map;
 
+/**
+ * Owns a user's identity details and their KYC status.
+ *
+ * <p>Submitting a complete identity is what drives verification in this service: there is no
+ * separate "verify me" action. Every path that can change a KYC status — the vendor webhook, a
+ * compliance override, and the demo auto-approval — funnels through {@link #processKycWebhook} so
+ * the status change, the idempotency guard, and the {@code kyc-events} broadcast behave identically
+ * whatever triggered them. Downstream, transaction-service refuses to move money for a user who is
+ * not {@code APPROVED}, so everything here is on the path to a customer being able to transact.
+ *
+ * <p>The phone number is not owned here. auth-service holds the copy that 2FA codes are sent to and
+ * enforces uniqueness on it, so this service writes through to auth-service and stores back what it
+ * answers with, rather than maintaining an independent second copy.
+ */
 @Service
 public class ProfileManagementService {
 
@@ -33,15 +47,11 @@ public class ProfileManagementService {
     private final KafkaTemplate<String, Object> kafkaTemplate;
     private final AuthServiceClient authServiceClient;
 
-    // Kafka Topic Constants
     private static final String PROFILE_EVENTS_TOPIC = "profile-events";
     private static final String KYC_EVENTS_TOPIC = "kyc-events";
 
     private static final int MINIMUM_AGE_YEARS = 18;
 
-    // The same flag that used to gate the Simulate-KYC-Approval button (true in application.yml,
-    // false in application-prod.yml). Reused deliberately: this is the same affordance, just moved
-    // from a fake button onto the real verification form.
     @Value("${app.demo.enabled:false}")
     private boolean demoAutoApprovalEnabled;
 
@@ -55,30 +65,58 @@ public class ProfileManagementService {
         this.authServiceClient = authServiceClient;
     }
 
-    // @Transactional here matters more than it looks, if publishing to kafka down in step 4
-    // ever threw, the db save from step 3 would get rolled back too since both are in one transaction
+    /**
+     * Applies a submitted identity — legal name, date of birth, phone number, and address — and
+     * verifies the applicant off the back of it.
+     *
+     * <p>The order of the steps is the contract, not an implementation detail:
+     *
+     * <ol>
+     *   <li>the current values are snapshotted first, because they are the only record of the
+     *       before-state that consumers get;
+     *   <li>the minimum-age rule is checked next, so a submission that was never going to be
+     *       accepted does not leave a changed phone number behind in auth-service — that write is a
+     *       real side effect on where 2FA codes are delivered and must not be done speculatively;
+     *   <li>the phone number is handed to auth-service, which owns it, <em>before</em> anything is
+     *       written locally and before any approval. Its answer, already in E.164, is what gets
+     *       stored — normalizing a second time here would risk two normalizers drifting apart, and
+     *       the point of the call is that one service is the source of truth. A rejection throws and
+     *       nothing after it runs: no save, no event, and critically no approval;
+     *   <li>only then are the new values saved, the change published, and the applicant
+     *       auto-approved.
+     * </ol>
+     *
+     * <p>All of that is one transaction, so a failure anywhere — including the Kafka publish — rolls
+     * back the local save and the approval together. The auth-service write is the exception: it has
+     * already committed remotely and is not undone, which is why it is ordered after every local
+     * check that could reject the submission.
+     *
+     * <p>Approval only happens where the demo flag permits it and only from
+     * {@code PENDING_VERIFICATION}; see {@link #processKycWebhook} for what a caller can rely on
+     * about the resulting status.
+     *
+     * @param userId never {@code null}; must already have a profile row, and is taken from the
+     *     caller's JWT rather than the request body
+     * @param dto fully validated by bean validation before arrival; the phone number must be one
+     *     auth-service accepts and no other user holds, and the date of birth must put the applicant
+     *     at 18 or over
+     * @throws ResponseStatusException {@code 400} when the applicant is under 18 or auth-service
+     *     cannot resolve the number, {@code 409} when the number is already registered to another
+     *     account, {@code 503} when auth-service cannot be reached or answers without a usable
+     *     number — in every case nothing is saved and no approval is granted
+     * @throws RuntimeException when no profile row exists for {@code userId}
+     */
     @Transactional
     public void updateContactInfo(Long userId, UpdateContactInfoRequestDto dto) {
         UserProfile user = userProfileRepository.findById(userId)
                 .orElseThrow(() -> new RuntimeException("User not found"));
 
-        // 1. Capture the before state for the audit trail
         Map<String, String> oldState = captureOldContactState(user);
 
-        // 2. Local rules first, so a submission that was never going to be accepted doesn't leave a
-        // changed phone number behind in auth-service - that write is a real side effect on the
-        // number 2FA codes get sent to, not something to do speculatively.
         requireApplicantIsAdult(dto.getDateOfBirth());
 
-        // 3. Hand the phone number to auth-service, which owns it, BEFORE anything is written here
-        // and before any KYC approval. It answers with the number in E.164; that answer is what gets
-        // stored, rather than normalizing a second time locally - two normalizers agreeing today is
-        // not a guarantee they agree forever, and the whole point of this call is that there is one
-        // source of truth for this field. If it rejects the number, this throws and nothing below
-        // runs: no save, no Kafka event, and critically no approval.
         String normalizedPhone = registerPhoneNumberWithAuthService(userId, dto.getPhoneNumber());
 
-        // 4. Apply new state
         user.setLegalName(dto.getLegalName());
         user.setDateOfBirth(dto.getDateOfBirth());
         user.setPhoneNumber(normalizedPhone);
@@ -88,28 +126,29 @@ public class ProfileManagementService {
         user.setState(dto.getState());
         user.setZipCode(dto.getZipCode());
 
-        // 5. Save to database
         userProfileRepository.save(user);
 
-        // 6. Publish to Kafka with userId as the routing key
         publishContactInfoChangedEvent(userId, oldState, dto);
 
-        // 7. Submitting a complete identity IS the verification here - the user has given a legal
-        // name, date of birth and address, and every field was validated before reaching this point.
         autoApproveKycIfEligible(userId, user);
     }
 
-    // What the identity form pre-fills from. The phone number comes from auth-service because that is
-    // the copy that matters - showing this service's mirror instead would put the old number back in
-    // front of a user who just changed it, which is exactly the confusion this whole change removes.
-    // Falls back to the local copy only when auth-service can't be reached, so an outage degrades to
-    // a possibly-stale pre-fill rather than an empty form (and an empty form is what gets retyped
-    // wrong).
+    /**
+     * Returns the identity details the profile form pre-fills from.
+     *
+     * <p>The phone number comes from auth-service, the service that owns it; showing this service's
+     * mirror instead would put the old number back in front of a user who has just changed it. When
+     * auth-service cannot be reached the local copy is used instead, so an outage degrades to a
+     * possibly-stale pre-fill rather than a blank form — a blank form is what gets retyped wrong, and
+     * is the original cause of two accounts sharing one number.
+     *
+     * @param userId never {@code null}; a user with no profile row is not an error and no row is
+     *     created for them, unlike the KYC status lookup
+     * @return never {@code null}; every field is {@code null} for a user who has never completed the
+     *     form, which the page renders as the blank form that is correct to show them
+     */
     @Transactional(readOnly = true)
     public ContactInfoResponseDto getContactInfo(Long userId) {
-        // No provisioning on read here, unlike the KYC status lookup: a user with no profile row has
-        // simply never filled this form in, and an all-null response renders as the blank form that
-        // is the correct thing to show them.
         UserProfile user = userProfileRepository.findById(userId).orElse(null);
 
         return new ContactInfoResponseDto(
@@ -130,19 +169,12 @@ public class ProfileManagementService {
                 return response.phoneNumber();
             }
         } catch (RuntimeException e) {
-            // Deliberately swallowed: this is a read used to pre-fill a form. Failing the whole
-            // request would leave the user unable to see their own details because a different
-            // service is down. The write path below does the opposite, and must.
             logger.warn("Could not read the phone number for user id {} from auth-service; falling back "
                     + "to this service's local copy, which may be stale.", userId, e);
         }
         return localProfile == null ? null : localProfile.getPhoneNumber();
     }
 
-    // Returns the E.164 number auth-service accepted and stored. Every failure path here aborts the
-    // caller's transaction - there is no "carry on without it" option, because saving a number
-    // auth-service never agreed to is how the two services started disagreeing about which number
-    // receives a user's login codes.
     private String registerPhoneNumberWithAuthService(Long userId, String rawPhoneNumber) {
         AuthServiceClient.PhoneNumberResponse response;
         try {
@@ -151,16 +183,10 @@ public class ProfileManagementService {
         } catch (ResponseStatusException e) {
             throw translateAuthServiceFailure(e);
         } catch (RuntimeException e) {
-            // Connection refused, timeout, DNS - never reached auth-service at all. Feign raises
-            // these before the ErrorDecoder is ever consulted, so they arrive as something other
-            // than a ResponseStatusException.
             throw phoneNumberUnverifiable(userId, e);
         }
 
         if (response == null || response.phoneNumber() == null || response.phoneNumber().isBlank()) {
-            // A 200 with nothing usable in it means the contract was not honoured. Treated the same
-            // as unreachable rather than guessed at, since the alternative is storing a number that
-            // may not be the one auth-service actually holds.
             throw phoneNumberUnverifiable(userId, null);
         }
 
@@ -169,14 +195,10 @@ public class ProfileManagementService {
 
     private ResponseStatusException translateAuthServiceFailure(ResponseStatusException e) {
         if (e.getStatusCode() == HttpStatus.CONFLICT) {
-            // The bug this whole change exists for: the signup form already answers 409 for a number
-            // someone else holds, and this form used to be a way straight around that rule.
             return new ResponseStatusException(HttpStatus.CONFLICT,
                     "That phone number is already registered to another account");
         }
         if (e.getStatusCode() == HttpStatus.BAD_REQUEST) {
-            // auth-service's own wording, passed through unchanged so the user is told the same
-            // thing here as they would be told at signup.
             return new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getReason());
         }
         return phoneNumberUnverifiable(null, e);
@@ -190,13 +212,9 @@ public class ProfileManagementService {
                 "We couldn't verify your phone number just now. Please try again in a moment.");
     }
 
-    // The DTO's @Past only rejects future dates; the minimum-age rule needs real date arithmetic, so
-    // it lives here. Rejecting rather than silently leaving the profile PENDING_VERIFICATION because
-    // a user who is told nothing would just keep resubmitting the same form wondering why transfers
-    // are still blocked.
     private void requireApplicantIsAdult(LocalDate dateOfBirth) {
         if (dateOfBirth == null) {
-            return; // @NotNull on the DTO already covers this; nothing useful to add here.
+            return;
         }
         if (Period.between(dateOfBirth, LocalDate.now()).getYears() < MINIMUM_AGE_YEARS) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
@@ -204,14 +222,6 @@ public class ProfileManagementService {
         }
     }
 
-    // Stands in for the identity vendor's callback, which is the only thing that would approve a user
-    // in a real deployment (see ProfileController.handleKycWebhook). Gated on app.demo.enabled for
-    // exactly that reason: locally this makes the app usable end to end without a vendor account,
-    // while a real deployment still has to hear from the vendor before any money can move.
-    //
-    // Only ever promotes from PENDING_VERIFICATION. A REJECTED user editing their address must not
-    // be able to clear their own rejection - that decision belongs to the vendor or a compliance
-    // officer's override, not to the applicant.
     private void autoApproveKycIfEligible(Long userId, UserProfile user) {
         if (!demoAutoApprovalEnabled) {
             return;
@@ -220,29 +230,12 @@ public class ProfileManagementService {
             return;
         }
 
-        // Routed through the same method the real webhook uses, so the status change, the idempotency
-        // guard and the kyc-events broadcast all behave identically no matter what triggered it.
-        // This is a self-invocation, so processKycWebhook's own @Transactional is bypassed by the
-        // proxy - which is harmless and in fact wanted here, because updateContactInfo's transaction
-        // is already open and the approval should commit or roll back together with the identity it
-        // was granted on, never on its own.
         processKycWebhook(userId, KycStatus.APPROVED);
     }
 
-    // Every field the identity form can change is snapshotted, because this map is the ONLY record
-    // of the before-value: notification-service diffs it against the submitted DTO to tell the user
-    // what actually changed, and audit-service stores it. While this captured only three fields, a
-    // legal-name or state change was invisible on both sides - the alert could say nothing about it
-    // and the audit trail had nothing to compare against.
-    //
-    // Keys must match the JSON property names on UpdateContactInfoRequestDto, since the consumer
-    // pairs the two by name. HashMap rather than Map.of on purpose: these values are routinely null
-    // for a profile that has never been completed, and Map.of rejects nulls outright.
     private Map<String, String> captureOldContactState(UserProfile user) {
         Map<String, String> oldState = new HashMap<>();
         oldState.put("legalName", user.getLegalName());
-        // ISO yyyy-MM-dd, the same shape @JsonFormat gives the incoming DTO - formatting the two
-        // sides differently would read as a change on every submission that never touched the date.
         oldState.put("dateOfBirth", user.getDateOfBirth() != null ? user.getDateOfBirth().toString() : null);
         oldState.put("phoneNumber", user.getPhoneNumber());
         oldState.put("addressLine1", user.getAddressLine1());
@@ -262,24 +255,65 @@ public class ProfileManagementService {
         kafkaTemplate.send(PROFILE_EVENTS_TOPIC, String.valueOf(userId), event);
     }
 
+    /**
+     * Moves a user to a new KYC status and broadcasts the transition.
+     *
+     * <p>The single point at which a KYC status changes outside a compliance override, used both by
+     * the vendor's signed webhook and by the demo auto-approval, so neither can drift from the other.
+     *
+     * <p>Idempotent: a repeated notification of the status a user already holds returns without
+     * writing or publishing, which matters because vendors retry callbacks and a duplicate would
+     * otherwise re-notify the user of a change that never happened.
+     *
+     * <p>The status change and the {@code kyc-events} publish share one transaction, so a failed
+     * publish rolls the status back rather than leaving this service believing a user is approved
+     * while nothing downstream was told. Called from within {@link #updateContactInfo}, this runs
+     * inside that caller's transaction — the approval commits or rolls back together with the
+     * identity it was granted on, never on its own.
+     *
+     * @param userId never {@code null}; must already have a profile row
+     * @param newStatus applied as given, including a demotion; this method enforces no transition
+     *     rules of its own, so callers that must not clear a {@code REJECTED} verdict have to check
+     *     the current status themselves
+     * @throws RuntimeException when no profile row exists for {@code userId}
+     */
     @Transactional
     public void processKycWebhook(Long userId, KycStatus newStatus) {
         UserProfile user = userProfileRepository.findById(userId)
                 .orElseThrow(() -> new RuntimeException("User not found"));
 
         if (user.getKycStatus() == newStatus) {
-            return; // Idempotent check: Prevent spamming Kafka if status hasn't actually changed
+            return;
         }
 
         KycStatus oldStatus = user.getKycStatus();
         user.setKycStatus(newStatus);
         userProfileRepository.save(user);
 
-        // Broadcast to Notification Service
         KycStatusUpdatedEvent event = new KycStatusUpdatedEvent(userId, oldStatus, newStatus, LocalDateTime.now());
         kafkaTemplate.send(KYC_EVENTS_TOPIC, String.valueOf(userId), event);
     }
 
+    /**
+     * Forces a user's KYC status on a compliance officer's authority and records why.
+     *
+     * <p>The audit entry is written before the status is changed, and both share this transaction
+     * with the {@code kyc-events} publish: there is no ordering in which a status ends up overridden
+     * without an immutable record of who did it and on what grounds. Unlike
+     * {@link #processKycWebhook} this applies unconditionally, including re-asserting a status the
+     * user already holds, because an override is an event worth auditing even when the value does
+     * not move.
+     *
+     * <p>Emits the same event as the webhook path, so consumers cannot distinguish — and do not need
+     * to distinguish — a vendor decision from a manual one.
+     *
+     * @param userId never {@code null}; must already have a profile row
+     * @param adminId never {@code null}; the acting officer from their JWT, recorded in the audit log
+     * @param newStatus any status, including clearing a {@code REJECTED} verdict, which is the whole
+     *     point of an override
+     * @param reason required by the caller and stored verbatim as the audit justification
+     * @throws RuntimeException when no profile row exists for {@code userId}
+     */
     @Transactional
     public void adminOverrideKyc(Long userId, Long adminId, KycStatus newStatus, String reason) {
         UserProfile user = userProfileRepository.findById(userId)
@@ -287,14 +321,11 @@ public class ProfileManagementService {
 
         KycStatus oldStatus = user.getKycStatus();
 
-        // 1. Log the override in the immutable audit table
         recordOverrideAuditLog(userId, adminId, oldStatus, newStatus, reason);
 
-        // 2. Update the user's status
         user.setKycStatus(newStatus);
         userProfileRepository.save(user);
 
-        // 3. Publish the exact same Kafka event as the webhook
         KycStatusUpdatedEvent event = new KycStatusUpdatedEvent(userId, oldStatus, newStatus, LocalDateTime.now());
         kafkaTemplate.send(KYC_EVENTS_TOPIC, String.valueOf(userId), event);
     }
@@ -306,12 +337,38 @@ public class ProfileManagementService {
         auditLogRepository.save(auditLog);
     }
 
-    // =========================================================================================
-    // DTO Records for Kafka Events (Typically placed in a shared library, defined here for clarity)
-    // =========================================================================================
-    // records are a newer java feature, this one line auto generates the constructor, getters,
-    // equals, hashcode and toString, a lot shorter than writing all of that out by hand like the
-    // model classes in the auth service do
+    /**
+     * Announces a change to a user's contact details on the {@code profile-events} topic.
+     *
+     * <p>Defined here rather than in a shared library only because there is no shared library yet.
+     *
+     * @param userId never {@code null}; also used as the partition key so one user's changes stay
+     *     ordered
+     * @param timestamp when the change was applied, in this service's local zone
+     * @param eventType constant discriminator, currently only {@code CONTACT_INFO_CHANGE}
+     * @param changes holds {@code old} and {@code new}: the before-values keyed by the JSON property
+     *     names of {@code UpdateContactInfoRequestDto}, and the submitted DTO itself. Consumers pair
+     *     the two by name, so a key that does not match a DTO property is invisible to them —
+     *     notification-service diffs the pair to tell the user what actually changed and
+     *     audit-service stores it, making {@code old} the only record of the before-state anywhere.
+     *     Values are routinely {@code null} for a profile that was never completed, and dates are
+     *     ISO {@code yyyy-MM-dd} to match the shape of the incoming DTO — formatting the two sides
+     *     differently would read as a change on every submission that never touched the date
+     */
     public record ProfileUpdatedEvent(Long userId, LocalDateTime timestamp, String eventType, Map<String, Object> changes) {}
+
+    /**
+     * Announces a KYC transition on the {@code kyc-events} topic.
+     *
+     * <p>Emitted identically by the vendor webhook, the demo auto-approval, and a compliance
+     * override, and only when the status actually moved except in the override case.
+     *
+     * @param userId never {@code null}; also the partition key
+     * @param oldStatus the status held before the change; never equal to {@code newStatus} on the
+     *     webhook path
+     * @param newStatus the status now in force; transaction-service permits transfers only on
+     *     {@code APPROVED}
+     * @param timestamp when the transition was applied, in this service's local zone
+     */
     public record KycStatusUpdatedEvent(Long userId, KycStatus oldStatus, KycStatus newStatus, LocalDateTime timestamp) {}
 }

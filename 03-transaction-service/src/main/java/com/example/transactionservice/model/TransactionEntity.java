@@ -12,6 +12,22 @@ import jakarta.persistence.Id;
 import jakarta.persistence.PrePersist;
 import jakarta.persistence.Table;
 
+/**
+ * Maps the {@code wire_transactions} table, this service's record of transfers it originated.
+ *
+ * <p>Account-service declares a class of the same name mapping {@code transactions}, its ledger of
+ * per-account movements. The two are unrelated despite the shared simple name: this one owns
+ * {@code wire_transactions} only, and an import of the wrong {@code TransactionEntity} compiles
+ * cleanly while reading a different table.
+ *
+ * <p>The primary key is the client-facing confirmation UUID rather than a generated sequence, so it
+ * is assigned by the caller before persisting and is safe to hand back in a response.
+ *
+ * <p>{@code destinationAccountId} is set only for an "on-us" wire whose IBAN resolved to an account
+ * on this platform, and is {@code null} for a genuinely external wire, where funds leave the
+ * platform and there is nothing to credit. {@code createdAt} is the sort and filter key behind the
+ * History view and is never updated after insert.
+ */
 @Entity
 @Table(name = "wire_transactions")
 public class TransactionEntity {
@@ -42,18 +58,20 @@ public class TransactionEntity {
     @Column(name = "beneficiary_name", length = 100)
     private String beneficiaryName;
 
-    // Set only for "on-us" wires whose IBAN resolved to a real account on this platform; null for
-    // a genuinely external wire (funds conceptually leave the platform, no destination to credit).
     @Column(name = "destination_account_id")
     private Long destinationAccountId;
 
-    // Added after this table's initial creation - the History view needs something to sort/filter
-    // by date on, which wire_transactions never had before now.
     @Column(name = "created_at", nullable = false, updatable = false)
     private LocalDateTime createdAt;
 
     public TransactionEntity() {}
 
+    /**
+     * Stamps {@code createdAt} at insert time when the caller has not already set it.
+     *
+     * <p>An explicitly assigned value is left alone, so a backfill or a fixture can pin its own
+     * timestamp. The column is not updatable, so this is the only chance to set it.
+     */
     @PrePersist
     protected void onCreate() {
         if (this.createdAt == null) {

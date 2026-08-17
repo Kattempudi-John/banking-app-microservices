@@ -13,14 +13,22 @@ import com.example.notificationservice.model.NotificationStatus;
 import com.example.notificationservice.model.NotificationType;
 import com.example.notificationservice.repository.NotificationRecordRepository;
 
-// Consumes the TWO_FA_REQUESTED event auth-service publishes on every login that needs a 2FA code.
-// Delivery moved from SMS to email, which is why this class is no longer TwoFactorSmsListener: the
-// code now goes out through the same SendGrid/Twilio email path the alerts and summaries already use,
-// so 2FA stops being the one channel needing its own paid provider and its own phone number on file.
-//
-// The event still carries phoneNumber - auth-service publishes the whole contact set - and this
-// listener deliberately ignores it. Reading it would only invite a future "fall back to SMS" branch
-// that dispatches a live credential over a second channel nobody asked for.
+/**
+ * Emails a login verification code in response to the {@code TWO_FA_REQUESTED} event auth-service
+ * publishes.
+ *
+ * <p>Delivery moved from SMS to email, which is why this is no longer {@code TwoFactorSmsListener}:
+ * the code goes out over the same email path the alerts and summaries use, so 2FA no longer needs
+ * its own paid provider or a phone number on file. The event still carries {@code phoneNumber} and
+ * this listener deliberately ignores it — reading it invites a "fall back to SMS" branch that would
+ * dispatch a live credential over a second channel nobody asked for.
+ *
+ * <p>Two different strings are built per event on purpose: the code goes to the email provider,
+ * while what is persisted is a masked line naming only the address. That keeps the verification code
+ * out of {@code GET /api/v1/notifications}, a page the user — or anyone holding their session — can
+ * reopen long afterwards. An audit trail should record that a one-time code was sent, not its
+ * contents.
+ */
 @Service
 public class TwoFactorEmailListener {
 
@@ -28,10 +36,6 @@ public class TwoFactorEmailListener {
 
     private static final String EMAIL_SUBJECT = "Your verification code";
 
-    // The TTL auth-service currently issues, duplicated here only as a fallback. The event is the
-    // source of truth; this exists so an event that predates the expiresInSeconds key (or arrives
-    // from a producer that has not been redeployed yet) still produces a sentence rather than an
-    // exception. Keep it equal to application.security.two-factor.code-ttl-seconds' default.
     private static final long DEFAULT_TTL_SECONDS = 180L;
 
     private final NotificationProviderService notificationProviderService;
@@ -43,6 +47,24 @@ public class TwoFactorEmailListener {
         this.notificationRecordRepository = notificationRecordRepository;
     }
 
+    /**
+     * Consumes a {@code notification-events} message and emails the verification code it carries.
+     *
+     * <p>Ignores every message whose {@code action} is not {@code TWO_FA_REQUESTED}; the topic
+     * carries other traffic.
+     *
+     * <p>Writes a {@code NotificationRecord} either way — {@code SENT}, or {@code FAILED} when the
+     * user has no address on file or the provider gave up. Success is read from
+     * {@code dispatchEmail}'s boolean return, not from the absence of an exception, because its
+     * recovery path swallows the failure.
+     *
+     * <p>Never throws. A failure is logged and the message treated as consumed, since an exception
+     * escaping a Kafka listener redelivers it forever and stalls every code queued behind it.
+     *
+     * @param event must carry a numeric {@code userId}, an {@code email} and a {@code code}; an
+     *     absent or blank {@code email} is recorded as a failed send rather than passed to the
+     *     provider
+     */
     @KafkaListener(topics = "notification-events", groupId = "notification-service-group")
     public void consumeTwoFactorRequest(Map<String, Object> event) {
         try {
@@ -54,20 +76,10 @@ public class TwoFactorEmailListener {
             String email = (String) event.get("email");
             String code = (String) event.get("code");
 
-            // The login screen counts this exact TTL down next to the code entry box, so the sentence
-            // in the email has to come from the same number rather than a literal. Hardcoding it is
-            // what put "It expires in 5 minutes." next to a timer that ran out at 3:00 - the user
-            // reads the email, believes they have two minutes left, and gets EXPIRED instead.
             long ttlSeconds = readTtlSeconds(event);
 
-            // Two different strings on purpose. The first is the real email and has to carry the code;
-            // the second is what gets written to notification_records, and must not.
             String htmlBody = buildHtmlBody(code, ttlSeconds);
 
-            // A login that needs a code and an account with no address to send it to is a dead end, so
-            // record the miss and stop rather than handing the provider a blank recipient - the same
-            // way TransactionAlertListener and DailyBalanceSummaryJob treat a missing address. Silence
-            // here would leave the user staring at a code entry box with nothing explaining why.
             if (email == null || email.isBlank()) {
                 logger.warn("User {} has no email address on file - the 2FA code could not be delivered", userId);
                 persistRecord(userId, "Verification code could not be sent - no email address on file.",
@@ -75,9 +87,6 @@ public class TwoFactorEmailListener {
                 return;
             }
 
-            // dispatchEmail's @Recover swallows the exception after exhausting retries (same return
-            // type as the retried method), so its boolean return - not a caught exception - is
-            // what actually tells us whether this ultimately succeeded.
             boolean dispatched = notificationProviderService.dispatchEmail(email, EMAIL_SUBJECT, htmlBody);
             NotificationStatus status = dispatched ? NotificationStatus.SENT : NotificationStatus.FAILED;
 
@@ -85,21 +94,12 @@ public class TwoFactorEmailListener {
                 logger.info("Notification Service: 2FA code emailed to {}", maskEmail(email));
             }
 
-            // The record used to store the message body verbatim, which put a live login credential
-            // into GET /api/v1/notifications - a page the user (or anyone who got hold of their
-            // session) could reopen long afterwards and read the code straight off (see V3). The codes
-            // expire in minutes, so this was a narrow window rather than a standing key, but a
-            // one-time code is exactly the kind of thing an audit trail should record the sending of,
-            // not the content. Moving to email changes nothing about that - only which identifier gets
-            // masked in the line that is stored instead.
             persistRecord(userId, "Verification code sent to %s.".formatted(maskEmail(email)), status);
         } catch (Exception e) {
             logger.error("Failed to process 2FA email event", e);
         }
     }
 
-    // Text block rather than concatenation, matching TransactionAlertListener and
-    // DailyBalanceSummaryJob - the markup reads as markup and no quote in it needs escaping.
     private String buildHtmlBody(String code, long ttlSeconds) {
         return """
                <html>
@@ -116,16 +116,9 @@ public class TwoFactorEmailListener {
                """.formatted(code, describeExpiry(ttlSeconds));
     }
 
-    // The TTL arrives as a String in a Map<String,Object> whose values this service does not control,
-    // so every failure mode is a fallback rather than a throw: auth-service and notification-service
-    // deploy independently, and a listener that blew up on a missing key would drop every in-flight
-    // code the moment one of the two shipped first. Number is handled alongside String because a JSON
-    // deserializer is free to hand back an Integer for an unquoted value, and "180".toString() and
-    // 180.toString() have to land in the same place.
     private long readTtlSeconds(Map<String, Object> event) {
         Object raw = event.get("expiresInSeconds");
         if (raw == null) {
-            // Not an error worth a warn: this is exactly what an old producer looks like.
             return DEFAULT_TTL_SECONDS;
         }
         if (raw instanceof Number number) {
@@ -134,8 +127,6 @@ public class TwoFactorEmailListener {
         }
         try {
             long parsed = Long.parseLong(raw.toString().trim());
-            // Zero or negative would render "It expires in 0 minutes." - a sentence that is worse
-            // than the default, since the code being mailed is demonstrably still live.
             return parsed > 0 ? parsed : DEFAULT_TTL_SECONDS;
         } catch (NumberFormatException e) {
             logger.warn("Unparseable expiresInSeconds '{}' on a 2FA event - falling back to {}s", raw,
@@ -144,11 +135,6 @@ public class TwoFactorEmailListener {
         }
     }
 
-    // Renders the TTL the way a person would say it. Whole minutes are the normal case (180 -> "3
-    // minutes"), but the value comes from config and nothing stops it being 90 or 45, so the odd
-    // shapes get a correct sentence too instead of an integer-divided "1 minute" that undersells how
-    // long the user actually has. Singulars are spelled out because "It expires in 1 minutes." is the
-    // kind of thing that makes a real email look like a phishing attempt.
     private String describeExpiry(long ttlSeconds) {
         long minutes = ttlSeconds / 60;
         long seconds = ttlSeconds % 60;
@@ -166,19 +152,12 @@ public class TwoFactorEmailListener {
         return value + " " + unit + (value == 1 ? "" : "s");
     }
 
-    // "user@example.com" -> "u***@example.com", the email counterpart of the "***4567" the phone
-    // number used to get: enough for the reader to recognise their own address, not enough for the
-    // stored row to republish it. Defensive about odd or missing input because this feeds a record
-    // written inside a Kafka listener - throwing here would abandon the audit row for a send that
-    // already happened.
     private String maskEmail(String email) {
         if (email == null || email.isBlank()) {
             return "the email address on file";
         }
         int at = email.indexOf('@');
         if (at <= 0) {
-            // No local part to keep - either no "@" at all or an address that starts with one. There
-            // is nothing safe to show, and inventing a shape for a malformed address helps nobody.
             return "***";
         }
         return email.charAt(0) + "***" + email.substring(at);

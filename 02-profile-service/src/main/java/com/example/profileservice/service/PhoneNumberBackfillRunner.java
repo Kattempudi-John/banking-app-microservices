@@ -14,10 +14,14 @@ import com.example.profileservice.model.UserProfile;
 import com.example.profileservice.repository.UserProfileRepository;
 import com.example.profileservice.util.PhoneNumberNormalizer;
 
-// Mirrors auth-service's runner of the same name, for this service's own copy of the phone number.
-// Profiles provisioned from a "user-events" message before registration normalized its input hold
-// whatever the user originally typed, so they're brought into the same E.164 shape here - otherwise
-// the Profile page would keep displaying a number in a format the platform no longer accepts.
+/**
+ * Rewrites historical profile phone numbers into E.164 form once at startup.
+ *
+ * <p>Profiles provisioned from a {@code user-events} message before registration normalized its
+ * input hold whatever the user originally typed, so the Profile page would keep displaying numbers
+ * in a format the platform no longer accepts. Mirrors auth-service's runner of the same name, for
+ * this service's own copy of the field.
+ */
 @Component
 public class PhoneNumberBackfillRunner implements ApplicationRunner {
 
@@ -32,7 +36,16 @@ public class PhoneNumberBackfillRunner implements ApplicationRunner {
         this.phoneNumberNormalizer = phoneNumberNormalizer;
     }
 
-    // Best-effort housekeeping on historical rows - never allowed to stop the service booting.
+    /**
+     * Runs the backfill during startup, logging rather than propagating any failure.
+     *
+     * <p>Departs from the usual {@code ApplicationRunner} contract on purpose: an exception here is
+     * swallowed instead of aborting the boot, because this is best-effort housekeeping on historical
+     * rows and a service that refuses to start is far worse than one holding a few numbers in their
+     * original format.
+     *
+     * @param args unused; the backfill covers every stored profile and takes no parameters
+     */
     @Override
     public void run(ApplicationArguments args) {
         try {
@@ -43,6 +56,18 @@ public class PhoneNumberBackfillRunner implements ApplicationRunner {
         }
     }
 
+    /**
+     * Normalizes every stored profile phone number that is not already in E.164 form.
+     *
+     * <p>Scans and saves the whole {@code user_profiles} table inside one transaction, so either
+     * every rewritten number is committed or none is; there is no partial backfill to reason about.
+     * Rows whose number cannot be resolved unambiguously are left exactly as they are and reported
+     * by user id in a warning, rather than guessed at — an incorrectly "fixed" number is a login
+     * code delivered to a stranger.
+     *
+     * <p>Safe to run repeatedly: already-normalized and blank numbers are skipped, so a second pass
+     * writes nothing.
+     */
     @Transactional
     public void backfillPhoneNumbers() {
         List<UserProfile> updated = new ArrayList<>();
@@ -57,7 +82,6 @@ public class PhoneNumberBackfillRunner implements ApplicationRunner {
             String normalized = phoneNumberNormalizer.normalize(stored).orElse(null);
 
             if (normalized == null) {
-                // Ambiguous input - left untouched rather than guessed at, and named in the log.
                 unfixable.add(profile.getId());
                 continue;
             }

@@ -26,71 +26,86 @@ import javax.crypto.spec.SecretKeySpec;
 import java.util.Base64;
 import java.util.List;
 
+/**
+ * Wires the HTTP security chain, the JWT verifier, and the browser CORS policy for this service.
+ *
+ * <p>{@link InternalTokenFilter} is constructed by hand inside the chain rather than declared as a
+ * {@code @Component}. Any {@code Filter} that is also a bean is auto-registered by Boot across the
+ * <em>whole</em> servlet chain, so it would run twice per request — once inside this chain and once
+ * outside it. Do not "simplify" it into a component.
+ */
 @Configuration
 @EnableWebSecurity
 @EnableMethodSecurity
 public class SecurityConfig {
 
-    // Same base64-encoded HMAC secret auth-service signs tokens with (shared via the
-    // JWT_SECRET_KEY k8s secret in prod, see application-prod.yml) so this service can verify
-    // a token's signature on its own, without ever calling back to auth-service.
     @Value("${application.security.jwt.secret-key:404E635266556A586E3272357538782F413F4428472B4B6250645367566B5970}")
     private String secretKey;
 
-    // Shared secret every service in this project presents on its /api/v1/internal/** calls, same
-    // property name and same dev default in all five so docker-compose still starts with no config.
     @Value("${application.security.internal-token:local-dev-internal-token}")
     private String internalToken;
 
+    /**
+     * Builds the stateless filter chain: internal shared-secret check first, bearer token second.
+     *
+     * <p>{@code InternalTokenFilter} is placed <em>before</em> {@code BearerTokenAuthenticationFilter}
+     * so a service-to-service request is settled on its shared secret before any token parsing runs;
+     * those callers hold no user token to parse. Reversing the order rejects every internal caller.
+     *
+     * <p>Everything under {@code /api/v1/internal/**} is {@code permitAll} at the authorize layer on
+     * purpose — the filter is what gates it, and requiring authentication here would reject callers
+     * that have no user JWT to present. The corollary is a hard rule: every unauthenticated endpoint
+     * MUST live under that one prefix, because the k8s ingress refuses to route it by path prefix. An
+     * endpoint permitted anywhere else is published straight to the internet.
+     *
+     * <p>The {@code ERROR} dispatcher type is permitted so that Spring's internal re-dispatch to
+     * {@code /error} can render a response body. Without it every 400/403/404 — including
+     * {@code INSUFFICIENT_FUNDS} and ownership failures that transaction-service relays to the user —
+     * came back as a bodyless 401. Permitting the dispatch type rather than the {@code "/error"} path
+     * keeps {@code /error} from being reachable as a public endpoint of its own.
+     *
+     * <p>Authorization rules stop at {@code anyRequest().authenticated()} deliberately;
+     * {@code @PreAuthorize("hasAuthority('SCOPE_FULL_AUTH')")} on the controllers is what enforces
+     * the scope requirement, and duplicating it here would mean two places to keep in sync.
+     *
+     * @param http never {@code null}; supplied by Spring Security's builder
+     * @return the built chain
+     * @throws Exception when the underlying builder fails to assemble the chain
+     */
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
         http
             .csrf(AbstractHttpConfigurer::disable)
-            // Allow the Angular dev server (and later, its deployed origin) to call this API
-            // cross-origin, including sending the Authorization header on credentialed requests.
             .cors(cors -> cors.configurationSource(corsConfigurationSource()))
             .authorizeHttpRequests(auth -> auth
-                // When a handler throws, Spring re-dispatches the request internally to /error to
-                // render the response body. That dispatch was being authorized like a fresh request,
-                // so with nothing permitting it every 400/403/404 came back as a bodyless 401 instead
-                // - including INSUFFICIENT_FUNDS and ownership failures, which transaction-service
-                // relays to the user. Permitting the ERROR dispatch specifically (rather than the
-                // "/error" path) keeps /error from being reachable as a public endpoint on its own.
                 .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
-                // Internal, service-to-service only endpoints (transaction-service's transfer/
-                // debit/credit calls, notification-service's balances-batch lookup) - not reachable
-                // via the k8s ingress, so no end-user JWT is ever available to satisfy SCOPE_FULL_AUTH here.
-                // Everything permitted here MUST live under this one prefix: the ingress routes by
-                // path prefix, so an unauthenticated endpoint anywhere else (balances/batch used to be
-                // under /api/v1/accounts) is an endpoint published straight to the internet.
-                // Still permitAll, on purpose: InternalTokenFilter below is what gates these, and
-                // requiring authentication here instead would reject every caller outright, since
-                // the services calling in hold no user token to present.
                 .requestMatchers("/api/v1/internal/**").permitAll()
-                // Swagger/OpenAPI UI - documentation, not application data
                 .requestMatchers("/swagger-ui/**", "/swagger-ui.html", "/v3/api-docs/**").permitAll()
-                // simplest possible rule set here, just one line, since @PreAuthorize on the
-                // controller itself is what actually enforces the full auth scope requirement
                 .anyRequest().authenticated()
             )
             .sessionManagement(session -> session
                 .sessionCreationPolicy(SessionCreationPolicy.STATELESS)
             )
-            // Validates the bearer token against the JwtDecoder bean below and populates the
-            // SecurityContext with a JwtAuthenticationToken, whose authorities come from the
-            // token's "scope" claim (e.g. "FULL_AUTH" -> SCOPE_FULL_AUTH) — this is what
-            // @PreAuthorize("hasAuthority('SCOPE_FULL_AUTH')") on AccountController checks against.
             .oauth2ResourceServer(oauth2 -> oauth2.jwt(Customizer.withDefaults()))
-            // Placed before the JWT authentication filter so an internal request is rejected on its
-            // shared secret before any token parsing happens - internal callers have no bearer token
-            // to parse anyway. Constructed by hand rather than registered as a @Component: any Filter
-            // that is also a bean gets auto-registered by Boot across the WHOLE servlet chain, so it
-            // would then run twice per request, once inside this chain and once outside it.
             .addFilterBefore(new InternalTokenFilter(internalToken), BearerTokenAuthenticationFilter.class);
 
         return http.build();
     }
 
+    /**
+     * Builds the HS256 verifier the resource server authenticates bearer tokens with.
+     *
+     * <p>The key is the same base64-encoded HMAC secret auth-service signs with, shared in
+     * production through the {@code JWT_SECRET_KEY} k8s secret. Symmetric signing is what lets this
+     * service verify a token entirely on its own, with no callback to auth-service on the hot path;
+     * the flip side is that rotating the secret must happen in both services together.
+     *
+     * <p>Authorities on the resulting authentication come from the token's {@code scope} claim
+     * ({@code "FULL_AUTH"} becomes {@code SCOPE_FULL_AUTH}), which is what the controllers'
+     * {@code @PreAuthorize} expressions match on.
+     *
+     * @return a decoder pinned to {@code HS256}; a token signed with any other algorithm is rejected
+     */
     @Bean
     public JwtDecoder jwtDecoder() {
         byte[] keyBytes = Base64.getDecoder().decode(secretKey);
@@ -98,6 +113,15 @@ public class SecurityConfig {
         return NimbusJwtDecoder.withSecretKey(key).macAlgorithm(MacAlgorithm.HS256).build();
     }
 
+    /**
+     * Defines the browser CORS policy for the customer-facing API.
+     *
+     * <p>Origins are an explicit allow-list rather than a wildcard because credentials are enabled,
+     * and the two cannot be combined: a wildcard origin makes the browser drop the response. A new
+     * deployed frontend origin has to be added here or its calls fail preflight.
+     *
+     * @return a source applying the same policy to every path
+     */
     @Bean
     public CorsConfigurationSource corsConfigurationSource() {
         CorsConfiguration configuration = new CorsConfiguration();

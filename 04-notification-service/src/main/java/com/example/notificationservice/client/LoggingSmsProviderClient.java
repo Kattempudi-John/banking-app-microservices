@@ -5,9 +5,17 @@ import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
-// default SMS provider so local dev (and CI) never needs a real SMS account or any credentials -
-// active unless sms.provider names a real one, mirroring LoggingEmailProviderClient.
-// matchIfMissing is what makes "no configuration at all" land here rather than failing to start.
+/**
+ * Pretends to deliver SMS by writing the payload to the log instead of contacting a provider.
+ *
+ * <p>Selected when {@code sms.provider=logging}, and — because of {@code matchIfMissing = true} —
+ * also whenever the property is absent altogether, so a service with no SMS credentials starts
+ * cleanly rather than failing. Naming {@code twilio} or {@code textbelt} deselects this bean, so
+ * exactly one {@link SmsProviderClient} is ever in the context.
+ *
+ * <p>Mirrors {@link LoggingEmailProviderClient}: every send succeeds and nothing leaves the
+ * process, so this default must not be left in place anywhere real messages are expected.
+ */
 @Component
 @ConditionalOnProperty(name = "sms.provider", havingValue = "logging", matchIfMissing = true)
 public class LoggingSmsProviderClient implements SmsProviderClient {

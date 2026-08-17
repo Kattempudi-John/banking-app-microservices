@@ -4,14 +4,23 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.cloud.openfeign.EnableFeignClients;
 
-// @EnableFeignClients has to go on this main class (or somewhere spring scans) or
-// AuthServiceClient never actually gets wired up as a real bean anywhere
+/**
+ * Boots the profile service and its component scan.
+ *
+ * <p>Feign client scanning is enabled from this class because it is the root of the scanned package
+ * tree; moved anywhere Spring does not scan, {@code AuthServiceClient} is never wired as a bean and
+ * the context fails to start on the missing dependency.
+ */
 @SpringBootApplication
 @EnableFeignClients
 public class ProfileServiceApplication {
 
-	// same pattern as every other service's main method, boots the embedded server and the
-	// whole spring context, this class is what maven builds into the runnable jar's manifest
+	/**
+	 * Starts the Spring context and the embedded server.
+	 *
+	 * @param args forwarded to Spring Boot verbatim, so {@code --spring.profiles.active} and other
+	 *     property overrides given on the command line take effect
+	 */
 	public static void main(String[] args) {
 		SpringApplication.run(ProfileServiceApplication.class, args);
 	}

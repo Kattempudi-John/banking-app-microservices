@@ -16,10 +16,22 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
-// Real email delivery via SendGrid (Twilio's email product, separate API and separate key from the
-// SMS credentials) - active when email.provider=sendgrid, mutually exclusive with the logging client.
-// Carries every notification this service sends, 2FA codes included since they moved off SMS - which
-// makes a failure here a login nobody can complete, not just an alert nobody reads.
+/**
+ * Delivers email through the classic SendGrid v3 {@code mail/send} API.
+ *
+ * <p>Selected when {@code email.provider=sendgrid}, which deselects
+ * {@link LoggingEmailProviderClient} and {@link TwilioEmailProviderClient} so Spring only ever has
+ * one {@link EmailProviderClient} candidate. SendGrid is Twilio's email product but a separate API
+ * with its own key: {@code email.sendgrid.api-key} is unrelated to the {@code sms.twilio.*}
+ * credentials, unlike {@link TwilioEmailProviderClient}, which reuses them.
+ *
+ * <p>Selecting this provider makes the application refuse to start unless
+ * {@code email.sendgrid.api-key} and {@code email.sendgrid.from-email} are both set; see
+ * {@link #initialiseClient()}. That is deliberate — this client carries every notification the
+ * service sends, 2FA codes included since those moved off SMS, so a misconfiguration here is a
+ * login nobody can complete rather than an alert nobody reads, and it is better found at boot than
+ * inside a Kafka listener.
+ */
 @Component
 @ConditionalOnProperty(name = "email.provider", havingValue = "sendgrid")
 public class SendGridEmailProviderClient implements EmailProviderClient {
@@ -31,15 +43,34 @@ public class SendGridEmailProviderClient implements EmailProviderClient {
     private final String fromEmail;
     private SendGrid sendGrid;
 
+    /**
+     * Captures the SendGrid credentials without contacting SendGrid.
+     *
+     * <p>Both properties carry an empty-string default so that a missing value reaches
+     * {@link #initialiseClient()} and is reported by property name, rather than failing earlier as
+     * an unresolvable placeholder that names nothing useful.
+     *
+     * @param apiKey the {@code email.sendgrid.api-key} value; blank here is tolerated only until
+     *     {@code @PostConstruct} runs
+     * @param fromEmail the {@code email.sendgrid.from-email} value; must be an address verified as a
+     *     sender in the SendGrid account or every send is rejected at delivery time
+     */
     public SendGridEmailProviderClient(@Value("${email.sendgrid.api-key:}") String apiKey,
                                        @Value("${email.sendgrid.from-email:}") String fromEmail) {
         this.apiKey = apiKey;
         this.fromEmail = fromEmail;
     }
 
-    // Same reasoning as TwilioSmsProviderClient: fail at boot with a message naming the missing
-    // property, rather than discovering it inside a Kafka listener where it becomes a silently
-    // undelivered alert.
+    /**
+     * Verifies the credentials are present and builds the SendGrid client.
+     *
+     * <p>Runs during context refresh, so a blank property brings the whole application down at boot
+     * with a message naming it. The alternative — discovering it on the first send — turns a typo
+     * into a notification that is silently never delivered.
+     *
+     * @throws IllegalStateException when {@code email.sendgrid.api-key} or
+     *     {@code email.sendgrid.from-email} is missing or blank
+     */
     @PostConstruct
     void initialiseClient() {
         requireConfigured(apiKey, "email.sendgrid.api-key");
@@ -57,10 +88,25 @@ public class SendGridEmailProviderClient implements EmailProviderClient {
         }
     }
 
+    /**
+     * Posts the message to SendGrid and treats any non-2xx response as a failure.
+     *
+     * <p>The status check is not redundant: the SendGrid SDK returns a {@link Response} for
+     * rejections instead of throwing, so without it a 401 or a 400 would be logged as a successful
+     * send. A success is 202 Accepted, meaning queued rather than delivered.
+     *
+     * <p>The body is always sent as {@code text/html} with no plain-text alternative, because every
+     * caller in this service composes an HTML document.
+     *
+     * @param userEmail the recipient address, passed through unvalidated for SendGrid to reject
+     * @param subject plain text; markup here is rejected by the provider
+     * @param htmlContent an HTML document, sent verbatim as the only body part
+     * @throws RuntimeException when SendGrid answers outside 2xx or the call fails in transport;
+     *     unchecked on purpose so {@code NotificationProviderService} retries it and, once the
+     *     attempts are spent, records a {@code FAILED} notification
+     */
     @Override
     public void send(String userEmail, String subject, String htmlContent) {
-        // Every caller builds an HTML body (see the text blocks in TransactionAlertListener and
-        // DailyBalanceSummaryJob), so text/html is always the right content type here.
         Mail mail = new Mail(new Email(fromEmail), subject, new Email(userEmail), new Content("text/html", htmlContent));
 
         Request request = new Request();
@@ -71,8 +117,6 @@ public class SendGridEmailProviderClient implements EmailProviderClient {
             request.setBody(mail.build());
             Response response = sendGrid.api(request);
 
-            // SendGrid answers 202 Accepted on success. Anything outside the 2xx range means the
-            // message was rejected, and the body explains why - surface it rather than assuming sent.
             if (response.getStatusCode() < 200 || response.getStatusCode() >= 300) {
                 throw new RuntimeException("SendGrid rejected the message with status "
                         + response.getStatusCode() + ": " + response.getBody());
@@ -81,8 +125,6 @@ public class SendGridEmailProviderClient implements EmailProviderClient {
             log.info("SUCCESS: Email dispatched via SendGrid. To: [{}], Subject: {}, status: {}",
                     userEmail, subject, response.getStatusCode());
         } catch (IOException e) {
-            // Rethrown unchecked so NotificationProviderService's @Retryable retries it and its
-            // @Recover records a FAILED NotificationRecord once the attempts are exhausted.
             throw new RuntimeException("SendGrid email send failed: " + e.getMessage(), e);
         }
     }

@@ -4,26 +4,36 @@ import java.time.LocalDate;
 
 import jakarta.persistence.*;
 
+/**
+ * A customer's contact details, identity fields, and KYC standing.
+ *
+ * <p>The identifier is <em>not</em> generated: it is assigned from the user's auth-service id, so a
+ * profile saved without one first is rejected rather than given a fresh key. That shared id is what
+ * lets other services look a profile up without a second lookup by email.
+ *
+ * <p>{@code email} is copied from the {@code user-events} registration message rather than fetched
+ * from auth-service on each send — notification-service already calls this service for a user's
+ * alert preferences, so carrying the address on that response costs nothing extra.
+ *
+ * <p>{@code legalName} and {@code dateOfBirth} are the identity half of KYC: an address alone
+ * verifies nothing, so they are collected with the contact fields and are what gates automatic
+ * approval in {@code ProfileManagementService}. Both are nullable, because every profile created
+ * before they existed has neither and those users stay {@link KycStatus#PENDING_VERIFICATION} until
+ * they complete the form.
+ *
+ * <p>The status is persisted as its name rather than its ordinal, so reordering the enum constants
+ * cannot silently reinterpret stored rows.
+ */
 @Entity
 @Table(name = "user_profiles")
 public class UserProfile {
 
-    // no @GeneratedValue on this @Id, learned this means the id has to be assigned manually
-    // before saving, this entity's id is meant to be the same as the user's id from auth-service
     @Id
     private Long id;
 
     private String phoneNumber;
-    // Copied from the user-events registration message. Lives here rather than being fetched from
-    // auth-service on every send, because notification-service already calls this service for a
-    // user's alert preferences - carrying the address on that same response costs nothing extra.
     private String email;
 
-    // The identity half of KYC. An address on its own verifies nothing - who someone is and when
-    // they were born is what an identity vendor actually checks - so these are collected together
-    // with the contact fields and are what gates the automatic approval in ProfileManagementService.
-    // Nullable because every profile that existed before this was added has neither, and those users
-    // stay PENDING_VERIFICATION until they fill the form in.
     private String legalName;
     private LocalDate dateOfBirth;
 
@@ -33,9 +43,6 @@ public class UserProfile {
     private String state;
     private String zipCode;
 
-    // @Enumerated(EnumType.STRING) stores the actual word like "PENDING_VERIFICATION" in the
-    // db column instead of a plain number, a little more storage but way easier to read in
-    // the database directly and safer if enum values ever get reordered
     @Enumerated(EnumType.STRING)
     private KycStatus kycStatus = KycStatus.PENDING_VERIFICATION;
 

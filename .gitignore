@@ -66,3 +66,4 @@ prompts/
 # second source of truth alongside README.md
 CLAUDE.md
 docs/ARCHITECTURE.md
+docs/DESIGN-NOTES.md

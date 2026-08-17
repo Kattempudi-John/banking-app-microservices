@@ -9,8 +9,19 @@ import org.springframework.web.bind.annotation.RequestBody;
 import java.math.BigDecimal;
 import java.util.List;
 
-// second feign client in this service, same declarative pattern as ProfileServiceClient below,
-// just pointed at a different downstream service and url property
+/**
+ * Reads balances and account ownership from account-service.
+ *
+ * <p>A declarative Feign client — the implementation is generated at runtime, unlike
+ * {@link EmailProviderClient} and {@link SmsProviderClient} in the same package, which are plain
+ * interfaces with hand-written implementations. The base URL comes from
+ * {@code account-service.url}, defaulting to {@code http://localhost:8083} for local runs.
+ *
+ * <p>Both endpoints live under {@code /api/v1/internal/} so the Kubernetes ingress does not route
+ * them publicly. They are unauthenticated by necessity — a service-to-service call carries no
+ * end-user token — and one of them answers with users' total balances, so that path prefix is the
+ * only thing keeping them off the public internet.
+ */
 @FeignClient(name = "account-service", url = "${account-service.url:http://localhost:8083}")
 public interface AccountServiceClient {
 
@@ -21,20 +32,33 @@ public interface AccountServiceClient {
 
     record AccountOwnerResponse(Long ownerUserId) {}
 
-    // Moved under /api/v1/internal/ so the k8s ingress stops routing it publicly - it answers with
-    // users' total balances and is unauthenticated by necessity, since there's no end-user token on a
-    // service-to-service call.
+    /**
+     * Fetches the total balance across all accounts for each of the given users, in one call.
+     *
+     * @param userIds the users to total; sent as a request body rather than a query string because
+     *     the daily-summary sweep passes the whole opted-in population
+     * @return one entry per user account-service could resolve, so the result may be shorter than
+     *     the input and is not ordered to match it
+     */
     @PostMapping("/api/v1/internal/accounts/balances/batch")
     List<UserAggregateBalanceResponse> getAggregateBalancesBatch(@RequestBody List<Long> userIds);
 
-    // "Whose account is this?" - the first half of naming the counterparty on a transaction alert
-    // (the second half is AuthServiceClient.getDisplayName). The transfer event carries account IDs
-    // only, and an account ID belongs to a different ID sequence than a user ID, so it cannot be
-    // used as one. Same endpoint transaction-service already calls for its recipient checks.
-    //
-    // It answers with the owner and nothing else, which is also what makes the own-transfer case
-    // detectable: an owner equal to the alerted user means money moved between that user's own two
-    // accounts, not out to a stranger.
+    /**
+     * Resolves which user owns an account.
+     *
+     * <p>This is the first half of naming the counterparty on a transaction alert; the second half
+     * is {@link AuthServiceClient#getDisplayName}. It is needed because a transfer event carries
+     * account IDs only, and account IDs come from a different sequence than user IDs, so one can
+     * never be used as the other.
+     *
+     * <p>The owner is also what makes a self-transfer detectable: an owner equal to the alerted user
+     * means money moved between two of that user's own accounts rather than out to a stranger, which
+     * callers use to suppress or reword the alert.
+     *
+     * @param accountId an existing account ID; an unknown one is a 404 from account-service, which
+     *     Feign surfaces as an exception rather than a {@code null} result
+     * @return the owning user, carrying no other account detail
+     */
     @GetMapping("/api/v1/internal/accounts/{accountId}/owner")
     AccountOwnerResponse getAccountOwner(@PathVariable("accountId") Long accountId);
 }

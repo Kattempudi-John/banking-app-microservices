@@ -5,23 +5,44 @@ import org.springframework.stereotype.Component;
 import com.example.accountservice.dto.AccountOverviewResponseDto;
 import com.example.accountservice.model.AccountEntity;
 
-// separating this mapping logic into its own @component instead of stuffing it into the service
-// or the entity keeps the entity to db mapping and the entity to api response mapping independent
+/**
+ * Converts account entities into the response shape the API hands back, masking the account number.
+ *
+ * <p>Kept as its own component rather than folded into the service or the entity so that the
+ * entity-to-database mapping and the entity-to-API mapping can change independently.
+ */
 @Component
 public class AccountMapper {
 
-    // SWIFT/BIC identifies the institution, not the individual account - every account here
-    // shares this one value, the same way they all share DEFAULT_ROUTING_NUMBER.
-    // Format: 4-char bank code + 2-char country code (6 letters total) + 2-char location code -
-    // matches transaction-service's IbanSwiftValidator/ExternalWireRequestDto validation, which
-    // requires the first 6 characters to be letters only.
-    // Public because transaction-service has to know which BIC belongs to this platform before it
-    // will accept a wire aimed at one of our IBANs, and it asks for it through the internal IBAN
-    // lookup rather than declaring a second copy of the string. A wire carries an IBAN and a BIC
-    // that are supposed to identify the same bank; a duplicated constant that drifted would make
-    // that check quietly compare against the wrong bank.
+    /**
+     * This platform's own SWIFT/BIC, shared by every account rather than issued per account.
+     *
+     * <p>A BIC identifies the institution, the same way {@code DEFAULT_ROUTING_NUMBER} does.
+     * Public because transaction-service must know which BIC belongs to this platform before it
+     * will accept a wire aimed at one of these IBANs, and it reads the value through the internal
+     * IBAN lookup instead of declaring a second copy. A wire carries an IBAN and a BIC that are
+     * supposed to name the same bank; a duplicated constant that drifted would make that check
+     * compare against the wrong one.
+     *
+     * <p>Format is a 4-character bank code plus a 2-character country code plus a 2-character
+     * location code, which keeps the first six characters letters-only as
+     * transaction-service's {@code IbanSwiftValidator} requires.
+     */
     public static final String PLATFORM_SWIFT_CODE = "XBUSUS31";
 
+    /**
+     * Renders one account for its own owner.
+     *
+     * <p>The result carries the account number twice on purpose: masked for the dashboard's
+     * at-a-glance view, and raw to back the Copy button on the Receive Money panel. That is only
+     * safe because this DTO is built exclusively for the account's owner — never reuse it for a
+     * response shown to a third party such as a payment recipient; use {@link #maskAccountNumber}
+     * alone there.
+     *
+     * @param entity must be fully populated; a {@code null} account type, balance or status field
+     *     fails here rather than producing a partial DTO
+     * @return the overview DTO, never {@code null}
+     */
     public AccountOverviewResponseDto toOverviewDto(AccountEntity entity) {
         return new AccountOverviewResponseDto(
                 entity.getId(),
@@ -29,9 +50,6 @@ public class AccountMapper {
                 entity.getAvailableBalance(),
                 entity.getRoutingNumber(),
                 maskAccountNumber(entity.getAccountNumber()),
-                // Both forms travel together: the masked one is what the dashboard renders at a
-                // glance, the raw one backs the Copy button on the Receive Money panel. Safe here
-                // because this DTO is only ever built for the account's own owner.
                 entity.getAccountNumber(),
                 entity.getIban(),
                 PLATFORM_SWIFT_CODE,
@@ -39,22 +57,31 @@ public class AccountMapper {
         );
     }
 
-    // Public because InternalAccountController's recipient lookup masks a number it didn't build a
-    // full overview DTO for - same masking rule, so it reuses this rather than repeating it.
+    /**
+     * Replaces everything but the trailing four digits of an account number with dots.
+     *
+     * <p>Public so the internal recipient lookup, which masks a number without building a full
+     * overview DTO, applies the identical rule instead of repeating it.
+     *
+     * <p>Degrades rather than throws: a {@code null} number, or one of four characters or fewer,
+     * is returned unchanged, so a malformed row cannot break a response — but it also means short
+     * input is not actually masked.
+     *
+     * @param rawAccountNumber the unmasked number; {@code null} and values of length four or less
+     *     are passed straight back
+     * @return the masked number, or the input unchanged when it is too short to mask
+     */
     public String maskAccountNumber(String rawAccountNumber) {
         if (rawAccountNumber == null) {
-            return rawAccountNumber; // Failsafe for unusually short or malformed numbers
+            return rawAccountNumber;
         }
         if (rawAccountNumber.length() <= 4) {
-            return rawAccountNumber; // Failsafe for unusually short or malformed numbers
+            return rawAccountNumber;
         }
 
         int length = rawAccountNumber.length();
         String lastFourDigits = rawAccountNumber.substring(length - 4);
 
-        // Creates a string of dots for the hidden portion
-        // learned string.repeat is a pretty recent java addition, used to have to build this
-        // kind of padding with a loop or stringbuilder before it existed
         String mask = ".".repeat(length - 4);
 
         return mask + lastFourDigits;

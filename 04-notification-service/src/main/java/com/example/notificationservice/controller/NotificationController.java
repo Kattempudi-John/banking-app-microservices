@@ -32,8 +32,13 @@ import java.util.Arrays;
 import java.util.Map;
 import java.util.stream.Collectors;
 
-// This service's first-ever REST endpoint - everything else here is Kafka-consumer-driven with no
-// API surface. Powers the frontend's Notifications page.
+/**
+ * Serves the signed-in user's own notification feed, which powers the frontend's Notifications page.
+ *
+ * <p>This is the only customer-facing HTTP surface in the service; everything else here is Kafka
+ * consumer driven. Every method requires the {@code FULL_AUTH} scope, so a token issued mid-2FA
+ * cannot read the feed.
+ */
 @RestController
 @RequestMapping("/api/v1/notifications")
 @PreAuthorize("hasAuthority('SCOPE_FULL_AUTH')")
@@ -45,14 +50,31 @@ public class NotificationController {
         this.notificationQueryService = notificationQueryService;
     }
 
-    // Every filter is optional and they combine freely - the page lets a user narrow by kind, by
-    // channel, by outcome and by date at the same time, so any subset of these five has to be a valid
-    // request, including none of them at all. Supplying none returns exactly what this endpoint
-    // returned before filtering existed, so the page keeps working untouched.
-    //
-    // from/to are inclusive on both ends and bind from ISO-8601 date-times (2026-08-01T00:00:00),
-    // the same @DateTimeFormat contract account-service's transaction history already uses - so the
-    // frontend sends one date format to both services rather than one per service.
+    /**
+     * Returns a page of the calling user's notifications, newest first.
+     *
+     * <p>The user id comes from the {@code userId} claim on the caller's JWT and never from a
+     * request parameter, so no combination of filters can widen the result past the caller's own
+     * records. There is no way to request another user's feed through this endpoint.
+     *
+     * <p>All five filters are optional and combine freely; supplying none returns the unfiltered
+     * feed. An empty result is an empty page rather than a 404 — a user with no notifications is
+     * normal, not an error.
+     *
+     * @param type optional; must name a {@code NotificationType} constant, else 400 listing the
+     *     accepted values
+     * @param channel optional; must name a {@code NotificationChannel} constant, else 400 listing
+     *     the accepted values
+     * @param status optional; must name a {@code NotificationStatus} constant, else 400 listing the
+     *     accepted values
+     * @param from optional lower bound, inclusive; ISO-8601 local date-time such as
+     *     {@code 2026-08-01T00:00:00}, the same format account-service's transaction history accepts
+     * @param to optional upper bound, also inclusive, so a notification created exactly on the
+     *     boundary is returned rather than dropped
+     * @param pageable defaults to 50 records sorted by {@code createdAt} descending when the caller
+     *     supplies no paging parameters
+     * @return a page of the caller's own notifications, empty when nothing matches
+     */
     @GetMapping
     public ResponseEntity<Page<NotificationResponseDto>> getNotifications(
             @RequestParam(required = false) NotificationType type,
@@ -68,16 +90,24 @@ public class NotificationController {
                 userId, new NotificationFilter(type, channel, status, from, to), pageable));
     }
 
-    // Spring's own handling of an unparseable "?type=NOPE" is a bodyless response that tells the
-    // caller nothing about which parameter it disliked or what it would have accepted. Local to this
-    // controller rather than a @RestControllerAdvice on purpose: an advice would also catch type
-    // mismatches on InternalNotificationController, whose callers are services parsing a different
-    // response shape.
+    /**
+     * Translates an unparseable filter value into a 400 that names the parameter and its accepted
+     * values.
+     *
+     * <p>Spring's own handling of {@code ?type=NOPE} is a bodyless response saying neither which
+     * parameter it disliked nor what it would have taken. Scoped to this controller rather than
+     * declared as a {@code @RestControllerAdvice} deliberately: an advice would also catch type
+     * mismatches on {@code InternalNotificationController}, whose callers are services parsing a
+     * different response shape.
+     *
+     * @param ex the mismatch Spring raised while binding a query parameter
+     * @return 400 whose body repeats the same text under both {@code error} and {@code message} —
+     *     the frontend's {@code extractApiError} reads {@code error}, while {@code message} is the
+     *     key these services' own bodies use
+     */
     @ExceptionHandler(MethodArgumentTypeMismatchException.class)
     public ResponseEntity<Map<String, String>> handleUnparseableFilter(MethodArgumentTypeMismatchException ex) {
         String message = describeBadFilter(ex);
-        // Both keys carry the same text, matching the other services' handlers: the frontend's
-        // extractApiError reads "error", while "message" is what these services' own bodies use.
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                 .body(Map.of("error", message, "message", message));
     }
@@ -88,8 +118,6 @@ public class NotificationController {
         Class<?> required = ex.getRequiredType();
 
         if (required != null && required.isEnum()) {
-            // Listing the accepted values is the whole point - the caller is one typo away from a
-            // working request and the response should say which one.
             String allowed = Arrays.stream(required.getEnumConstants())
                     .map(Object::toString)
                     .collect(Collectors.joining(", "));
@@ -125,11 +153,6 @@ class NotificationQueryService {
     }
 
     Page<NotificationResponseDto> getNotifications(Long userId, NotificationFilter filter, Pageable pageable) {
-        // The unfiltered feed - which is what the page loads with every time it opens - keeps the
-        // exact derived query it has always used, rather than being rerouted through a Specification
-        // that would build the identical single-predicate query. Same result either way; this way the
-        // default request's behaviour is unchanged by the filtering feature rather than merely
-        // believed to be.
         Page<NotificationRecord> page = filter.isEmpty()
                 ? notificationRecordRepository.findByUserId(userId, pageable)
                 : notificationRecordRepository.findAll(NotificationSpecifications.forUser(userId, filter), pageable);

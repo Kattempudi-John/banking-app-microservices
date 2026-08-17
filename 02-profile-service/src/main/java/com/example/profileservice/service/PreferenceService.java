@@ -12,20 +12,36 @@ import java.math.BigDecimal;
 import java.time.ZoneId;
 import java.util.List;
 
+/**
+ * Reads and updates a user's notification preferences, creating a defaulted row on first use.
+ *
+ * <p>No user is required to have a preference row: every entry point here falls back to a default
+ * entity, so a caller never has to check for existence first. The defaults mirror the column
+ * defaults in the Flyway migrations, so a brand-new user's untouched fields hold the same values
+ * whether the row was created lazily here or has yet to be created at all.
+ *
+ * <p>Each write evicts the {@code user-preferences} cache entry for that user, since
+ * notification-service reads these values on every alert and would otherwise keep acting on the
+ * superseded threshold.
+ */
 @Service
 public class PreferenceService {
 
-    // Mirrors the column defaults in V3__Update_Preferences_Schema.sql, so a brand-new user's
-    // untouched fields end up with the same values whether created lazily here (first PUT to
-    // either endpoint) or seen for the first time by the Notification Service.
     private static final BigDecimal DEFAULT_ALERT_THRESHOLD = new BigDecimal("100.00");
     private static final boolean DEFAULT_DAILY_SUMMARY_ENABLED = false;
     private static final String DEFAULT_TIMEZONE = "UTC";
-    // 8 is what notification.daily-summary.hour shipped as when the send hour was one global config
-    // value, so a user who never picks an hour keeps being emailed at exactly the time they are now.
-    // Same number as V6__Add_Daily_Summary_Hour.sql's column default, for the same reason as above.
-    // Public because UserPreferenceResponseMapper answers with the same value for a row that predates
-    // the column, so the two cannot disagree about what "never chose an hour" means.
+
+    /**
+     * Hour of day a daily summary is sent to a user who has never chosen one.
+     *
+     * <p>{@code 8} is what {@code notification.daily-summary.hour} shipped as when the send hour was
+     * a single global config value, so users who never pick an hour keep being emailed at exactly
+     * the time they already were. Matches the column default in
+     * {@code V6__Add_Daily_Summary_Hour.sql}.
+     *
+     * <p>Public because {@link UserPreferenceResponseMapper} substitutes the same value for rows
+     * predating that column; the two must not disagree about what "never chose an hour" means.
+     */
     public static final int DEFAULT_DAILY_SUMMARY_HOUR = 8;
 
     private final PreferenceRepository preferenceRepository;
@@ -34,8 +50,16 @@ public class PreferenceService {
         this.preferenceRepository = preferenceRepository;
     }
 
-    // the #userId inside key = is spring expression language reaching into the method's own
-    // parameter by name, this is how it knows exactly which redis cache entry to evict
+    /**
+     * Sets the balance-change amount above which a user is alerted.
+     *
+     * <p>Creates a defaulted preference row when the user has none, so this doubles as first-time
+     * opt-in. The user's cached preferences are evicted as part of the same call.
+     *
+     * @param userId never {@code null}; need not already have a preference row
+     * @param alertThresholdAmount stored as given, including {@code null}; range is enforced by the
+     *     request DTO, not here
+     */
     @Transactional
     @CacheEvict(value = "user-preferences", key = "#userId")
     public void updateAlertThreshold(Long userId, BigDecimal alertThresholdAmount) {
@@ -44,11 +68,24 @@ public class PreferenceService {
         preferenceRepository.save(entity);
     }
 
+    /**
+     * Sets the daily-summary opt-in, timezone, and send hour, creating the row if absent.
+     *
+     * <p>The timezone is validated before anything is written, so a rejected zone leaves the stored
+     * preferences untouched rather than half-applied.
+     *
+     * @param userId never {@code null}; need not already have a preference row
+     * @param dailySummaryEnabled stored as given
+     * @param timezone must be a resolvable IANA identifier such as {@code America/New_York}
+     * @param dailySummaryHour optional: {@code null} means "the caller did not mention the hour" and
+     *     leaves whatever the user already chose in place, so a client that only knows how to send
+     *     the toggle and the zone cannot silently move someone's send time
+     * @throws ResponseStatusException {@code 400} when {@code timezone} is not a valid IANA zone
+     */
     @Transactional
     @CacheEvict(value = "user-preferences", key = "#userId")
     public void updateDailySummarySettings(Long userId, Boolean dailySummaryEnabled, String timezone,
                                            Integer dailySummaryHour) {
-        // Strict Domain Validation: Ensure the timezone is a valid IANA identifier.
         try {
             ZoneId.of(timezone);
         } catch (Exception e) {
@@ -58,32 +95,40 @@ public class PreferenceService {
         UserPreferenceEntity entity = findOrCreateDefault(userId);
         entity.setDailySummaryEnabled(dailySummaryEnabled);
         entity.setTimezone(timezone);
-        // A null hour is "the caller did not mention the hour", so whatever the user already chose
-        // stands - overwriting it with the default here would quietly move the send time of anyone
-        // whose client only knows how to send the toggle and the timezone.
         if (dailySummaryHour != null) {
             entity.setDailySummaryHour(dailySummaryHour);
         }
         preferenceRepository.save(entity);
     }
 
-    // orElseGet takes a supplier instead of a plain value like orElse does, so the new entity
-    // only actually gets constructed when the optional is truly empty, not on every single call
     private UserPreferenceEntity findOrCreateDefault(Long userId) {
         return preferenceRepository.findByUserId(userId).orElseGet(() -> buildDefault(userId));
     }
 
+    /**
+     * Returns a user's preferences, or a defaulted set when they have never saved any.
+     *
+     * @param userId never {@code null}; an unknown id is not an error
+     * @return never {@code null}; an unsaved, in-memory default entity for a user with no row, so
+     *     callers must not assume the result corresponds to a persisted record
+     */
     @Transactional(readOnly = true)
     public UserPreferenceEntity getPreferences(Long userId) {
         return preferenceRepository.findByUserId(userId).orElseGet(() -> buildDefault(userId));
     }
 
-    // A null/blank timezone means "every opted-in user, whatever their zone". Now that each user
-    // picks their own hour, the caller can no longer work out which timezones are currently at the
-    // send hour and ask for just those - every zone is a potential match on every sweep, so the job
-    // fetches the opt-ins once and compares each user's own hour locally instead of issuing one
-    // request per zone. Passing a timezone still filters exactly as it always did, because
-    // notification-service's manual trigger endpoint still asks for a single zone.
+    /**
+     * Lists the users opted in to the daily summary, optionally narrowed to one timezone.
+     *
+     * <p>Now that each user picks their own send hour, the caller can no longer work out which zones
+     * are currently at the send hour and ask for only those — every zone is a potential match on
+     * every sweep. The hourly job therefore fetches the whole opt-in list once and compares each
+     * user's own hour locally, instead of issuing one request per zone.
+     *
+     * @param timezone {@code null} or blank returns every opted-in user regardless of zone; an IANA
+     *     identifier filters to exactly that zone, which is what the manual trigger endpoint uses
+     * @return possibly empty, never {@code null}; opted-out users are excluded
+     */
     @Transactional(readOnly = true)
     public List<UserPreferenceEntity> getUsersForDailySummary(String timezone) {
         if (timezone == null || timezone.isBlank()) {

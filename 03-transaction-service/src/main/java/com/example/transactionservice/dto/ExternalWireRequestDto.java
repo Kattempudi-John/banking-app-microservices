@@ -9,17 +9,30 @@ import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.Size;
 
+/**
+ * Carries the details of an outbound external wire request.
+ *
+ * <p>Bean validation on these components only checks shape. Whether an IBAN is real — the mod-97
+ * checksum — is a separate check performed by {@code IbanSwiftValidator} inside the service, so a
+ * payload that passes validation here can still be rejected with a 400 later.
+ *
+ * @param iban uppercase only, and structural: two letters, two digits, then 11 to 30 alphanumerics;
+ *     must be non-blank, and the checksum is verified separately
+ * @param swiftCode uppercase only: six letters, two alphanumerics, and an optional three-character
+ *     branch code; must be non-blank
+ * @param beneficiaryName non-blank, at most 100 characters, matching the column width it is stored
+ *     in
+ * @param amount required and strictly positive, floor 0.01, so zero is rejected rather than treated
+ *     as a no-op; an amount over the service's fraud threshold is held for review instead of
+ *     completing
+ */
 public record ExternalWireRequestDto(
 
         @NotBlank(message = "IBAN is mandatory")
-        // Basic structural regex for IBAN: 2 letters, 2 digits, followed by 11 to 30 alphanumeric characters
-        // learned this regex only checks the shape, not whether the iban is a real valid one,
-        // the actual mod 97 checksum math lives separately in IbanSwiftValidator
         @Pattern(regexp = "^[A-Z]{2}[0-9]{2}[A-Z0-9]{11,30}$", message = "Invalid IBAN structure provided")
         String iban,
 
         @NotBlank(message = "SWIFT/BIC code is mandatory")
-        // Standard SWIFT/BIC format: 6 letters, 2 alphanumeric, and an optional 3 alphanumeric branch code
         @Pattern(regexp = "^[A-Z]{6}[A-Z0-9]{2}([A-Z0-9]{3})?$", message = "Invalid SWIFT/BIC format provided")
         String swiftCode,
 

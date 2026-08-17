@@ -14,33 +14,50 @@ import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 
-// /api/v1/internal/** is permitAll in SecurityConfig because the callers are other services, which
-// hold no end-user JWT to present. Until now the only thing keeping that prefix away from the
-// internet was the k8s ingress declining to route it - one layer, and a single bad ingress rule (or
-// an SSRF, or anything already inside the network) removes it. What sits behind the prefix here is
-// PATCH /api/v1/internal/transfers/{id}/fraud-status, which approves or reverses a held wire: losing
-// that one layer means an arbitrary caller can release someone else's money, not just read it.
-//
-// Same OncePerRequestFilter base as profile-service's KycWebhookFilter, and deliberately simpler
-// than it - a shared secret arriving in a header needs no HMAC and no body read, so the request
-// stream is left untouched and no caching wrapper is needed.
+/**
+ * Gates {@code /api/v1/internal/**} on a shared secret carried in the {@code X-Internal-Token}
+ * header.
+ *
+ * <p>Those paths are {@code permitAll} in {@code SecurityConfig} because their callers are other
+ * services holding no end-user JWT. Before this filter the only thing keeping the prefix off the
+ * internet was the ingress declining to route it — a single layer that one bad ingress rule, an
+ * SSRF, or any foothold inside the network removes. Behind the prefix sits
+ * {@code PATCH /api/v1/internal/transfers/{id}/fraud-status}, which approves or reverses a held
+ * wire, so losing that layer lets an arbitrary caller release someone else's money.
+ *
+ * <p>Must be registered ahead of the bearer-token filter in the chain; see
+ * {@code SecurityConfig#securityFilterChain}. Requests outside the internal prefix pass straight
+ * through, so customer-facing paths are authenticated exactly as they would be without it.
+ *
+ * <p>Rejections are deliberately uninformative and constant-time: a missing token and a wrong one
+ * produce the identical body, which names neither the header nor the property, and the comparison
+ * runs over every byte so response timing cannot be used to recover the secret one character at a
+ * time.
+ *
+ * <p>Configured by {@code application.security.internal-token}, which defaults to a development
+ * value so local and compose runs work unconfigured; every environment that matters overrides it,
+ * and all services in the platform read the same property and header names.
+ */
 @Component
 public class InternalTokenFilter extends OncePerRequestFilter {
 
-    // Colon default keeps docker-compose and local runs working with zero configuration, the same
-    // way SecurityConfig defaults the JWT signing key. Real environments override it from the k8s
-    // secret. All five services read this same property name and header.
     @Value("${application.security.internal-token:local-dev-internal-token}")
     private String internalToken;
 
     private static final String INTERNAL_PATH = "/api/v1/internal/";
     private static final String TOKEN_HEADER = "X-Internal-Token";
 
-    // Deliberately says nothing about which header or property was wrong. A caller who can reach
-    // this endpoint at all should not be handed the name of the credential to go looking for, and
-    // missing/wrong are answered identically so the response can't be used to probe for the schema.
     private static final String REJECTION_MESSAGE = "Not authorized to call this endpoint";
 
+    /**
+     * Lets any request outside the internal prefix through untouched, and challenges the rest.
+     *
+     * <p>Path matching uses {@code contains} rather than {@code startsWith}, matching the sibling
+     * services' filters and erring toward challenging: a looser check costs a spurious 401, while a
+     * check that misses — a context path prepended, say — leaves the gate open silently. A caller
+     * that fails the check gets a 401 and the chain stops; the request body is never read, so the
+     * stream reaches the controller intact.
+     */
     @Override
     protected void doFilterInternal(
             @NonNull HttpServletRequest request,
@@ -48,31 +65,19 @@ public class InternalTokenFilter extends OncePerRequestFilter {
             @NonNull FilterChain filterChain
     ) throws ServletException, IOException {
 
-        // 1. Only intercept the internal prefix - every customer-facing path passes straight
-        // through untouched, so the oauth2 resource server's bearer-token handling still sees those
-        // requests exactly as it did before this filter existed.
-        // contains() rather than startsWith() to match the sibling services' filters, and because it
-        // errs towards challenging a request: the failure mode of the looser check is an extra 401,
-        // while a check that misses (a context path prepended, say) silently leaves the gate open.
         if (!request.getRequestURI().contains(INTERNAL_PATH)) {
             filterChain.doFilter(request, response);
             return;
         }
 
-        // 2. Compare the presented secret against the configured one
         if (!isTokenValid(request.getHeader(TOKEN_HEADER))) {
             rejectRequest(response);
             return;
         }
 
-        // 3. Caller proved it holds the shared secret - hand it on to the controller
         filterChain.doFilter(request, response);
     }
 
-    // String.equals() returns the moment it hits a mismatched character, so how long the rejection
-    // took leaks how many leading characters were right, and a patient caller can recover the secret
-    // one character at a time. MessageDigest.isEqual compares every byte regardless, so every wrong
-    // token of a given length costs the same.
     private boolean isTokenValid(String presentedToken) {
         if (presentedToken == null) {
             return false;
@@ -83,9 +88,6 @@ public class InternalTokenFilter extends OncePerRequestFilter {
         );
     }
 
-    // Both keys carry the same text, matching GlobalExceptionHandler's own two-key error body:
-    // "error" is what this service has always returned and what the frontend reads, "message" is
-    // what the calling services read - all five services answer this identically.
     private void rejectRequest(HttpServletResponse response) throws IOException {
         response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
         response.setContentType("application/json");

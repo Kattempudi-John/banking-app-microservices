@@ -9,8 +9,16 @@ import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
 
-// no lombok here, this class writes its own getters/setters by hand further down, learned both
-// approaches exist side by side in this codebase depending on which model file you look at
+/**
+ * A long-lived session token that can be exchanged for a fresh access token.
+ *
+ * <p>Only a hash of the token is stored, so a database dump does not hand an attacker a set of
+ * usable sessions; the raw value exists solely in the client's cookie.
+ *
+ * <p>Revocation is a soft delete — the row stays and {@code revoked} flips — so a logout leaves an
+ * audit trail rather than erasing evidence. There is deliberately no setter for that flag; use
+ * {@link #revoke()}, which is one-way.
+ */
 @Entity
 @Table(name = "refresh_tokens")
 public class RefreshToken {
@@ -22,11 +30,9 @@ public class RefreshToken {
     @Column(name = "user_id", nullable = false)
     private Long userId;
 
-    // We store a hashed version of the token so a database dump doesn't leak active sessions
     @Column(name = "token_hash", nullable = false, unique = true)
     private String tokenHash;
 
-    // The Soft Delete flag. True means the token was manually killed before natural expiration.
     @Column(nullable = false)
     private Boolean revoked;
 
@@ -36,36 +42,68 @@ public class RefreshToken {
     @Column(name = "created_at", nullable = false, updatable = false)
     private LocalDateTime createdAt;
 
-    // --- Constructors ---
-
+    /**
+     * Creates a token stamped as created now, with no owner, hash, expiry, or revocation state.
+     *
+     * <p>Exists for JPA. Unlike the two-argument form this leaves {@code revoked} and
+     * {@code expiresAt} null, so {@link #isValid()} throws on an instance built this way and not
+     * fully populated.
+     */
     public RefreshToken() {
         this.createdAt = LocalDateTime.now();
     }
 
+    /**
+     * Issues a session token that expires 24 hours from now and starts out unrevoked.
+     *
+     * <p>The 24-hour lifetime is fixed here, not configurable — it is the outer bound on how long a
+     * logged-out-and-forgotten session can still mint access tokens.
+     *
+     * @param userId the owner; carried as a plain id, not verified against the users table
+     * @param tokenHash the hash of the raw token, never the raw value; unique across the table, so
+     *     issuing with a hash already on file fails the insert
+     */
     public RefreshToken(Long userId, String tokenHash) {
         this.userId = userId;
         this.tokenHash = tokenHash;
         this.revoked = false;
         this.createdAt = LocalDateTime.now();
-        // Sets expiration to 24 hours from creation
         this.expiresAt = LocalDateTime.now().plusHours(24);
     }
 
-    // --- Rich Domain Helper Methods ---
-
+    /**
+     * Reports whether the token has passed its expiry, comparing against the clock at call time.
+     *
+     * <p>Says nothing about revocation; a revoked token that has not yet expired still reports
+     * {@code false} here. Use {@link #isValid()} to decide whether a token may be exchanged.
+     *
+     * @return {@code true} once {@code expiresAt} is in the past
+     */
     public boolean isExpired() {
         return LocalDateTime.now().isAfter(this.expiresAt);
     }
 
+    /**
+     * Reports whether the token may still be exchanged for an access token.
+     *
+     * <p>The full check a caller should use: not revoked and not expired. Evaluated against the
+     * current clock, so a token can pass here and fail moments later.
+     *
+     * @return {@code true} only when neither revoked nor expired
+     */
     public boolean isValid() {
         return !this.revoked && !isExpired();
     }
 
+    /**
+     * Marks the token as revoked in memory.
+     *
+     * <p>One-way: there is no un-revoke, by design. Only the in-memory field changes, so the entity
+     * still has to be saved (or be managed inside a transaction) for the revocation to survive.
+     */
     public void revoke() {
         this.revoked = true;
     }
-
-    // --- Getters and Setters ---
 
     public Long getId() { return id; }
 
@@ -76,7 +114,6 @@ public class RefreshToken {
     public void setTokenHash(String tokenHash) { this.tokenHash = tokenHash; }
 
     public Boolean getRevoked() { return revoked; }
-    // We use the revoke() helper method instead of a raw setter for safety
 
     public LocalDateTime getExpiresAt() { return expiresAt; }
     

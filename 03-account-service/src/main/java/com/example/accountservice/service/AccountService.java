@@ -27,8 +27,21 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
 
-// @Transactional(readOnly = true) at the class level applies to every method here by default,
-// learned this lets hibernate skip some dirty checking work since it knows nothing gets written
+/**
+ * Serves the account-owner's own view of their accounts and applies the customer-facing writes.
+ *
+ * <p>Reads are the default here: the class-level transaction boundary is read-only, so Hibernate
+ * skips dirty checking for the query methods, and each write method re-declares a read-write
+ * boundary of its own. A method that forgets to do so cannot persist anything.
+ *
+ * <p>Every method takes the caller's {@code userId} and verifies ownership itself rather than
+ * trusting the account id it was handed; nothing here is safe to call with an id sourced from a
+ * client without that check.
+ *
+ * <p>The three write methods are gated by {@link RequiresKyc}, enforced by
+ * {@code KycEnforcementAspect} on the Spring proxy. That gate therefore applies to calls arriving
+ * from the controller, not to a call this class makes to itself.
+ */
 @Service
 @Transactional(readOnly = true)
 public class AccountService {
@@ -49,33 +62,71 @@ public class AccountService {
         this.ibanGenerator = ibanGenerator;
     }
 
+    /**
+     * Lists the accounts to show on a user's dashboard.
+     *
+     * <p>{@code CLOSED} accounts are excluded, so a user who has closed everything gets an empty
+     * list rather than a history of dead accounts. Account numbers come back masked.
+     *
+     * @param userId the authenticated caller's id; an id with no accounts yields an empty list, not
+     *     a 404
+     * @return one DTO per non-closed account, never {@code null}
+     */
     public List<AccountOverviewResponseDto> getDashboardAccounts(Long userId) {
-        // Query the database for accounts, strictly excluding CLOSED ones
         List<AccountEntity> accounts = accountRepository.findByUserIdAndStatusNot(userId, AccountStatus.CLOSED);
-        
-        // Map the raw entities to secure DTOs, masking the sensitive account numbers
+
         return accounts.stream()
                 .map(accountMapper::toOverviewDto)
                 .collect(Collectors.toList());
     }
 
+    /**
+     * Pages the transactions of a single account.
+     *
+     * <p>Ownership is checked before anything is read, so an account id belonging to someone else
+     * is rejected rather than returning an empty page that would leak whether the id exists.
+     *
+     * @param userId the authenticated caller's id; must own {@code accountId}
+     * @param accountId must reference an existing account, closed or not
+     * @param filterType {@code null} means both directions; otherwise restricts to that single
+     *     {@code CREDIT} or {@code DEBIT} type
+     * @param pageable sort and page size as supplied by the caller; no ordering is imposed here, so
+     *     an unsorted value yields database order
+     * @return the requested page, empty when the account has no matching transactions
+     * @throws ResponseStatusException 404 when the account does not exist
+     * @throws AccessDeniedException when the account exists but belongs to another user
+     */
     public Page<TransactionEntity> getAccountTransactions(Long userId, Long accountId, TransactionType filterType, Pageable pageable) {
 
         verifyAccountOwnership(userId, accountId);
 
         if (filterType != null) {
-            // If the user specified CREDIT or DEBIT, use the highly targeted repository method
             return transactionRepository.findByAccountIdAndTransactionType(accountId, filterType, pageable);
         } else {
-            // If no filter is specified, return all transactions for the account
             return transactionRepository.findByAccountId(accountId, pageable);
         }
     }
 
-    // Powers the frontend's cross-account History page - unlike getAccountTransactions above,
-    // this isn't scoped to one accountId path segment; it spans every account the caller owns
-    // (or just one, if they narrowed it with accountIdFilter) so History can show everything in
-    // one place instead of per-account.
+    /**
+     * Pages transactions across every account the caller owns, optionally narrowed to one of them.
+     *
+     * <p>Unlike {@link #getAccountTransactions}, the scope is the user rather than a single
+     * account, which is what lets the History page show everything in one list. The candidate
+     * account ids are resolved from the caller's own non-closed accounts, so a client-supplied
+     * {@code accountIdFilter} can only ever narrow that set, never widen it.
+     *
+     * @param userId the authenticated caller's id
+     * @param accountIdFilter {@code null} spans all of the caller's accounts; otherwise must be one
+     *     the caller owns
+     * @param type {@code null} means both directions; otherwise restricts to that single type
+     * @param from inclusive lower bound on transaction time, or {@code null} for unbounded
+     * @param to inclusive upper bound on transaction time, or {@code null} for unbounded
+     * @param pageable sort and page size as supplied by the caller
+     * @return the requested page; an empty page when the caller owns no open accounts, without
+     *     touching the transaction table
+     * @throws AccessDeniedException when {@code accountIdFilter} names an account the caller does
+     *     not own
+     */
     public Page<TransactionEntity> getAllTransactions(Long userId, Long accountIdFilter, TransactionType type,
                                                         LocalDateTime from, LocalDateTime to, Pageable pageable) {
         List<Long> ownedAccountIds = accountRepository.findByUserIdAndStatusNot(userId, AccountStatus.CLOSED).stream()
@@ -99,14 +150,32 @@ public class AccountService {
         return transactionRepository.findByAccountIdInWithFilters(accountIds, type, from, to, pageable);
     }
 
-    // Self-service "Add Funds" for the portfolio demo — a real product would fund this through a
-    // linked debit card/ACH pull; here it's a capped, ownership-checked credit the user triggers
-    // themselves, distinct from the unauthenticated internal /credit endpoint account-to-account
-    // transfers and Kafka provisioning use.
     private static final BigDecimal MAX_DEPOSIT_AMOUNT = new BigDecimal("10000");
 
-    // Taking in funds is the moment KYC exists to govern - an unverified identity should not be
-    // able to put money into the bank any more than it can move money out of it.
+    /**
+     * Credits an account from the self-service Add Funds action and records the movement.
+     *
+     * <p>Stands in for what a real product would fund through a linked card or ACH pull, so it is
+     * capped at {@code 10000} per call and ownership-checked — unlike the unauthenticated internal
+     * credit endpoint that other services use, which is neither.
+     *
+     * <p>KYC-gated: taking money in is precisely what know-your-customer exists to govern, so an
+     * unverified identity can no more pay money in than move it out. The gate runs before this
+     * method body, so a refused call writes nothing.
+     *
+     * <p>The account row is locked {@code FOR UPDATE} before its balance is read, so a concurrent
+     * transfer cannot interleave between the read and the write. The balance update and the ledger
+     * row commit together; neither survives alone.
+     *
+     * @param userId the authenticated caller's id; must own {@code accountId}
+     * @param accountId must reference an existing account
+     * @param amount must be strictly positive and no greater than {@code 10000}; zero is rejected
+     *     rather than ignored
+     * @return the account's refreshed overview, reflecting the new balance
+     * @throws ResponseStatusException 400 when the amount is non-positive or above the cap, 404
+     *     when the account does not exist
+     * @throws AccessDeniedException when the account belongs to another user
+     */
     @RequiresKyc
     @Transactional
     public AccountOverviewResponseDto depositFunds(Long userId, Long accountId, BigDecimal amount) {
@@ -137,15 +206,30 @@ public class AccountService {
         return accountMapper.toOverviewDto(account);
     }
 
-    // Self-service "Open Account" — an ordinary banking feature (not a demo-only shortcut), so it
-    // isn't gated behind app.demo.enabled. The cap just keeps one user from spamming accounts.
     private static final String DEFAULT_ROUTING_NUMBER = "021000021";
     private static final int MAX_ACCOUNTS_PER_USER = 5;
 
-    // Gated for the same reason the deposit path is: opening an account is the classic
-    // know-your-customer moment. Note this is the self-service path only - the starter account a
-    // brand-new user gets at registration is built directly by UserRegisteredListener, which never
-    // calls this method, so provisioning still works while that user sits at PENDING_VERIFICATION.
+    /**
+     * Opens an additional account for a user, {@code ACTIVE} with a zero balance.
+     *
+     * <p>An ordinary banking feature rather than a demo shortcut, so it is not behind
+     * {@code app.demo.enabled}. A user may hold at most five non-closed accounts, which exists only
+     * to stop one user from creating accounts without limit; closing an account frees a slot.
+     *
+     * <p>KYC-gated for the classic reason — opening an account is the know-your-customer moment.
+     * This covers the self-service path only: the starter account a brand-new user receives at
+     * registration is built directly by {@code UserRegisteredListener} and never passes through
+     * here, so provisioning still works while that user sits at {@code PENDING_VERIFICATION}.
+     *
+     * <p>The account number is generated, and its IBAN derived from it, inside the same transaction
+     * as the insert, so a rolled-back attempt leaves no number reserved.
+     *
+     * @param userId the authenticated caller's id; the new account is owned by this user
+     * @param accountType the product to open; determines nothing but the stored type, all accounts
+     *     open at a zero balance
+     * @return the newly created account's overview
+     * @throws ResponseStatusException 400 when the caller already holds five non-closed accounts
+     */
     @RequiresKyc
     @Transactional
     public AccountOverviewResponseDto openAccount(Long userId, AccountType accountType) {
@@ -173,9 +257,6 @@ public class AccountService {
         return String.valueOf(number);
     }
 
-    // Demo-only: fabricates a realistic-looking transaction history (paycheck deposits, everyday
-    // purchases, spread over the past ~45 days) so a freshly-deposited-into account doesn't just
-    // show one flat "Deposit" line. Gated behind app.demo.enabled at the controller.
     private static final String[] DEMO_CREDIT_DESCRIPTIONS = {
             "Payroll Deposit", "Freelance Payment", "Refund - Online Order", "Interest Payment"
     };
@@ -184,8 +265,31 @@ public class AccountService {
             "Gas Station", "Restaurant", "Streaming Subscription", "Pharmacy"
     };
 
-    // Gated too, even though it's demo-only and already off in prod: the fabricated history it
-    // writes includes credits, so leaving it open would just be the deposit gate with an extra step.
+    /**
+     * Fabricates a plausible transaction history on an account and adjusts its balance to match.
+     *
+     * <p>Demo-only, so that an account that has only ever been deposited into does not show a
+     * single flat line. Writes two or three credits and up to nine debits, dated randomly across
+     * the past 45 days. The caller is responsible for refusing this when {@code app.demo.enabled}
+     * is false; this method does not check it.
+     *
+     * <p>Real money moves: the balance is genuinely written, not simulated. Seeded debits are
+     * capped at half of what the balance would be once the seeded credits land, so the account can
+     * never be drained or driven negative, and the debit loop stops early when that budget runs
+     * out — so fewer rows than requested is a normal outcome, not a failure.
+     *
+     * <p>KYC-gated despite being demo-only and off in production, because the history it writes
+     * includes credits; leaving it open would be the deposit gate with an extra step.
+     *
+     * <p>The account row is locked {@code FOR UPDATE} for the duration, and all the generated rows
+     * plus the new balance commit as one unit.
+     *
+     * @param userId the authenticated caller's id; must own {@code accountId}
+     * @param accountId must reference an existing account
+     * @return the account's refreshed overview, reflecting the adjusted balance
+     * @throws ResponseStatusException 404 when the account does not exist
+     * @throws AccessDeniedException when the account belongs to another user
+     */
     @RequiresKyc
     @Transactional
     public AccountOverviewResponseDto seedDemoTransactions(Long userId, Long accountId) {
@@ -199,19 +303,17 @@ public class AccountService {
         List<TransactionEntity> generated = new ArrayList<>();
 
         BigDecimal creditsSum = BigDecimal.ZERO;
-        int creditCount = 2 + random.nextInt(2); // 2-3
+        int creditCount = 2 + random.nextInt(2);
         for (int i = 0; i < creditCount; i++) {
             BigDecimal amount = randomAmount(800, 2500);
             creditsSum = creditsSum.add(amount);
             generated.add(buildDemoTransaction(accountId, TransactionType.CREDIT, amount, randomChoice(DEMO_CREDIT_DESCRIPTIONS)));
         }
 
-        // Never let seeded debits push the account below half of what it would have after the
-        // seeded credits land, so this can never drain or negative-balance the account.
         BigDecimal maxDebitBudget = account.getAvailableBalance().add(creditsSum)
                 .multiply(new BigDecimal("0.5"));
         BigDecimal debitsSum = BigDecimal.ZERO;
-        int debitCount = 5 + random.nextInt(5); // 5-9
+        int debitCount = 5 + random.nextInt(5);
         for (int i = 0; i < debitCount; i++) {
             BigDecimal amount = randomAmount(5, 150);
             if (debitsSum.add(amount).compareTo(maxDebitBudget) > 0) {
@@ -260,10 +362,6 @@ public class AccountService {
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Account not found or invalid ID provided."));
 
         if (!account.getUserId().equals(userId)) {
-            // Throwing this exception ensures Spring Security intercepts it and returns a 403 Forbidden
-            // learned this specific exception type matters, spring security has an exception handler
-            // already registered for accessdeniedexception, a plain runtimeexception would have
-            // just bubbled up as an unhandled 500 instead of a proper 403
             throw new AccessDeniedException("Action forbidden: You do not have permission to view this account's history.");
         }
     }

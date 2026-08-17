@@ -6,27 +6,37 @@ import org.springframework.context.annotation.Configuration;
 
 import feign.RequestInterceptor;
 
-// The outbound half of the shared-secret change. ProfileServiceClient calls profile-service's
-// /api/v1/internal/profiles/{userId}/kyc-status, and profile-service is putting the very same
-// filter in front of its own internal prefix - so without this interceptor every KYC check would
-// come back 401, KycEnforcementAspect fails closed by design, and every deposit and account
-// opening in this service would start refusing.
-//
-// A plain @Bean here rather than a `configuration = ...` class attached to @FeignClient: that form
-// builds an isolated child context per client, so the bean would have to be duplicated for each new
-// client added later, and forgetting it is a silent 401 at runtime rather than a compile error.
-// Declaring it globally means any future internal client this service grows is authenticated by
-// default - the safe direction to fail.
+/**
+ * Attaches this service's shared secret to every outbound Feign call.
+ *
+ * <p>The outbound half of the internal-token scheme whose inbound half is {@code InternalTokenFilter}.
+ * Peer services put the same filter in front of their own {@code /api/v1/internal/**} prefix, so
+ * without this interceptor {@code ProfileServiceClient}'s KYC lookup returns 401,
+ * {@code KycEnforcementAspect} fails closed by design, and every deposit and account opening in this
+ * service starts refusing.
+ *
+ * <p>The secret is read from the same property and dev default as the inbound filter: in a
+ * single-secret deployment, the credential this service accepts is the credential it presents.
+ */
 @Configuration
 public class FeignInternalTokenConfig {
 
     private static final String INTERNAL_TOKEN_HEADER = "X-Internal-Token";
 
-    // Same property and same dev default as the inbound InternalTokenFilter reads, deliberately:
-    // in a single-secret deployment this service's own credential is the one it presents to others.
     @Value("${application.security.internal-token:local-dev-internal-token}")
     private String internalToken;
 
+    /**
+     * Supplies a global interceptor stamping {@code X-Internal-Token} on every Feign request.
+     *
+     * <p>Registered as a plain application-context bean rather than through
+     * {@code @FeignClient(configuration = ...)}. That form builds an isolated child context per
+     * client, so the bean would have to be repeated for each client added later, and forgetting it
+     * surfaces as a silent 401 at runtime instead of a compile error. Declaring it globally means any
+     * internal client this service grows is authenticated by default — the safe direction to fail.
+     *
+     * @return an interceptor applied to all Feign clients in this context, internal or not
+     */
     @Bean
     public RequestInterceptor internalTokenRequestInterceptor() {
         return template -> template.header(INTERNAL_TOKEN_HEADER, internalToken);

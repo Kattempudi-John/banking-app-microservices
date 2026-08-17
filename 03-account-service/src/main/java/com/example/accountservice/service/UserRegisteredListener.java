@@ -15,10 +15,13 @@ import java.math.BigDecimal;
 import java.security.SecureRandom;
 import java.util.Map;
 
-// auth-service only owns credentials - this is how account-service learns a new user exists at
-// all, so it can provision a starter account for them. Every account here shares this bank's
-// routing number; account_number just needs to be a unique 20-char value, nothing more specific
-// is implied by the schema.
+/**
+ * Provisions a starter checking account when auth-service announces a newly registered user.
+ *
+ * <p>auth-service owns credentials only, so this event is how account-service learns a user exists
+ * at all. Every account created here carries the platform's shared routing number; the account
+ * number only has to be unique, nothing further is implied by the schema.
+ */
 @Service
 public class UserRegisteredListener {
 
@@ -34,14 +37,34 @@ public class UserRegisteredListener {
         this.ibanGenerator = ibanGenerator;
     }
 
+    /**
+     * Creates the user's first {@code ACTIVE} checking account, with a zero balance and a generated
+     * IBAN.
+     *
+     * <p>Not gated by {@code @RequiresKyc}, and deliberately so: it writes the account directly
+     * rather than through {@code AccountService.openAccount}, so it never crosses the proxy the KYC
+     * aspect advises. A user must be provisioned while still at {@code PENDING_VERIFICATION} —
+     * verification happens after registration, not before it. Note that this also means there is no
+     * authenticated caller here for a gate to read.
+     *
+     * <p>Idempotent on the user: if the user already has any account, the event is a redelivery or
+     * a retry and is skipped rather than handing out a second starter account.
+     *
+     * <p>Swallows every failure after logging it, so a malformed or unparseable message cannot stall
+     * the consumer group by being redelivered forever. The consequence is that a failed event is
+     * dropped — the user ends up with no account and no automatic repair; a production deployment
+     * would route these to a dead-letter queue instead. The write itself is transactional, so a
+     * partially built account is never committed.
+     *
+     * @param event the deserialized {@code user-events} payload; must carry a {@code userId} whose
+     *     {@code toString} parses as a {@code long}, otherwise the event is logged and discarded
+     */
     @KafkaListener(topics = "user-events", groupId = "account-service-group")
     @Transactional
     public void consumeUserRegistered(Map<String, Object> event) {
         try {
             Long userId = Long.valueOf(event.get("userId").toString());
 
-            // idempotent: if a retry/redelivery lands here for a user we already provisioned,
-            // do nothing rather than hand them a second starter account
             if (accountRepository.existsByUserId(userId)) {
                 logger.info("Account already exists for user id {}, skipping provisioning", userId);
                 return;
@@ -61,8 +84,6 @@ public class UserRegisteredListener {
             logger.info("Provisioned starter checking account for newly registered user id {}", userId);
         } catch (Exception e) {
             logger.error("Failed to process UserRegistered event", e);
-            // In a production system, we would route this to a Dead Letter Queue (DLQ)
-            // so the raw message isn't lost if parsing fails.
         }
     }
 
