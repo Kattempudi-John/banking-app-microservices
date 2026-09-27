@@ -30,3 +30,19 @@ server:
 app:
   demo:
     enabled: false
+
+# AUTOMATION TEST SUPPORT MUST NOT BE ENABLED IN PRODUCTION.
+#
+# With this set to false:
+# - AutomationOtpStore is not created
+# - AutomationTestController is not created
+# - SecurityConfig does not permit the test-support OTP endpoint
+#
+# Therefore:
+#
+# GET /api/v1/test-support/otp
+#
+# is not exposed as an automation endpoint in production.
+automation:
+  test-support:
+    enabled: false

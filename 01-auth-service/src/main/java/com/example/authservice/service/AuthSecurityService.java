@@ -9,11 +9,14 @@ import com.example.authservice.repository.RecognizedDeviceRepository;
 import com.example.authservice.repository.RefreshTokenRepository;
 import com.example.authservice.repository.TwoFactorCodeRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -46,6 +49,17 @@ public class AuthSecurityService {
     private final KafkaTemplate<String, String> kafkaTemplate;
     private final ObjectMapper objectMapper;
 
+    /*
+     * Optional bean.
+     *
+     * AutomationOtpStore only exists when:
+     * automation.test-support.enabled=true
+     *
+     * In production, where the property is false, getIfAvailable()
+     * simply returns null and normal authentication continues.
+     */
+    private final ObjectProvider<AutomationOtpStore> automationOtpStoreProvider;
+
     @Value("${application.security.two-factor.code-ttl-seconds:180}")
     private int codeTtlSeconds;
 
@@ -61,20 +75,30 @@ public class AuthSecurityService {
      * and a different thing the client must do next: {@code INVALID} retry, {@code NO_CODE} and
      * {@code EXPIRED} resend, {@code LOCKED} restart the login.
      */
-    public enum TwoFaResult { VALID, INVALID, EXPIRED, LOCKED, NO_CODE }
+    public enum TwoFaResult {
+        VALID,
+        INVALID,
+        EXPIRED,
+        LOCKED,
+        NO_CODE
+    }
 
-    public AuthSecurityService(RecognizedDeviceRepository deviceRepository,
-                               TwoFactorCodeRepository twoFactorCodeRepository,
-                               RefreshTokenRepository refreshTokenRepository,
-                               BlacklistedTokenRepository blacklistedTokenRepository,
-                               KafkaTemplate<String, String> kafkaTemplate,
-                               ObjectMapper objectMapper) {
+    public AuthSecurityService(
+            RecognizedDeviceRepository deviceRepository,
+            TwoFactorCodeRepository twoFactorCodeRepository,
+            RefreshTokenRepository refreshTokenRepository,
+            BlacklistedTokenRepository blacklistedTokenRepository,
+            KafkaTemplate<String, String> kafkaTemplate,
+            ObjectMapper objectMapper,
+            ObjectProvider<AutomationOtpStore> automationOtpStoreProvider
+    ) {
         this.deviceRepository = deviceRepository;
         this.twoFactorCodeRepository = twoFactorCodeRepository;
         this.refreshTokenRepository = refreshTokenRepository;
         this.blacklistedTokenRepository = blacklistedTokenRepository;
         this.kafkaTemplate = kafkaTemplate;
         this.objectMapper = objectMapper;
+        this.automationOtpStoreProvider = automationOtpStoreProvider;
     }
 
     /**
@@ -86,14 +110,23 @@ public class AuthSecurityService {
      *
      * @param userId must reference an existing user; an unknown id simply matches nothing
      * @param rawDeviceCookie the raw {@code Device-ID} cookie value, not its hash; {@code null}
-     *     and blank are both normal and yield {@code false}
+     *                        and blank are both normal and yield {@code false}
      * @return {@code true} only when this exact cookie is on file for this user
      */
     public boolean isDeviceRecognized(Long userId, String rawDeviceCookie) {
-        if (rawDeviceCookie == null) return false;
-        if (rawDeviceCookie.isBlank()) return false;
+        if (rawDeviceCookie == null) {
+            return false;
+        }
+
+        if (rawDeviceCookie.isBlank()) {
+            return false;
+        }
+
         String hashedCookie = hashString(rawDeviceCookie);
-        return deviceRepository.findByUserIdAndDeviceHash(userId, hashedCookie).isPresent();
+
+        return deviceRepository
+                .findByUserIdAndDeviceHash(userId, hashedCookie)
+                .isPresent();
     }
 
     /**
@@ -110,8 +143,13 @@ public class AuthSecurityService {
     @Transactional
     public String registerNewDevice(Long userId) {
         String rawDeviceId = UUID.randomUUID().toString();
+
         String hashedId = hashString(rawDeviceId);
-        deviceRepository.save(new RecognizedDevice(userId, hashedId));
+
+        deviceRepository.save(
+                new RecognizedDevice(userId, hashedId)
+        );
+
         return rawDeviceId;
     }
 
@@ -123,215 +161,430 @@ public class AuthSecurityService {
      * code never comes back, because returning it was how it once ended up in a login response
      * body; the caller gets only the lifetime it needs to count down from.
      *
-     * <p>The store and the Kafka publish share one transaction, so a broker that will not accept
-     * the event rolls the new code back rather than leaving a code in the table that nobody was
-     * ever told. Note that this destroys the existing code row first, which is why
-     * {@link #secondsUntilResendAllowed} has to be consulted before this method and not after.
+     * <p>The automation OTP copy is written only after this transaction successfully commits.
+     * This prevents a stale automation OTP from existing when the database transaction rolls back.
      *
      * @param userId must reference an existing user
-     * @param phoneNumber E.164 or {@code null}; carried on the event as the fallback contact
-     *     rather than used here, since delivery is by email today
-     * @param email the address the code is actually sent to; {@code null} leaves the message
-     *     undeliverable, as auth-service is the only holder of this value
-     * @return the code's lifetime in seconds, the same figure that reaches the notification text,
-     *     so the on-screen countdown and the email agree
-     * @throws RuntimeException when the event cannot be published, which rolls back the stored
-     *     code
+     * @param phoneNumber E.164 or {@code null}
+     * @param email email destination
+     * @return OTP lifetime in seconds
      */
     @Transactional
-    public int trigger2fa(Long userId, String phoneNumber, String email) {
+    public int trigger2fa(
+            Long userId,
+            String phoneNumber,
+            String email
+    ) {
         String code = generateAndStoreCode(userId);
-        publish2faEvent(userId, phoneNumber, email, code);
+
+        publish2faEvent(
+                userId,
+                phoneNumber,
+                email,
+                code
+        );
+
+        /*
+         * Save raw OTP for automation only AFTER transaction commit.
+         *
+         * If Kafka or the transaction fails, nothing is written to
+         * AutomationOtpStore.
+         */
+        afterTransactionCommit(() -> {
+            AutomationOtpStore automationOtpStore =
+                    automationOtpStoreProvider.getIfAvailable();
+
+            if (automationOtpStore != null) {
+                automationOtpStore.save(
+                        userId,
+                        code,
+                        codeTtlSeconds
+                );
+            }
+        });
+
         return codeTtlSeconds;
     }
 
     /**
      * Reports how many seconds remain before this user may request another 2FA code.
      *
-     * <p>Must be called <em>before</em> {@link #trigger2fa}, which deletes the very row this
-     * reads and would therefore always report zero afterwards. The window is measured from the
-     * existing code's creation time rather than from a separate rate-limit table, because there
-     * is only ever one live code per user and that row already records when it was minted.
-     *
-     * <p>The cooldown is 30 seconds, far shorter than the code's own lifetime: long enough that
-     * a held-down button cannot fan out a mailbox worth of codes, short enough that someone whose
-     * first email never arrived is not left staring at a dead form.
-     *
-     * @param userId must reference an existing user; a user with no code on file has nothing to
-     *     wait on and yields {@code 0}
-     * @return seconds still to wait, {@code 0} when a resend may go immediately, and never more
-     *     than the 30-second window even if the stored timestamp is in the future because of
-     *     clock skew between instances
+     * @param userId user id
+     * @return remaining cooldown seconds
      */
     public int secondsUntilResendAllowed(Long userId) {
-        return twoFactorCodeRepository.findByUserId(userId)
+        return twoFactorCodeRepository
+                .findByUserId(userId)
                 .map(existing -> {
-                    long elapsed = Duration.between(existing.getCreatedAt(), LocalDateTime.now()).getSeconds();
+
+                    long elapsed = Duration.between(
+                            existing.getCreatedAt(),
+                            LocalDateTime.now()
+                    ).getSeconds();
+
                     if (elapsed >= RESEND_COOLDOWN_SECONDS) {
                         return 0;
                     }
-                    return (int) Math.min(RESEND_COOLDOWN_SECONDS, RESEND_COOLDOWN_SECONDS - elapsed);
+
+                    return (int) Math.min(
+                            RESEND_COOLDOWN_SECONDS,
+                            RESEND_COOLDOWN_SECONDS - elapsed
+                    );
                 })
                 .orElse(0);
     }
 
+    /**
+     * Generates a fresh six-digit OTP and stores only its hash in the database.
+     *
+     * Any previous OTP for the user is replaced.
+     */
     private String generateAndStoreCode(Long userId) {
+
+        /*
+         * Remove previous database OTP first.
+         */
         twoFactorCodeRepository.deleteByUserId(userId);
 
         SecureRandom random = new SecureRandom();
-        String code = String.format("%06d", random.nextInt(999999));
 
-        twoFactorCodeRepository.save(new TwoFactorCode(userId, hashString(code), codeTtlSeconds));
+        /*
+         * Generates values from:
+         * 000000 to 999999
+         */
+        String code = String.format(
+                "%06d",
+                random.nextInt(1_000_000)
+        );
+
+        twoFactorCodeRepository.save(
+                new TwoFactorCode(
+                        userId,
+                        hashString(code),
+                        codeTtlSeconds
+                )
+        );
 
         return code;
     }
 
-    private void publish2faEvent(Long userId, String phoneNumber, String email, String code) {
+    private void publish2faEvent(
+            Long userId,
+            String phoneNumber,
+            String email,
+            String code
+    ) {
         try {
             Map<String, String> event = new HashMap<>();
-            event.put("action", "TWO_FA_REQUESTED");
-            event.put("userId", userId.toString());
-            event.put("phoneNumber", phoneNumber);
-            event.put("email", email);
-            event.put("code", code);
-            event.put("expiresInSeconds", String.valueOf(codeTtlSeconds));
 
-            kafkaTemplate.send("notification-events", objectMapper.writeValueAsString(event));
+            event.put(
+                    "action",
+                    "TWO_FA_REQUESTED"
+            );
+
+            event.put(
+                    "userId",
+                    userId.toString()
+            );
+
+            event.put(
+                    "phoneNumber",
+                    phoneNumber
+            );
+
+            event.put(
+                    "email",
+                    email
+            );
+
+            event.put(
+                    "code",
+                    code
+            );
+
+            event.put(
+                    "expiresInSeconds",
+                    String.valueOf(codeTtlSeconds)
+            );
+
+            kafkaTemplate.send(
+                    "notification-events",
+                    objectMapper.writeValueAsString(event)
+            );
+
         } catch (Exception e) {
-            throw new RuntimeException("Failed to publish 2FA event to Kafka", e);
+            throw new RuntimeException(
+                    "Failed to publish 2FA event to Kafka",
+                    e
+            );
         }
     }
 
     /**
-     * Checks a submitted 2FA code against the one on file and consumes the code either way.
+     * Checks a submitted 2FA code against the one on file.
      *
-     * <p>A code is single-use: a correct one is deleted so it cannot be replayed, and an expired
-     * or locked-out one is deleted so it cannot linger. Every path returns rather than throws,
-     * precisely so those deletes commit; an exception here would roll back the cleanup it just
-     * performed.
+     * Valid, expired and locked codes are removed from both:
      *
-     * <p>Three wrong attempts burn the code permanently. There is no way back from
-     * {@code LOCKED} except a fresh login, since the row the resend endpoint would extend no
-     * longer exists.
+     * - database
+     * - LOCAL/QA automation store
      *
-     * @param userId must reference the user the {@code PRE_AUTH} token was issued for; the code
-     *     is looked up by this id alone, so passing another user's id checks another user's code
-     * @param providedCode the six digits as typed; must not be {@code null}, which faults rather
-     *     than counting as a failed attempt, and a wrong value spends one of the three attempts
-     * @return which of the five outcomes occurred, never {@code null}
+     * The automation store removal occurs after the transaction commits.
+     *
+     * @param userId user id taken from PRE_AUTH authentication
+     * @param providedCode OTP supplied by the client
+     * @return verification result
      */
     @Transactional
-    public TwoFaResult verifySms2fa(Long userId, String providedCode) {
-        TwoFactorCode storedCode = twoFactorCodeRepository.findByUserId(userId).orElse(null);
+    public TwoFaResult verifySms2fa(
+            Long userId,
+            String providedCode
+    ) {
+
+        TwoFactorCode storedCode =
+                twoFactorCodeRepository
+                        .findByUserId(userId)
+                        .orElse(null);
+
+        /*
+         * Database is the source of truth.
+         *
+         * If there is no DB OTP, make sure an automation OTP
+         * cannot remain stale.
+         */
         if (storedCode == null) {
+
+            removeAutomationOtpAfterCommit(userId);
+
             return TwoFaResult.NO_CODE;
         }
 
+        /*
+         * Expired OTP:
+         * remove DB row and automation raw OTP.
+         */
         if (storedCode.isExpired()) {
+
             twoFactorCodeRepository.delete(storedCode);
+
+            removeAutomationOtpAfterCommit(userId);
+
             return TwoFaResult.EXPIRED;
         }
 
+        /*
+         * Defensive check in case a row already has >= 3 attempts.
+         */
         if (storedCode.getAttempts() >= 3) {
+
             twoFactorCodeRepository.delete(storedCode);
+
+            removeAutomationOtpAfterCommit(userId);
+
             return TwoFaResult.LOCKED;
         }
 
-        if (!storedCode.getCodeHash().equals(hashString(providedCode))) {
+        /*
+         * Invalid OTP.
+         */
+        if (!storedCode
+                .getCodeHash()
+                .equals(hashString(providedCode))) {
+
             storedCode.incrementAttempts();
+
+            /*
+             * Third failed attempt immediately burns the OTP.
+             *
+             * Previous code saved attempts=3 and only locked/deleted
+             * it on the NEXT request.
+             */
+            if (storedCode.getAttempts() >= 3) {
+
+                twoFactorCodeRepository.delete(storedCode);
+
+                removeAutomationOtpAfterCommit(userId);
+
+                return TwoFaResult.LOCKED;
+            }
+
             twoFactorCodeRepository.save(storedCode);
+
             return TwoFaResult.INVALID;
         }
 
+        /*
+         * Correct OTP:
+         * consume it immediately.
+         */
         twoFactorCodeRepository.delete(storedCode);
+
+        removeAutomationOtpAfterCommit(userId);
+
         return TwoFaResult.VALID;
     }
 
     /**
      * Announces a newly registered user so the other services can provision their own rows.
      *
-     * <p>auth-service owns only credentials. profile-service and account-service each hold their
-     * own slice of a user, contact and KYC data on one side and accounts on the other, and this
-     * event is the only way either of them learns the user exists, so a user whose event is never
-     * published has no profile and no account.
-     *
-     * <p>Not transactional and not retried: call it after the user row is committed, because a
-     * publish failure here throws and the caller sees a failed registration for an account that
-     * now exists.
-     *
-     * @param userId must reference the just-saved user
-     * @param username the login name, the only place any other service can get one
-     * @param phoneNumber E.164 or {@code null}
-     * @param email a real, deliverable address; downstream services address balance summaries and
-     *     transaction alerts to it
-     * @throws RuntimeException when the event cannot be serialized or published
+     * @param userId user id
+     * @param username username
+     * @param phoneNumber phone number
+     * @param email email
      */
-    public void publishUserRegisteredEvent(Long userId, String username, String phoneNumber, String email) {
+    public void publishUserRegisteredEvent(
+            Long userId,
+            String username,
+            String phoneNumber,
+            String email
+    ) {
         try {
             Map<String, String> event = new HashMap<>();
-            event.put("userId", String.valueOf(userId));
-            event.put("username", username);
-            event.put("phoneNumber", phoneNumber);
-            event.put("email", email);
 
-            kafkaTemplate.send("user-events", objectMapper.writeValueAsString(event));
+            event.put(
+                    "userId",
+                    String.valueOf(userId)
+            );
+
+            event.put(
+                    "username",
+                    username
+            );
+
+            event.put(
+                    "phoneNumber",
+                    phoneNumber
+            );
+
+            event.put(
+                    "email",
+                    email
+            );
+
+            kafkaTemplate.send(
+                    "user-events",
+                    objectMapper.writeValueAsString(event)
+            );
+
         } catch (Exception e) {
-            throw new RuntimeException("Failed to publish user registered event to Kafka", e);
+            throw new RuntimeException(
+                    "Failed to publish user registered event to Kafka",
+                    e
+            );
         }
     }
 
     /**
-     * Revokes every refresh token a user holds and blacklists the access token they logged out with.
+     * Revokes every refresh token a user holds and blacklists
+     * the access token used for logout.
      *
-     * <p>Both halves are needed and both happen in one transaction: revoking refresh tokens alone
-     * would leave the current access token usable for the rest of its 15 minutes, and blacklisting
-     * the access token alone would let the caller mint a new one from the refresh cookie. Because
-     * the revocation is user-wide rather than session-wide, this signs the account out of every
-     * device, not just the one that called.
-     *
-     * <p>The blacklist row is kept only until the token would have expired anyway; a scheduled
-     * purge clears it after that, so the table stays proportional to live sessions.
-     *
-     * @param userId must reference the user the token belongs to; nothing cross-checks the two,
-     *     so a mismatched pair revokes one user's sessions and blacklists another's token
-     * @param jwtJti the {@code jti} claim of the access token being retired, the value the
-     *     request filter looks up on every subsequent call
-     * @param jwtExpiration that token's own expiry, interpreted in the JVM's default zone; a
-     *     value in the past leaves the entry immediately eligible for purging
+     * @param userId user id
+     * @param jwtJti JWT id
+     * @param jwtExpiration JWT expiry
      */
     @Transactional
-    public void logoutUserSession(Long userId, String jwtJti, Date jwtExpiration) {
-        refreshTokenRepository.revokeAllUserTokens(userId);
+    public void logoutUserSession(
+            Long userId,
+            String jwtJti,
+            Date jwtExpiration
+    ) {
 
-        LocalDateTime expiresAt = LocalDateTime.ofInstant(jwtExpiration.toInstant(), ZoneId.systemDefault());
-        blacklistedTokenRepository.save(new BlacklistedToken(jwtJti, expiresAt));
+        refreshTokenRepository
+                .revokeAllUserTokens(userId);
+
+        LocalDateTime expiresAt =
+                LocalDateTime.ofInstant(
+                        jwtExpiration.toInstant(),
+                        ZoneId.systemDefault()
+                );
+
+        blacklistedTokenRepository.save(
+                new BlacklistedToken(
+                        jwtJti,
+                        expiresAt
+                )
+        );
     }
 
     /**
-     * Drops blacklist entries whose tokens have expired on their own.
-     *
-     * <p>Runs hourly rather than continuously because nothing depends on the timing: an entry
-     * past its expiry is already harmless, since the filter that consults the list would reject
-     * the expired token anyway. The schedule exists only to keep the table proportional to live
-     * sessions instead of to every logout ever performed.
-     *
-     * <p>Runs on the scheduler's own thread on every instance, so in a multi-replica deployment
-     * several replicas execute it at the same hour; the delete is idempotent, so that is
-     * wasteful rather than wrong.
+     * Drops blacklist entries whose tokens have already expired.
      */
     @Scheduled(cron = "0 0 * * * *")
     @Transactional
     public void purgeExpiredBlacklistTokens() {
-        blacklistedTokenRepository.deleteAllExpiredTokensSince(LocalDateTime.now());
+
+        blacklistedTokenRepository
+                .deleteAllExpiredTokensSince(
+                        LocalDateTime.now()
+                );
     }
 
+    /**
+     * Removes LOCAL/QA raw OTP only after the surrounding database
+     * transaction has successfully committed.
+     */
+    private void removeAutomationOtpAfterCommit(Long userId) {
+
+        afterTransactionCommit(() -> {
+
+            AutomationOtpStore automationOtpStore =
+                    automationOtpStoreProvider.getIfAvailable();
+
+            if (automationOtpStore != null) {
+                automationOtpStore.remove(userId);
+            }
+        });
+    }
+
+    /**
+     * Executes an action only after transaction commit.
+     *
+     * If called without an active transaction, executes immediately.
+     */
+    private void afterTransactionCommit(Runnable action) {
+
+        if (TransactionSynchronizationManager.isSynchronizationActive()
+                && TransactionSynchronizationManager.isActualTransactionActive()) {
+
+            TransactionSynchronizationManager.registerSynchronization(
+                    new TransactionSynchronization() {
+
+                        @Override
+                        public void afterCommit() {
+                            action.run();
+                        }
+                    }
+            );
+
+            return;
+        }
+
+        action.run();
+    }
+
+    /**
+     * Hashes authentication secrets before persistence/comparison.
+     */
     private String hashString(String input) {
+
         try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] encodedHash = digest.digest(input.getBytes(StandardCharsets.UTF_8));
-            return Base64.getEncoder().encodeToString(encodedHash);
+            MessageDigest digest =
+                    MessageDigest.getInstance("SHA-256");
+
+            byte[] encodedHash =
+                    digest.digest(
+                            input.getBytes(StandardCharsets.UTF_8)
+                    );
+
+            return Base64
+                    .getEncoder()
+                    .encodeToString(encodedHash);
+
         } catch (NoSuchAlgorithmException e) {
-            throw new RuntimeException("Failed to hash string", e);
+
+            throw new RuntimeException(
+                    "Failed to hash string",
+                    e
+            );
         }
     }
 }
