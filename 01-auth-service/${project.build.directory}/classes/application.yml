@@ -4,7 +4,7 @@ spring:
   application:
     name: 01-auth-service
   datasource:
-    url: jdbc:postgresql://localhost:5433/banking
+    url: jdbc:postgresql://localhost:5432/banking
     username: dbadmin
     password: localdevpassword
     driver-class-name: org.postgresql.Driver
@@ -66,15 +66,3 @@ application:
       # here changes all four together. Every @Value reading it keeps an inline :180 fallback, so
       # tests and a fresh checkout need no config at all.
       code-ttl-seconds: 180
-
-# LOCAL / QA AUTOMATION SUPPORT ONLY.
-#
-# When true:
-# - AutomationOtpStore bean exists
-# - AutomationTestController exists
-# - GET /api/v1/test-support/otp can be permitted by SecurityConfig
-#
-# Production must explicitly set this to false.
-automation:
-  test-support:
-    enabled: true

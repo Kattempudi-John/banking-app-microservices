@@ -1,0 +1,18 @@
+-- AuthController already refuses a registration whose normalized phone number is taken, but an
+-- application-level check alone leaves a gap: two registrations arriving at the same instant both
+-- pass the existsByPhoneNumber check before either has inserted, and both get written. This index
+-- is the backstop that makes that physically impossible.
+--
+-- Why this is a migration rather than just @Column(unique = true) on the entity: Hibernate's
+-- ddl-auto=update does not reliably add a unique constraint to a column that already exists, and
+-- when it tries against data that already violates one it fails silently. The annotation stays on
+-- User.phoneNumber to document the intent; this file is what actually creates the constraint.
+--
+-- Nulls are deliberately left alone: Postgres allows any number of null values under a unique
+-- index, so users with no number on file (the column is nullable for rows predating it) are
+-- unaffected. Only real, populated numbers have to be distinct.
+--
+-- Numbers are normalized to E.164 before they are ever stored (see PhoneNumberNormalizer, applied
+-- at registration and by PhoneNumberBackfillRunner), which is what makes a plain string comparison
+-- the right one here - "(571) 285-6947" and "+15712856947" both land as the same stored value.
+CREATE UNIQUE INDEX IF NOT EXISTS uk_users_phone_number ON users (phone_number);

@@ -27,5 +27,6 @@ public class LoggingEmailProviderClient implements EmailProviderClient {
     @Override
     public void send(String userEmail, String subject, String htmlContent) {
         log.info("SUCCESS: Email payload delivered to external provider. To: [{}], Subject: {}", userEmail, subject);
+        log.info("DEV ONLY - Email body: {}", htmlContent);
     }
 }
