@@ -2,23 +2,41 @@ package com.example.notificationservice.config;
 
 import com.example.notificationservice.security.InternalTokenFilter;
 import jakarta.servlet.DispatcherType;
+import org.springframework.http.HttpMethod;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpMethod;
 import org.springframework.boot.web.servlet.FilterRegistrationBean;
+import org.springframework.http.HttpMethod;
 import org.springframework.context.annotation.Bean;
+import org.springframework.http.HttpMethod;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.Customizer;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.oauth2.server.resource.web.authentication.BearerTokenAuthenticationFilter;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.http.HttpMethod;
 import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.http.HttpMethod;
 import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.http.HttpMethod;
 import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 
 import javax.crypto.spec.SecretKeySpec;
@@ -59,12 +77,12 @@ public class SecurityConfig {
      * <p>{@code /api/v1/internal/**} stays {@code permitAll} here because service-to-service callers
      * carry no end-user token to present; {@code InternalTokenFilter} is the gate for that prefix,
      * not these rules. It is also the one prefix the k8s ingress does not route, which is why
-     * anything unauthenticated must live under it — the ingress matches by path prefix, so a
+     * anything unauthenticated must live under it â€” the ingress matches by path prefix, so a
      * {@code permitAll} endpoint under a routed prefix is published to the internet. That matters
      * because {@code InternalNotificationController} triggers real email sends.
      *
      * <p>{@code InternalTokenFilter} is placed ahead of {@code BearerTokenAuthenticationFilter} so
-     * an internal request is rejected before any JWT parsing runs — internal callers have no
+     * an internal request is rejected before any JWT parsing runs â€” internal callers have no
      * {@code Authorization} header to parse. Requests outside the internal prefix pass through the
      * filter untouched, so moving it after the bearer filter would only add JWT work to requests
      * that are about to be rejected.
@@ -82,6 +100,7 @@ public class SecurityConfig {
             .authorizeHttpRequests(auth -> auth
                 .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
                 .requestMatchers("/api/v1/internal/**").permitAll()
+                .requestMatchers(HttpMethod.GET, "/actuator/health", "/actuator/health/**").permitAll()
                 .anyRequest().authenticated()
             )
             .sessionManagement(session -> session
@@ -136,7 +155,7 @@ public class SecurityConfig {
      * Allows browser calls from the local Angular development origin only.
      *
      * <p>The allowed origin is hard-coded to {@code http://localhost:4200} and credentials are
-     * enabled, which forbids a wildcard origin — a deployed frontend on any other host needs this
+     * enabled, which forbids a wildcard origin â€” a deployed frontend on any other host needs this
      * list extended or its requests fail preflight.
      *
      * @return a source applied to every path, since the only browser-reachable path is the
@@ -154,3 +173,4 @@ public class SecurityConfig {
         return source;
     }
 }
+

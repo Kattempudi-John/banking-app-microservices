@@ -143,6 +143,12 @@ public class SecurityConfig {
                      * Everything not explicitly listed above requires
                      * authentication.
                      */
+                    auth.requestMatchers(
+                            HttpMethod.GET,
+                            "/actuator/health",
+                            "/actuator/health/**"
+                    ).permitAll();
+
                     auth.anyRequest().authenticated();
                 })
 

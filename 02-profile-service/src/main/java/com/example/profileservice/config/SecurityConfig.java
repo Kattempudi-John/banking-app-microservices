@@ -54,7 +54,7 @@ public class SecurityConfig {
      * bearer-token resource-server validation.
      *
      * <p>{@code KycWebhookFilter} and {@code InternalTokenFilter} both run before
-     * {@code UsernamePasswordAuthenticationFilter} because neither of their callers authenticates —
+     * {@code UsernamePasswordAuthenticationFilter} because neither of their callers authenticates â€”
      * the vendor webhook proves itself with an HMAC signature, sibling services with a shared token.
      * Their order relative to each other is free: they guard the disjoint prefixes
      * {@code /api/v1/webhooks/} and {@code /api/v1/internal/} and each passes straight through on any
@@ -63,7 +63,7 @@ public class SecurityConfig {
      * <p>Those two prefixes are {@code permitAll} at the Spring Security layer precisely because the
      * filters, not this chain, are what gate them. Raising {@code /api/v1/internal/**} to
      * {@code authenticated()} breaks every caller: these are service-to-service calls with no
-     * end-user token to present — notification-service sweeping daily-summary opt-ins has no user in
+     * end-user token to present â€” notification-service sweeping daily-summary opt-ins has no user in
      * the room at all.
      *
      * <p>{@code /api/v1/internal/} is also the one prefix the k8s ingress does not route, so any new
@@ -93,6 +93,7 @@ public class SecurityConfig {
                 .requestMatchers("/api/v1/webhooks/**").permitAll()
                 .requestMatchers("/api/v1/internal/**").permitAll()
                 .requestMatchers("/swagger-ui/**", "/swagger-ui.html", "/v3/api-docs/**").permitAll()
+                .requestMatchers(HttpMethod.GET, "/actuator/health", "/actuator/health/**").permitAll()
                 .anyRequest().authenticated()
             )
             .sessionManagement(session -> session
@@ -129,7 +130,7 @@ public class SecurityConfig {
      * Allows the Angular dev server to call this API cross-origin with credentials.
      *
      * <p>Credentialed requests are permitted so the {@code Authorization} header survives the
-     * preflight, which forbids a wildcard origin — the allowed origin list must name each origin
+     * preflight, which forbids a wildcard origin â€” the allowed origin list must name each origin
      * explicitly, so a deployed frontend origin has to be added here before it can call this service.
      *
      * @return a source applying one policy to {@code /**}

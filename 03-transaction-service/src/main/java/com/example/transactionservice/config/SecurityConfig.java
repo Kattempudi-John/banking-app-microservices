@@ -1,22 +1,39 @@
 package com.example.transactionservice.config;
 
 import jakarta.servlet.DispatcherType;
+import org.springframework.http.HttpMethod;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpMethod;
 import org.springframework.context.annotation.Bean;
+import org.springframework.http.HttpMethod;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.Customizer;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.oauth2.server.resource.web.authentication.BearerTokenAuthenticationFilter;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.http.HttpMethod;
 import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.http.HttpMethod;
 import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.http.HttpMethod;
 import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 
 import com.example.transactionservice.security.InternalTokenFilter;
@@ -58,15 +75,15 @@ public class SecurityConfig {
      * <p>{@code InternalTokenFilter} is anchored before {@link BearerTokenAuthenticationFilter} so
      * the shared secret is checked before anything else on the request is treated as a credential.
      * That anchor filter is registered by the {@code oauth2ResourceServer} call, so the
-     * {@code addFilterBefore} must stay after it — {@code addFilterBefore} can only anchor to a
+     * {@code addFilterBefore} must stay after it â€” {@code addFilterBefore} can only anchor to a
      * filter already in the chain, and reordering the two lines throws at startup. The filter
      * ignores every path outside the internal prefix, so customer-facing requests still reach the
      * bearer-token filter unchanged.
      *
      * <p>The {@code ERROR} dispatch type is permitted because Spring re-dispatches internally to
      * {@code /error} to render an error body; without it that dispatch is authorized as a fresh
-     * request and anything {@code GlobalExceptionHandler} does not catch — bean-validation failures,
-     * 404s — reaches the user as a bodyless 401 with the real reason discarded. Matching the
+     * request and anything {@code GlobalExceptionHandler} does not catch â€” bean-validation failures,
+     * 404s â€” reaches the user as a bodyless 401 with the real reason discarded. Matching the
      * dispatch type rather than the path keeps {@code /error} itself unreachable from outside.
      *
      * <p>Customer endpoints are additionally narrowed by method-level {@code @PreAuthorize} on
@@ -86,6 +103,7 @@ public class SecurityConfig {
                 .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
                 .requestMatchers("/swagger-ui/**", "/swagger-ui.html", "/v3/api-docs/**").permitAll()
                 .requestMatchers("/api/v1/internal/**").permitAll()
+                .requestMatchers(HttpMethod.GET, "/actuator/health", "/actuator/health/**").permitAll()
                 .anyRequest().authenticated()
             )
             .sessionManagement(session -> session
@@ -136,3 +154,4 @@ public class SecurityConfig {
         return source;
     }
 }
+

@@ -1,0 +1,21 @@
+﻿services:
+  flyway-migrate:
+    image: flyway/flyway:10
+    restart: "no"
+
+    depends_on:
+      postgres:
+        condition: service_started
+
+    environment:
+      FLYWAY_URL: jdbc:postgresql://postgres:5432/banking
+      FLYWAY_USER: ${FLYWAY_USER}
+      FLYWAY_PASSWORD: ${FLYWAY_PASSWORD}
+      FLYWAY_LOCATIONS: filesystem:/flyway/sql
+      FLYWAY_BASELINE_ON_MIGRATE: "false"
+      FLYWAY_CONNECT_RETRIES: "10"
+
+    volumes:
+      - ./database-migrations:/flyway/sql:ro
+
+    command: migrate

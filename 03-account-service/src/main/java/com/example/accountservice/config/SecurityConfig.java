@@ -1,23 +1,40 @@
 package com.example.accountservice.config;
 
+import org.springframework.http.HttpMethod;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpMethod;
 import org.springframework.context.annotation.Bean;
+import org.springframework.http.HttpMethod;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.Customizer;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.oauth2.server.resource.web.authentication.BearerTokenAuthenticationFilter;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.web.SecurityFilterChain;
 
 import com.example.accountservice.security.InternalTokenFilter;
+import org.springframework.http.HttpMethod;
 import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.http.HttpMethod;
 import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.http.HttpMethod;
 import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 
 import jakarta.servlet.DispatcherType;
@@ -31,7 +48,7 @@ import java.util.List;
  *
  * <p>{@link InternalTokenFilter} is constructed by hand inside the chain rather than declared as a
  * {@code @Component}. Any {@code Filter} that is also a bean is auto-registered by Boot across the
- * <em>whole</em> servlet chain, so it would run twice per request — once inside this chain and once
+ * <em>whole</em> servlet chain, so it would run twice per request â€” once inside this chain and once
  * outside it. Do not "simplify" it into a component.
  */
 @Configuration
@@ -53,14 +70,14 @@ public class SecurityConfig {
      * those callers hold no user token to parse. Reversing the order rejects every internal caller.
      *
      * <p>Everything under {@code /api/v1/internal/**} is {@code permitAll} at the authorize layer on
-     * purpose — the filter is what gates it, and requiring authentication here would reject callers
+     * purpose â€” the filter is what gates it, and requiring authentication here would reject callers
      * that have no user JWT to present. The corollary is a hard rule: every unauthenticated endpoint
      * MUST live under that one prefix, because the k8s ingress refuses to route it by path prefix. An
      * endpoint permitted anywhere else is published straight to the internet.
      *
      * <p>The {@code ERROR} dispatcher type is permitted so that Spring's internal re-dispatch to
-     * {@code /error} can render a response body. Without it every 400/403/404 — including
-     * {@code INSUFFICIENT_FUNDS} and ownership failures that transaction-service relays to the user —
+     * {@code /error} can render a response body. Without it every 400/403/404 â€” including
+     * {@code INSUFFICIENT_FUNDS} and ownership failures that transaction-service relays to the user â€”
      * came back as a bodyless 401. Permitting the dispatch type rather than the {@code "/error"} path
      * keeps {@code /error} from being reachable as a public endpoint of its own.
      *
@@ -81,6 +98,7 @@ public class SecurityConfig {
                 .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
                 .requestMatchers("/api/v1/internal/**").permitAll()
                 .requestMatchers("/swagger-ui/**", "/swagger-ui.html", "/v3/api-docs/**").permitAll()
+                .requestMatchers(HttpMethod.GET, "/actuator/health", "/actuator/health/**").permitAll()
                 .anyRequest().authenticated()
             )
             .sessionManagement(session -> session
