@@ -77,6 +77,8 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       SPRING_FLYWAY_ENABLED: "false"
       APPLICATION_CLIENT_AUTH_SERVICE_URL: http://host.docker.internal:8081
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: "6379"
     ports:
       - "8082:8082"
     depends_on:
